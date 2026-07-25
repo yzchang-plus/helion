@@ -11,6 +11,7 @@ import os
 import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Callable
 from typing import Sequence
 
 import torch
@@ -96,6 +97,11 @@ class TritonBackend(Backend):
 
         if key in get_mtia_tunable_fragments():
             return supports_mtia_tunables()
+        # In NPU environment, disable num_warps and num_stages tuning
+        # (ConfigSpec.normalize sets them to None on NPU instead).
+        if key in ("num_warps", "num_stages"):
+            if hasattr(torch, "npu") and torch.npu.is_available():
+                return False
         return super().supports_config_key(key)
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
@@ -120,12 +126,55 @@ class TritonBackend(Backend):
         return fragments
 
     def setup_compile_cache_dir(self, device_index: int) -> None:
-        if "TRITON_CACHE_DIR" not in os.environ:
-            from ...autotuner.local_cache import helion_triton_cache_dir
+        from ...autotuner.local_cache import get_per_config_triton_cache_override
+        from ...autotuner.local_cache import helion_triton_cache_dir
+        from ...autotuner.local_cache import npu_volatile_triton_cache_dir
+        from ...autotuner.local_cache import should_force_npu_volatile_triton_cache
 
+        override = get_per_config_triton_cache_override()
+        if override is not None:
+            os.environ["TRITON_CACHE_DIR"] = override
+            log.debug(
+                "Set TRITON_CACHE_DIR=%s (per-config autotune benchmark)", override
+            )
+            return
+        # Resolve the compile device for NPU volatile-cache detection.
+        try:
+            from ..compile_environment import CompileEnvironment
+
+            device = CompileEnvironment.current().device
+        except Exception:
+            device = None
+        # NPU: override any pre-existing TRITON_CACHE_DIR (e.g. TorchInductor's
+        # torchinductor_root/...) so we do not read stale binaries under
+        # helion/triton.  ``should_force_npu_volatile_triton_cache`` already
+        # no-ops while an ephemeral autotune cache owns TRITON_CACHE_DIR.
+        if device is not None and should_force_npu_volatile_triton_cache(device):
+            triton_dir = npu_volatile_triton_cache_dir()
+            os.environ["TRITON_CACHE_DIR"] = triton_dir
+            log.debug("Set TRITON_CACHE_DIR=%s (NPU volatile)", triton_dir)
+            return
+        if "TRITON_CACHE_DIR" not in os.environ:
             triton_dir = helion_triton_cache_dir(device_index)
             os.environ["TRITON_CACHE_DIR"] = triton_dir
             log.debug("Set TRITON_CACHE_DIR=%s", triton_dir)
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]] | None:
+        # NPU: route to do_bench_npu when triton.testing.do_bench_npu is available,
+        # otherwise default_do_bench() falls back to the event-based do_bench.
+        # Non-NPU keeps the base behavior (None -> module-level do_bench).
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            from ...autotuner.benchmarking import default_do_bench
+
+            return default_do_bench()
+        return super().get_do_bench()
+
+    def get_interleaved_bench(self) -> Callable[..., list[float]] | None:
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            from ...autotuner.benchmarking import default_interleaved_bench
+
+            return default_interleaved_bench()
+        return super().get_interleaved_bench()
 
     def make_ephemeral_cache(
         self,
@@ -467,11 +516,20 @@ class TritonBackend(Backend):
             f"num_warps={num_warps}",
             f"num_stages={config.num_stages}",
             *(["launch_cooperative_grid=True"] if has_barrier else []),
-        ] + [
-            f"{x.removeprefix('_triton_config_')}={config[x]}"
-            for x in config
-            if x.startswith("_triton_config_")
         ]
+        # ``_triton_config_*`` tunables (e.g. ``_triton_config_maxRegAutoWS``)
+        # are inlined as constants in the kernel body by ``register_tunable``
+        # codegen AND forwarded (prefix stripped) as launcher kwargs here.
+        # triton-ascend does not recognise Blackwell-specific kwargs such as
+        # ``maxRegAutoWS`` and raises ``KeyError``; withhold them on NPU. The
+        # key must stay in ``config`` (do NOT pop it) so codegen can still
+        # resolve the value.
+        if not (hasattr(torch, "npu") and torch.npu.is_available()):
+            args += [
+                f"{x.removeprefix('_triton_config_')}={config[x]}"
+                for x in config
+                if x.startswith("_triton_config_")
+            ]
 
         from ...autotuner.config_spec import _get_backend_tunable_keys
 
@@ -491,6 +549,22 @@ class TritonBackend(Backend):
 
     def grid_barrier_stmt(self, sem_arg: str) -> str:
         return f"triton_helpers.x_grid_barrier({sem_arg})"
+
+    def clamp_masked_pointer_offsets(self) -> bool:
+        """Clamp masked load/store/atomic offsets to 0 on NPU (Ascend MTE).
+
+        Ascend MTE DMA descriptors require non-negative offsets even for
+        masked-out elements; codegen wraps offsets in ``tl.where(mask, off, 0)``.
+        """
+        if self.name == "tileir":
+            return False
+        return hasattr(torch, "npu") and torch.npu.is_available()
+
+    def force_tile_mask(self) -> bool:
+        """Force explicit masks for all tiles on NPU (pointer indexing safety)."""
+        if self.name == "tileir":
+            return False
+        return hasattr(torch, "npu") and torch.npu.is_available()
 
     def build_launcher_args(
         self,
@@ -547,3 +621,94 @@ class TileIRBackend(TritonBackend):
         return frozenset(
             {"grid", "warmup", "num_warps", "num_stages", "num_ctas", "occupancy"}
         )
+
+
+class AscendBackend(TritonBackend):
+    """Triton code generation backend targeting Ascend NPU via triton-ascend.
+
+    Codegen is emitted as ``triton`` (so the rest of Helion's Triton pipeline
+    applies), but library imports and a handful of lowering hooks are swapped for
+    their ``torch_npu`` counterparts.
+    """
+
+    @property
+    def name(self) -> str:
+        return "ascend"
+
+    @property
+    def codegen_name(self) -> str:
+        return "triton"
+
+    @property
+    def library_imports(self) -> dict[str, str]:
+        return {
+            "math": "import math",
+            "operator": "import operator",
+            "torch": "import torch",
+            "helion": "import helion",
+            "hl": "import helion.language as hl",
+            "triton": "import triton",
+            "tl": "import triton.language as tl",
+            "triton_helpers": "from torch._inductor.runtime import triton_helpers",
+            "tl_math": "from torch_npu._inductor.npu_triton_helpers import math as tl_math",
+            "libdevice": "from torch_npu._inductor.npu_triton_helpers import libdevice",
+            "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
+            "fast_dividef": "from triton.language.extra.libdevice import fast_dividef",
+            "fast_expf": "from triton.language.extra.libdevice import fast_expf",
+        }
+
+    def classify_autotune_exception(self, err: BaseException) -> str | None:
+        # Ascend ``triton-adapter-opt`` can abort with BlockPtrAnalysis
+        # assertions; ``classify_triton_exception`` does not treat these as
+        # expected.  Map to ``debug`` so autotune skips the config.
+        msg = f"{type(err).__name__}: {err}"
+        if "BlockPtrAnalysis" in msg or "addptrRes.hasOneUse" in msg:
+            return "debug"
+        return super().classify_autotune_exception(err)
+
+    @property
+    def max_tensor_numel(self) -> int | None:
+        # NPU Unified Buffer (~192KB) is far smaller than Triton's 2**20
+        # codegen ceiling; cap per-tile tensor numel conservatively so config
+        # generation filters tile-dim overflow configs. Does NOT catch
+        # constant-numel whole-tensor loads (structural overflows).
+        from ...autotuner.config_spec import _npu_max_tensor_numel
+        return _npu_max_tensor_numel()
+
+    def barrier_semaphore_dtype(self) -> torch.dtype:
+        return torch.int32
+
+    def grid_barrier_stmt(self, sem_arg: str) -> str:
+        """Ascend grid barrier via an atomic semaphore spin-loop.
+
+        triton-ascend does not support ``triton_helpers.x_grid_barrier``, so
+        implement a barrier manually with ``tl.debug_barrier`` plus an atomic
+        counter (PID 0 flips the high bit, others add 1, all spin-read until
+        the sign bit flips). Spin bound is ``1 << 18`` (triton-ascend has no
+        ``break``, so the loop runs to completion; 262144 reads is enough for
+        all programs to flip the bit). Wrapped in ``if True:`` so the
+        multi-statement barrier is a single AST statement.
+        """
+        return (
+            "if True:\n"
+            "    tl.debug_barrier()\n"
+            "    _bar_expected = tl.num_programs(0).to(tl.int32)\n"
+            f"    _bar_inc = (0x80000000 - (_bar_expected - 1)) if tl.program_id(0) == 0 else 1\n"
+            f"    _bar_old = tl.atomic_add({sem_arg}, _bar_inc, sem='release')\n"
+            "    for _bar_i in tl.range(0, 1 << 18):\n"
+            f"        _bar_cur = tl.atomic_add({sem_arg}, 0, sem='acquire')\n"
+            "        _bar_flipped = ((_bar_old ^ _bar_cur) & 0x80000000) != 0\n"
+            "        if _bar_flipped:\n"
+            "            pass\n"
+            "    tl.debug_barrier()"
+        )
+
+    def inline_constexpr_at_module_level(self) -> bool:
+        # triton-ascend prefers constexpr args as function parameters rather
+        # than module-level inlines; keep all constexpr args as kernel params.
+        return False
+
+    def sympy_printer_expr(self, expr: "sympy.Expr") -> str:
+        from .printer import ascend_texpr
+
+        return ascend_texpr(expr)

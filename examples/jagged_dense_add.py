@@ -126,7 +126,7 @@ def random_jagged_2d(
     max_cols: int,
     *,
     dtype: torch.dtype = torch.float32,
-    device: torch.device | str = "cuda",
+    device: torch.device | str = DEVICE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Generate random jagged 2D tensor data.

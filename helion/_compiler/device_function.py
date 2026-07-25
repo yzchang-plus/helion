@@ -820,11 +820,17 @@ class DeviceFunction:
         sorted_arguments = self.sorted_args()
 
         # Separate constexpr args: inline those with known literal values at
-        # module level, keep dynamic ones as function parameters
+        # module level, keep dynamic ones as function parameters.  Backends that
+        # opt out of module-level inlining (e.g. Ascend) keep all constexpr args
+        # as function parameters.
         constexpr_to_inline = [
             arg
             for arg in sorted_arguments
-            if isinstance(arg, ConstExprArg) and _is_literal_constexpr(arg)
+            if (
+                backend.inline_constexpr_at_module_level()
+                and isinstance(arg, ConstExprArg)
+                and _is_literal_constexpr(arg)
+            )
         ]
         inlined_names = {arg.name for arg in constexpr_to_inline}
         param_args = [
@@ -1005,7 +1011,11 @@ class DeviceFunction:
         arg_objects: list[Argument] = []
         for arg in self.sorted_args():
             # Skip constexpr args that are inlined at module level
-            if isinstance(arg, ConstExprArg) and _is_literal_constexpr(arg):
+            if (
+                backend.inline_constexpr_at_module_level()
+                and isinstance(arg, ConstExprArg)
+                and _is_literal_constexpr(arg)
+            ):
                 continue
             if isinstance(arg, ConstExprArg) and arg.name in self._constexpr_host_defs:
                 host_arg = arg.name

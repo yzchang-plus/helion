@@ -520,8 +520,66 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
 # the same worker process.
 def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and not supports_amd_cdna_tunables():
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return ("",)
         return ("", "first", "last")
     return ("",)
+
+
+def _npu_ub_budget_elements() -> int:
+    """Max ``prod(block_sizes) * reduction_loops`` on Ascend to avoid UB overflow.
+
+    The Ascend 910B Unified Buffer is ~192KB; triton-ascend's
+    ``--enable-auto-multi-buffer`` inflates accumulator footprint several-fold,
+    so large reduction chunks overflow UB. Empirically ~32 bytes/element of
+    accumulator are consumed, so 2048 elements (~64KB) leaves comfortable
+    margin against the compiler's non-deterministic multi-buffer factor.
+    Override with ``HELION_NPU_UB_BUDGET_ELEMENTS``.
+    """
+    v = os.environ.get("HELION_NPU_UB_BUDGET_ELEMENTS", "").strip()
+    try:
+        return int(v) if v else 2048
+    except ValueError:
+        return 2048
+
+
+def _npu_max_tensor_numel() -> int:
+    """Per-tile max tensor element count on Ascend NPU.
+
+    Triton's 2**20 ceiling is a Triton codegen limit, not the NPU Unified
+    Buffer (~192KB). Cap per-tile tensor numel conservatively so config
+    generation filters tile-dim overflow configs (default 8192 elements;
+    ~16KB fp16 / ~32KB fp32, leaving room for other tiles and triton-ascend's
+    non-deterministic auto-multi-buffer inflation). Override with
+    HELION_NPU_MAX_TENSOR_NUMEL.
+
+    Note: this only bounds tile-dim (block_size-dependent) tensors. A
+    constant-numel whole-tensor load (e.g. a matmul operand not tiled) is a
+    structural overflow no config can fix and is not caught here.
+    """
+    v = os.environ.get("HELION_NPU_MAX_TENSOR_NUMEL", "").strip()
+    try:
+        return int(v) if v else 8192
+    except ValueError:
+        return 8192
+
+
+def _npu_default_reduction_loop() -> int:
+    """Default (baseline) reduction chunk on Ascend NPU.
+
+    The default reduction is the autotune baseline config, which must compile
+    (a baseline UB overflow aborts autotuning). Multi-buffer inflation is
+    extreme for some multi-pass kernels (layer_norm at dim=10240 needs
+    reduction<=16 to fit ~192KB UB), so cap the *default* conservatively;
+    the autotune still searches larger reductions (bounded by the UB budget
+    cap, which skips overflowing ones). Override with
+    ``HELION_NPU_DEFAULT_REDUCTION_LOOP``.
+    """
+    v = os.environ.get("HELION_NPU_DEFAULT_REDUCTION_LOOP", "").strip()
+    try:
+        return int(v) if v else 16
+    except ValueError:
+        return 16
 
 
 def get_valid_load_cache_modifiers(backend_name: str) -> tuple[str, ...]:
@@ -546,10 +604,12 @@ class ConfigSpec:
         | object
         | None = _TARGET_DEVICE_CAPABILITY_UNSET,
         device: torch.device | None = None,
+        compile_device: torch.device | None = None,
         num_sm: int | None = None,
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
+        self._compile_device = compile_device
         self.max_reduction_threads = backend.max_reduction_threads()
         self.max_reduction_loop = backend.max_reduction_loop()
         self.reduction_loop_force_threshold = self.max_reduction_threads
@@ -602,6 +662,13 @@ class ConfigSpec:
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            # NPU: persistent pid needed for large outputs (coreDim 65535 limit)
+            self.allowed_pid_types = (
+                "flat",
+                "persistent_blocked",
+                "persistent_interleaved",
+            )
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
         self.tensor_numel_constraints: list[TensorNumelConstraint] = []
@@ -734,6 +801,10 @@ class ConfigSpec:
             self.epilogue_subtile_autotune_choices = EPILOGUE_SUBTILE_DEFAULT_CHOICES
 
     def valid_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+        # NPU backends (e.g. Triton-ascend) may not fully support block_ptr and can
+        # hit device-side faults (e.g. unaligned UUB access). Keep indexing conservative.
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return ("pointer",)
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         if not self.backend.supports_block_ptr_indexing():
@@ -745,6 +816,32 @@ class ConfigSpec:
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         return ("pointer",)
+
+    def downgrade_unsupported_indexing(self, config: dict[str, object]) -> None:
+        """Replace ``indexing``/``atomic_indexing`` values this device does not support.
+
+        Examples written for CUDA/Blackwell may pin values such as
+        ``"tensor_descriptor"`` or ``"block_ptr"``. On a device whose valid set
+        is restricted (e.g. NPU only allows ``"pointer"``) those values would
+        otherwise flow into codegen and fault or behave inconsistently. Replace
+        each unsupported value with the first valid type so configs stay
+        portable across devices. On NVIDIA the valid sets already contain the
+        values examples use, so this is a no-op there.
+        """
+        for name, valid in (
+            ("indexing", self.valid_indexing_types()),
+            ("atomic_indexing", self.valid_atomic_indexing_types()),
+        ):
+            if name not in config or not self.supports_config_key(name):
+                continue
+            value = config[name]
+            if isinstance(value, str):
+                if value not in valid:
+                    config[name] = valid[0]
+            elif isinstance(value, (list, tuple)):
+                config[name] = type(value)(
+                    v if v in valid else valid[0] for v in value
+                )
 
     def _remove_duplicates(self) -> None:
         self.num_threads._remove_duplicates()
@@ -761,9 +858,10 @@ class ConfigSpec:
     def disallow_pid_type(self, pid_type: PidTypeLiteral) -> None:
         """Disallow a pid_type from being used in the config."""
 
-        self.allowed_pid_types = tuple(
-            [x for x in self.allowed_pid_types if x != pid_type]
-        )
+        if len(self.allowed_pid_types) > 1 and pid_type in self.allowed_pid_types:
+            self.allowed_pid_types = tuple(
+                [x for x in self.allowed_pid_types if x != pid_type]
+            )
         assert self.allowed_pid_types
 
     @property
@@ -1594,6 +1692,45 @@ class ConfigSpec:
                 if changed:
                     config["reduction_loops"] = new_loops
 
+        # Ascend NPU: cap reduction_loops to fit UB budget, convert [None]
+        # (naive whole-dim load) to looped default, and shrink explicit config
+        # block_sizes to fit max_tensor_numel. CUDA unaffected (NPU guard).
+        if (
+            hasattr(torch, "npu")
+            and torch.npu.is_available()
+            and isinstance(config.get("reduction_loops"), list)
+        ):
+            new_loops = list(config["reduction_loops"])
+            changed = False
+            default_rl = _npu_default_reduction_loop()
+            for i, rl in enumerate(new_loops):
+                if rl is None:
+                    new_loops[i] = default_rl
+                    changed = True
+            block_sizes = config.get("block_sizes")
+            tile_product = 1
+            if isinstance(block_sizes, list):
+                for bs in block_sizes:
+                    if isinstance(bs, int) and bs > 0:
+                        tile_product *= bs
+            if tile_product > 0:
+                budget = _npu_ub_budget_elements()
+                max_reduction = max(1, budget // tile_product)
+                capped = 1 << (max_reduction.bit_length() - 1)
+                for i, rl in enumerate(new_loops):
+                    if isinstance(rl, int) and rl > capped:
+                        new_loops[i] = capped
+                        changed = True
+            if changed:
+                config["reduction_loops"] = new_loops
+        if (
+            hasattr(torch, "npu")
+            and torch.npu.is_available()
+            and isinstance(config.get("block_sizes"), list)
+            and self.tensor_numel_constraints
+        ):
+            self._shrink_for_numel_constraints(config)
+
         # CuTe-specific: persistent reduction whose thread count is shrunk
         # below the reduction extent by adjust_reduction_thread_count would
         # wrap the kernel body in a synthetic lane loop. The lane loop
@@ -1704,7 +1841,16 @@ class ConfigSpec:
             "maxnreg",
         ):
             if not self.supports_config_key(name):
-                config.pop(name, None)
+                # In NPU environment, set num_warps and num_stages to None instead
+                # of removing them (codegen omits them when None).
+                if (
+                    name in ("num_warps", "num_stages")
+                    and hasattr(torch, "npu")
+                    and torch.npu.is_available()
+                ):
+                    config[name] = None
+                else:
+                    config.pop(name, None)
 
         if self.supports_config_key("num_warps"):
             config.setdefault("num_warps", DEFAULT_NUM_WARPS)
@@ -1728,6 +1874,9 @@ class ConfigSpec:
             config.setdefault(
                 "store_cache_modifiers", self.store_cache_modifiers.default()
             )
+        # Downgrade indexing/atomic_indexing values not supported on this device
+        # (e.g. "tensor_descriptor"/"block_ptr" on NPU) before filling defaults.
+        self.downgrade_unsupported_indexing(config)
         if self.supports_config_key("indexing"):
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
@@ -1780,8 +1929,14 @@ class ConfigSpec:
                     raise InvalidConfig(
                         f"Invalid value for 'pid_type': {config['pid_type']!r} must be one of {list(VALID_PID_TYPES)!r}"
                     )
+                # Downgrade to a pid_type allowed on this device (e.g. NPU only
+                # allows "flat"): keeps configs portable instead of faulting
+                # downstream. On NVIDIA allowed_pid_types == VALID_PID_TYPES, so
+                # this is a no-op there.
+                if config["pid_type"] not in self.allowed_pid_types:
+                    config["pid_type"] = self.allowed_pid_types[0]
             else:
-                config["pid_type"] = VALID_PID_TYPES[0]
+                config["pid_type"] = self.allowed_pid_types[0]
 
         if self.supports_config_key("xcd_remap"):
             if "xcd_remap" in config:
@@ -2000,6 +2155,10 @@ class ConfigSpec:
         if self.supports_config_key("range_warp_specializes"):
             config["range_warp_specializes"] = range_warp_specializes
 
+        # Triton-ascend: force ``range_unroll_factors`` off on NPU
+        # (see coerce_npu_tl_range_tunables).
+        self.coerce_npu_tl_range_tunables(config)
+
         if self.backend_name == "cute":
             preserve_keys = self._cute_tcgen05_config.implicit_default_keys_to_preserve(
                 config
@@ -2011,8 +2170,35 @@ class ConfigSpec:
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
         }
+        # In NPU environment, allow num_warps and num_stages keys (set to None).
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            allowed_keys = allowed_keys | {"num_warps", "num_stages"}
         if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
+
+    def coerce_npu_tl_range_tunables(self, config: dict[str, object]) -> None:
+        """If compiling for NPU, normalize selected ``tl.range`` tunables (in place).
+
+        Force ``range_unroll_factors`` to all zeros so ``tl.range`` does not receive
+        ``loop_unroll_factor``. ``range_num_stages`` and ``range_multi_buffers`` are
+        left to the caller for experimentation.
+        """
+        if self._compile_device is None or self._compile_device.type != "npu":
+            return
+        rub = config.get("range_unroll_factors")
+        if isinstance(rub, list) and rub:
+            config["range_unroll_factors"] = [0] * len(rub)
+
+    def strip_npu_triton_config_keys(self, config: dict[str, object]) -> None:
+        """Deprecated no-op.
+
+        ``_triton_config_*`` tunables are now withheld from the triton launcher
+        on NPU in ``TritonBackend.launcher_keyword_args`` (the value is still
+        inlined as a constant in the kernel body by ``register_tunable``
+        codegen, so the key must remain in ``config``).  Kept as a no-op for
+        backward compatibility in case external callers invoke it.
+        """
+        return
 
     def raise_grid_block_minimums(self) -> None:
         """Raise min_size for grid block dimensions based on problem size.
@@ -2049,6 +2235,34 @@ class ConfigSpec:
                 spec.autotuner_min = assert_integer_power_of_two(
                     max(min_block, spec.autotuner_min)
                 )
+
+    def disallow_flat_pid_for_grid_limit(self, limit: int = 65535) -> None:
+        """On NPU, disallow ``flat`` pid if the total grid could exceed ``limit``.
+
+        Ascend caps ``coreDim`` (total launch grid) at 65535. ``flat`` pid
+        emits 1D grid = total tiles; persistent uses num_compute_units (<<65535).
+        Must be called after ``raise_grid_block_minimums``.
+        """
+        if not (hasattr(torch, "npu") and torch.npu.is_available()):
+            return
+        if not self.grid_block_ids:
+            return
+        total = 1
+        for grid_bid in self.grid_block_ids:
+            try:
+                spec = self.block_sizes.block_id_lookup(grid_bid)
+            except KeyError:
+                total = limit + 1
+                break
+            if spec.size_hint <= 0:
+                total = limit + 1  # symbolic (dynamic shape)
+                break
+            block = max(spec.autotuner_min, 1)
+            total *= (spec.size_hint + block - 1) // block
+            if total > limit:
+                break
+        if total > limit:
+            self.disallow_pid_type("flat")
 
     def create_config_generation(
         self,
@@ -2103,11 +2317,15 @@ class ConfigSpec:
         self._shrink_for_numel_constraints(config)
         return config
 
-    def _shrink_for_numel_constraints(self, config: helion.Config) -> None:
+    def _shrink_for_numel_constraints(self, config) -> None:
         """Shrink block_sizes in *config* in-place so every tensor numel
         constraint is satisfied.
+
+        Accepts either a ``helion.Config`` (uses its ``.config`` dict) or a raw
+        dict (as passed by ``normalize``).
         """
-        block_sizes = config.config.get("block_sizes")
+        cfg = config if isinstance(config, dict) else config.config
+        block_sizes = cfg.get("block_sizes")
         if (
             not isinstance(block_sizes, list)
             or not block_sizes
@@ -2455,6 +2673,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
         self.max_size: int = self.dim_max_size
+        # Keep NPU autotuning search space conservative. Ascend backends can
+        # degrade or fault with very large block sizes (UUB constraints).
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            self.max_size = min(self.max_size, 128)
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
         if self.max_size < self.min_size:
@@ -2597,6 +2819,16 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             force_threshold = base.reduction_loop_force_threshold
             if force_threshold is not None and self.size_hint > force_threshold:
                 default = min(default, base.max_reduction_loop)
+        # Ascend NPU: the default reduction is used as the autotune baseline
+        # config, which must compile (a baseline compile failure aborts
+        # autotuning). Multi-buffer inflation can overflow UB (~192KB) for
+        # large default reductions on multi-pass kernels (layer_norm/rms_norm/
+        # rope), so cap the *default* (baseline) reduction conservatively; the
+        # autotune search range is unaffected (still bounded by the UB budget
+        # cap in normalize, which skips overflowing configs). Tunable via
+        # HELION_NPU_DEFAULT_REDUCTION_LOOP.
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            default = min(default, _npu_default_reduction_loop())
         return BlockSizeFragment(low, high, default)
 
     def _flat_config(

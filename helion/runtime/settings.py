@@ -44,7 +44,7 @@ if TYPE_CHECKING:
         ) -> BaseAutotuner: ...
 
 
-DotPrecision = Literal["tf32", "tf32x3", "ieee", "default", "high", "highest"]
+DotPrecision = Literal["tf32", "tf32x3", "ieee", "hf32", "default", "high", "highest"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
@@ -346,6 +346,8 @@ def _get_dot_precision() -> DotPrecision:
 
     if is_hip():
         default_precision = "tf32" if supports_tf32_precision_on_amd() else "ieee"
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        default_precision = "ieee"
     else:
         default_precision = "tf32"
 

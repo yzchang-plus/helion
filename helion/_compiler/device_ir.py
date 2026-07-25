@@ -3713,6 +3713,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         ),
                     )
         config_spec.raise_grid_block_minimums()
+        # Ascend NPU: coreDim (the total launch grid, = product of all grid
+        # dims) is capped at 65535. ``flat`` pid emits a 1D grid = total tiles,
+        # which exceeds this for large outputs (2D grids do not help -- coreDim
+        # is the product). Force a persistent pid (grid = num_compute_units,
+        # each program loops over its tiles) when the grid could exceed 65535
+        # (large output or dynamic shapes), to avoid
+        # "KernelLaunch failed ... coreDim ... > 65535".
+        config_spec.disallow_flat_pid_for_grid_limit()
         if len(device_ir.root_ids) > 1:
             # xyz is not supported with shared program IDs. Non-tcgen05
             # persistent kernels are allowed; tcgen05 persistent has a

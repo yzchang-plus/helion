@@ -60,3 +60,60 @@ class HelionTritonPrinter(TritonPrinter):
 
 def texpr(expr: sympy.Expr) -> str:
     return HelionTritonPrinter().doprint(expr)
+
+
+class HelionAscendPrinter(HelionTritonPrinter):
+    """Ascend NPU printer: emits simple ``//`` for FloorDiv/CleanDiv/CeilDiv.
+
+    triton-ascend's BiShengIR does not recognise triton_helpers.div_floor_integer
+    / clean_div helpers; for index calculations (lhs >= 0, rhs > 0) plain ``//``
+    is correct and compiles.
+    """
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        lhs_str = self._print(lhs)
+        rhs_str = self._print(rhs)
+        if not (lhs.is_Integer or lhs.is_Symbol):
+            lhs_str = f"({lhs_str})"
+        if not (rhs.is_Integer or rhs.is_Symbol):
+            rhs_str = f"({rhs_str})"
+        return f"({lhs_str} // {rhs_str})"
+
+    def _print_CleanDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        lhs_str = self._print(lhs)
+        rhs_str = self._print(rhs)
+        if not (lhs.is_Integer or lhs.is_Symbol):
+            lhs_str = f"({lhs_str})"
+        if not (rhs.is_Integer or rhs.is_Symbol):
+            rhs_str = f"({rhs_str})"
+        return f"({lhs_str} // {rhs_str})"
+
+    def _print_CeilDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        lhs_str = self._print(lhs)
+        rhs_str = self._print(rhs)
+        if not (lhs.is_Integer or lhs.is_Symbol):
+            lhs_str = f"({lhs_str})"
+        if not (rhs.is_Integer or rhs.is_Symbol):
+            rhs_str = f"({rhs_str})"
+        # Standard ceiling division: (a + b - 1) // b
+        return f"(({lhs_str} + {rhs_str} - 1) // {rhs_str})"
+
+    def _print_PythonMod(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        lhs_str = self._print(lhs)
+        rhs_str = self._print(rhs)
+        if not (lhs.is_Integer or lhs.is_Symbol):
+            lhs_str = f"({lhs_str})"
+        if not (rhs.is_Integer or rhs.is_Symbol):
+            rhs_str = f"({rhs_str})"
+        # Use simple % without sign checks (assumes lhs >= 0, rhs > 0, valid
+        # for index calculations).
+        return f"({lhs_str} % {rhs_str})"
+
+
+def ascend_texpr(expr: sympy.Expr) -> str:
+    """Convert SymPy expression to Ascend NPU-compatible Triton code."""
+    return HelionAscendPrinter().doprint(expr)

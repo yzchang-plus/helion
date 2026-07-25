@@ -187,7 +187,7 @@ def test(
     heads: int,
     head_dim: int,
     dtype: torch.dtype = torch.bfloat16,
-    device: torch.device | str = "cuda",
+    device: torch.device | str = DEVICE,
 ) -> None:
     """
     Test the jagged HSTU attention kernel implementation.
