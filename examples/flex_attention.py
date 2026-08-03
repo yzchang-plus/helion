@@ -24,6 +24,7 @@ from torch.nn.attention.flex_attention import _score_mod_signature
 from torch.nn.attention.flex_attention import flex_attention
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
@@ -224,7 +225,7 @@ def test(
     head_dim: int,
     dtype: torch.dtype = torch.float32,
     score_mod: Callable | None = None,
-    device: torch.device | str = "cuda",
+    device: torch.device | str = DEVICE,
 ) -> None:
     """
     Test the attention kernel implementation against PyTorch's native attention functions.

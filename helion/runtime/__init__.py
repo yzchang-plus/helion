@@ -78,8 +78,12 @@ def default_launcher(
     triton_kernel: object,
     grid: tuple[int, ...],
     *args: object,
-    num_warps: int,
-    num_stages: int,
+    # Keyword-only on purpose.  On NPU, Helion intentionally sets these to
+    # ``None`` (and codegen may omit the keywords entirely), so they must be
+    # optional here and forwarded to the underlying launcher which also treats
+    # ``None`` as "do not pass to triton".
+    num_warps: int | None = None,
+    num_stages: int | None = None,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
@@ -89,16 +93,24 @@ def default_launcher(
     Triton's opaque "incompatible dimensions" error into
     :class:`helion.exc.ShapeMismatch`.
     """
+    from .. import _compat
+
+    launcher_kwargs: dict = {
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "ptx_options": ptx_options,
+        **kwargs,
+    }
+    # triton-ascend does not recognise ``launch_cooperative_grid``; only
+    # forward it on backends/Triton versions that support it.
+    if _compat.supports_launch_cooperative_grid():
+        launcher_kwargs["launch_cooperative_grid"] = launch_cooperative_grid
     try:
         return _triton_default_launcher(
             triton_kernel,
             grid,
             *args,
-            num_warps=num_warps,
-            num_stages=num_stages,
-            ptx_options=ptx_options,
-            launch_cooperative_grid=launch_cooperative_grid,
-            **kwargs,
+            **launcher_kwargs,
         )
     except Exception as error:
         message = str(error)

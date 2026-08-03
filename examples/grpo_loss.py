@@ -496,9 +496,21 @@ def compare_tensors(
         return
     if any([tensor1.dtype == torch.float32, tensor2.dtype == torch.float32]):
         tensor1, tensor2 = tensor1.float(), tensor2.float()
-    diff = (tensor1 - tensor2).abs()
-    diff = diff / (torch.max(tensor1.abs(), tensor2.abs()) + 1e-5)
-    print(f"Max difference: {diff.max().item()}, Mean difference: {diff.mean().item()}")
+    # Chunk along last dim to avoid OOM on large tensors (e.g. [B, L, V=64000])
+    last_dim = tensor1.shape[-1]
+    chunk_size = min(8192, last_dim)
+    max_diff = 0.0
+    total_diff = 0.0
+    total_elements = 0
+    for i in range(0, last_dim, chunk_size):
+        t1_chunk = tensor1[..., i : i + chunk_size]
+        t2_chunk = tensor2[..., i : i + chunk_size]
+        diff = (t1_chunk - t2_chunk).abs()
+        diff = diff / (torch.max(t1_chunk.abs(), t2_chunk.abs()) + 1e-5)
+        max_diff = max(max_diff, diff.max().item())
+        total_diff += diff.sum().item()
+        total_elements += diff.numel()
+    print(f"Max difference: {max_diff}, Mean difference: {total_diff / total_elements}")
 
 
 def test_grpo_loss(

@@ -879,6 +879,37 @@ class Kernel(Generic[_R]):
         return rv
 
 
+def _npu_if_controlling_scalar_params(
+    fn: Callable[..., object], param_names: set[str]
+) -> set[str]:
+    """Return scalar param names that appear in an ``if`` test condition.
+
+    Triton-ascend mishandles loop-carried accumulators inside runtime
+    ``if/elif/else`` branches on scalar args (GPU/triton handles them fine).
+    Specializing just those scalars (so the branch resolves at trace time)
+    works around the bug.  Other scalar args (e.g. ``eps``) are left symbolic
+    because specializing them is unnecessary and can change compilation.
+    Used only on NPU (see ``BoundKernel`` arg binding).  See
+    ``npu_test_results.md`` §5.1 (jsd).
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    try:
+        source = textwrap.dedent(inspect.getsource(fn))
+        tree = ast.parse(source)
+    except (OSError, TypeError, SyntaxError):
+        return set()
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            for sub in ast.walk(node.test):
+                if isinstance(sub, ast.Name) and sub.id in param_names:
+                    found.add(sub.id)
+    return found
+
+
 class BoundKernel(_AutotunableKernel, Generic[_R]):
     def __init__(
         self,
@@ -936,6 +967,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             assert len(args) == len(self.kernel.signature.parameters)
             self.fake_args: list[object] = []
             constexpr_args = {}
+            # NPU: detect scalar params that control `if` branches.  They are
+            # specialized (below) to work around a triton-ascend bug with
+            # loop-carried accumulators inside runtime branches.
+            npu_branch_scalars: set[str] = (
+                _npu_if_controlling_scalar_params(
+                    self.kernel.fn, set(self.kernel.signature.parameters)
+                )
+                if hasattr(torch, "npu") and torch.npu.is_available()
+                else set()
+            )
             for name, arg, annotation in zip(
                 self.kernel.signature.parameters,
                 args,
@@ -955,7 +996,25 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     self.fake_args.append(arg)
                     constexpr_args[name] = arg
                 else:
-                    self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
+                    if (
+                        name in npu_branch_scalars
+                        and isinstance(arg, (float, bool))
+                    ):
+                        # NPU: triton-ascend mishandles loop-carried
+                        # accumulators inside runtime if/elif/else branches on
+                        # scalar args (GPU/triton is fine).  Specialize only the
+                        # scalar args that actually control an ``if`` branch
+                        # (detected in ``npu_branch_scalars`` above) so the
+                        # branch resolves at trace time and no runtime branch is
+                        # emitted.  Other scalars (e.g. ``eps``) stay symbolic --
+                        # specializing them is unnecessary and can change
+                        # compilation.  See npu_test_results.md §5.1 (jsd).
+                        self.fake_args.append(arg)
+                        constexpr_args[name] = arg
+                    else:
+                        self.fake_args.append(
+                            self.env.to_fake(arg, ArgumentOrigin(name))
+                        )
 
             self._apply_mark_static(args)
 
@@ -1319,6 +1378,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config = self.env.backend.autotune(self, args, force=force, **kwargs)
         if ephemeral is not None:
             self.env.backend.finalize_ephemeral_cache(self, config)
+        # Autotuning compiles many trial configs, each cached in PyCodeCache as a
+        # separate module with its own Triton JIT function.  When the best config
+        # is recompiled afterwards, PyCodeCache may return a stale module whose JIT
+        # function is associated with incorrect binaries in Triton's disk cache.
+        # Clearing these caches ensures set_config() gets a fresh module (NPU fix).
+        if (
+            self.env.backend.codegen_name == "triton"
+            and hasattr(torch, "npu")
+            and torch.npu.is_available()
+        ):
+            self._compile_cache.clear()
+            self._cache_path_map.clear()
+            PyCodeCache.cache_clear()
         self.set_config(config)
         return config
 
