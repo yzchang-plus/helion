@@ -159,6 +159,18 @@ def _validate_subscript_indices(index: list[object]) -> int:
     return narrowed
 
 
+def _fork_autotune_disabled_for_npu_default(device: torch.device) -> bool:
+    """Disable fork precompile on NPU unless ``HELION_AUTOTUNE_ASCEND_FORK_PRECOMPILE=1``.
+
+    Lowering often runs on first ``JITFunction.run()``, not isolated ``compile()``
+    in a child.
+    """
+    if device.type != "npu":
+        return False
+    v = os.environ.get("HELION_AUTOTUNE_ASCEND_FORK_PRECOMPILE", "").strip().lower()
+    return v not in ("1", "true", "yes", "on")
+
+
 class Backend(abc.ABC):
     """Abstract base class for Helion code generation backends.
 
@@ -412,6 +424,15 @@ class Backend(abc.ABC):
         """Statement emitted between persistent phases, if supported."""
         raise exc.BackendUnsupported(self.name, "hl.barrier()")
 
+    def inline_constexpr_at_module_level(self) -> bool:
+        """Whether literal constexpr args may be inlined as module-level constants.
+
+        Some backends (e.g. Ascend) prefer constexpr args passed as function
+        parameters rather than inlined at module level; they override this to
+        False so all constexpr args remain kernel parameters.
+        """
+        return True
+
     def reduction_axis_first(self) -> bool:
         """Whether reduction strategies should occupy the first (lowest) thread axes."""
         return False
@@ -422,6 +443,16 @@ class Backend(abc.ABC):
 
     def launches_surplus_tile_threads(self) -> bool:
         """Whether an axis may be launched wider than the tile it indexes."""
+        return False
+
+    def clamp_masked_pointer_offsets(self) -> bool:
+        """Whether masked load/store/atomic offsets must be clamped to >= 0.
+
+        Ascend MTE DMA descriptors require non-negative offsets even for
+        masked-out elements; when True, codegen wraps the offset in
+        ``tl.where(mask, offset, 0)`` so masked-out elements read/write
+        ``ptr + 0`` (discarded anyway).
+        """
         return False
 
     def supports_config_key(self, key: str) -> bool:
@@ -1164,8 +1195,12 @@ class Backend(abc.ABC):
         """
         force = force or bound_kernel.settings.force_autotune
 
+        supports_pc = self.supports_precompile()
+        npu_fork_disable = _fork_autotune_disabled_for_npu_default(
+            bound_kernel.env.device
+        )
         # Disable precompile for backends that don't support it
-        if not self.supports_precompile():
+        if not supports_pc or npu_fork_disable:
             bound_kernel.settings.autotune_precompile = None
 
         if bound_kernel.settings.autotune_effort == "none" and (

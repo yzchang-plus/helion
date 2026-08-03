@@ -802,9 +802,11 @@ def register_npu_backend() -> None:
 
     Only import ``torch_npu`` lazily so non-NPU environments never require it.
     """
-    from torch_npu._inductor.codegen.wrapper import NPUWrapperCodeGen  # type: ignore[import-not-found]
     from torch._inductor.codegen.common import register_backend_for_device
     from torch._inductor.codegen.triton import TritonScheduling
+    from torch_npu._inductor.codegen.wrapper import (
+        NPUWrapperCodeGen,  # type: ignore[import-not-found]
+    )
 
     register_backend_for_device(
         device="npu",
@@ -816,7 +818,8 @@ def register_npu_backend() -> None:
 def _register_interface_for_device() -> None:
     """Register the NPU device interface with torch._dynamo."""
     from torch._dynamo.device_interface import register_interface_for_device
-    from torch_npu.utils._dynamo_device import NpuInterface  # type: ignore[import-not-found]
+    from torch_npu.utils._dynamo_device import (
+        NpuInterface,  # type: ignore[import-not-found]
+    )
 
     register_interface_for_device("npu", NpuInterface)
-
