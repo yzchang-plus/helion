@@ -244,6 +244,46 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
     return _replace(statement)
 
 
+def statements_from_string(template: str, **placeholders: ast.AST) -> list[ast.stmt]:
+    """Like :func:`statement_from_string` but parses a *block* of statements
+    (e.g. a ``for`` loop with its indented body, or several statements) and
+    returns the list of ExtendedAST statements."""
+    location: SourceLocation = current_location()
+
+    pattern = r"\{(\w+)\}(?!:)"
+    used = set(re.findall(pattern, template))
+    if missing := used - placeholders.keys():
+        raise KeyError(f"Missing placeholders: {sorted(missing)}")
+    mapping: dict[str, ast.AST] = {}
+
+    def make_unique(m: re.Match[str]) -> str:
+        name = m.group(1)
+        uid = f"__placeholder_{len(mapping)}__"
+        mapping[uid] = placeholders[name]
+        return uid
+
+    modified_template = re.sub(pattern, make_unique, template)
+    parsed = ast.parse(modified_template).body
+
+    def _replace(node: _R) -> _R:
+        if isinstance(node, list):
+            return [_replace(item) for item in node]  # type: ignore[return-value]
+        if not isinstance(node, ast.AST):
+            return node
+        if isinstance(node, ast.Name) and node.id in mapping:
+            return mapping[node.id]  # type: ignore[return-value]
+        cls = get_wrapper_cls(type(node))
+        # pyrefly: ignore[bad-argument]
+        return location.to_ast(
+            cls(
+                **{field: _replace(getattr(node, field)) for field in node._fields},
+                _location=location,
+            )
+        )
+
+    return [_replace(stmt) for stmt in parsed]
+
+
 def expr_from_string(template: str, **placeholders: ast.AST) -> ast.AST:
     expr = statement_from_string(template, **placeholders)
     assert isinstance(expr, ast.Expr)

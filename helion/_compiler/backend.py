@@ -2871,5 +2871,6 @@ def _active_loop_block_ids(fn: DeviceFunction) -> set[int]:
 from .cute.backend import CuteBackend  # noqa: E402, F401
 from .metal.backend import MetalBackend  # noqa: E402, F401
 from .pallas.backend import PallasBackend  # noqa: E402, F401
+from .ascend.backend import AscendBackend  # noqa: E402, F401
 from .triton.backend import TileIRBackend  # noqa: E402, F401
 from .triton.backend import TritonBackend  # noqa: E402, F401
