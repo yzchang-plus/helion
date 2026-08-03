@@ -70,16 +70,12 @@ def _inner_mb_loop(mb_cta: ast.For) -> ast.For | None:
 def _is_int(node: ast.AST, value: int) -> bool:
     """True if *node* is an integer literal evaluating to *value* (handles
     ``-1`` which the AST encodes as ``UnaryOp(USub, Constant(1))``)."""
-    if isinstance(node, ast.Constant) and node.value == value:
-        return True
-    if (
+    return (isinstance(node, ast.Constant) and node.value == value) or (
         isinstance(node, ast.UnaryOp)
         and isinstance(node.op, ast.USub)
         and isinstance(node.operand, ast.Constant)
         and -node.operand.value == value
-    ):
-        return True
-    return False
+    )
 
 
 def _has_call_with_dim(node: ast.AST, attr: str, dim: int) -> bool:
@@ -160,32 +156,32 @@ def _has_grad_x_store(node: ast.AST) -> bool:
 def _emit_rms_twopass(args: list[str]) -> list[str]:
     grad_out, x, weight, rsqrt = args
     return [
-        "m_block = hl.register_block_size({x}.size(0))".format(x=x),
-        "grad_x = torch.empty_like({x})".format(x=x),
-        "grad_weight = {x}.new_empty([({x}.size(0) + m_block - 1) // m_block, *{w}.shape], dtype=torch.float32)".format(x=x, w=weight),
-        "weight_shape = hl.specialize({w}.size(0))".format(w=weight),
-        "for mb_cta in hl.tile({x}.size(0), block_size=m_block):".format(x=x),
+        f"m_block = hl.register_block_size({x}.size(0))",
+        f"grad_x = torch.empty_like({x})",
+        f"grad_weight = {x}.new_empty([({x}.size(0) + m_block - 1) // m_block, *{weight}.shape], dtype=torch.float32)",
+        f"weight_shape = hl.specialize({weight}.size(0))",
+        f"for mb_cta in hl.tile({x}.size(0), block_size=m_block):",
         "    for tile_n in hl.tile(weight_shape):",
-        "        grad_w_m = {w}.new_zeros(tile_n, dtype=torch.float32)".format(w=weight),
+        f"        grad_w_m = {weight}.new_zeros(tile_n, dtype=torch.float32)",
         "        for mb in hl.tile(mb_cta.begin, mb_cta.end):",
-        "            x_m = {x}[mb, tile_n].to(torch.float32)".format(x=x),
-        "            do_m = {go}[mb, tile_n].to(torch.float32)".format(go=grad_out),
-        "            rsqrt_m = {rs}[mb, :].to(torch.float32)".format(rs=rsqrt),
+        f"            x_m = {x}[mb, tile_n].to(torch.float32)",
+        f"            do_m = {grad_out}[mb, tile_n].to(torch.float32)",
+        f"            rsqrt_m = {rsqrt}[mb, :].to(torch.float32)",
         "            grad_w_m += (x_m * do_m * rsqrt_m).sum(0)",
         "        grad_weight[mb_cta.id, tile_n] = grad_w_m",
         "    for mb in hl.tile(mb_cta.begin, mb_cta.end):",
-        "        rsqrt_m = {rs}[mb, :].to(torch.float32)".format(rs=rsqrt),
+        f"        rsqrt_m = {rsqrt}[mb, :].to(torch.float32)",
         "        mean_term = hl.zeros([mb], dtype=torch.float32)",
         "        for tile_n in hl.tile(weight_shape):",
-        "            x_m = {x}[mb, tile_n].to(torch.float32)".format(x=x),
-        "            do_m = {go}[mb, tile_n].to(torch.float32)".format(go=grad_out),
-        "            w_m = {w}[tile_n].to(torch.float32)".format(w=weight),
+        f"            x_m = {x}[mb, tile_n].to(torch.float32)",
+        f"            do_m = {grad_out}[mb, tile_n].to(torch.float32)",
+        f"            w_m = {weight}[tile_n].to(torch.float32)",
         "            mean_term += (w_m[None, :] * do_m * x_m).sum(-1)",
         "        mean_term = mean_term / weight_shape",
         "        for tile_n in hl.tile(weight_shape):",
-        "            x_m = {x}[mb, tile_n].to(torch.float32)".format(x=x),
-        "            do_m = {go}[mb, tile_n].to(torch.float32)".format(go=grad_out),
-        "            w_m = {w}[tile_n].to(torch.float32)".format(w=weight),
+        f"            x_m = {x}[mb, tile_n].to(torch.float32)",
+        f"            do_m = {grad_out}[mb, tile_n].to(torch.float32)",
+        f"            w_m = {weight}[tile_n].to(torch.float32)",
         "            {gx}[mb, tile_n] = (w_m[None, :] * do_m * rsqrt_m - x_m * rsqrt_m ** 3 * mean_term[:, None]).to({x}.dtype)".format(gx="grad_x", x=x),
-        "return (grad_x, grad_weight.sum(0).to({w}.dtype))".format(w=weight),
+        f"return (grad_x, grad_weight.sum(0).to({weight}.dtype))",
     ]

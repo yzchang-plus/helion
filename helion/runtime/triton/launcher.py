@@ -83,6 +83,7 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
         "xpu",
         "mtia",
         "mps",
+        "npu",
     ], "TODO: implement for other devices"
     if device.type == "cuda":
         available_sms = torch.cuda.get_device_properties(
@@ -93,6 +94,15 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
         available_sms = torch.xpu.get_device_properties(device.index).gpu_subslice_count
     elif device.type == "mps":
         available_sms = torch.backends.mps.get_core_count()
+    elif device.type == "npu":
+        if triton is not None:
+            from triton.runtime.driver import driver
+
+            available_sms = driver.active.utils.get_device_properties(device)[
+                "num_aicore"
+            ]
+        else:
+            raise RuntimeError("Triton is not available for NPU device")
     elif device.type == "mtia":
         device_props = torch.mtia.get_device_properties(device.index)
         if "max_grid_height" in device_props and "max_grid_width" in device_props:
@@ -159,8 +169,11 @@ def default_launcher(
     triton_kernel: object,
     grid: tuple[int, ...],
     *args: object,
-    num_warps: int,
-    num_stages: int,
+    # Optional on purpose: on NPU Helion sets these to ``None`` (codegen may
+    # omit them); when ``None`` they are not forwarded to ``triton_kernel.run``
+    # so triton-ascend uses its own defaults.
+    num_warps: int | None = None,
+    num_stages: int | None = None,
     _remote_copy_signal_dst: torch.Tensor | None = None,
     _remote_copy_signal_slots_per_program: int = 0,
     _remote_copy_process_group_name: str | None = None,
@@ -234,11 +247,14 @@ def default_launcher(
     run_kwargs: dict = {
         "grid": grid,
         "warmup": False,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "launch_cooperative_grid": launch_cooperative_grid,
         **kwargs,
     }
+    if num_warps is not None:
+        run_kwargs["num_warps"] = num_warps
+    if num_stages is not None:
+        run_kwargs["num_stages"] = num_stages
+    if launch_cooperative_grid:
+        run_kwargs["launch_cooperative_grid"] = launch_cooperative_grid
     if ptx_options is not None:
         run_kwargs["ptx_options"] = ptx_options
     if _minimum_resident_programs:

@@ -112,21 +112,18 @@ def _rewrite_loop(outer_for: ast.For, info: dict) -> ast.For:
     #    THEN inner body (which uses starts[:, None] that needs scalar removal).
     rewriter = _JaggedBodyRewriter(tile_b, "b", tile_l)
     new_outer_body = []
-    inner_inserted = False
     for stmt in outer_for.body:
         if stmt is inner_for:
             # Visit inner body now (scalars are populated from outer body above)
             new_inner_body = [rewriter.visit(s) for s in inner_for.body]
-            new_inner_body = [mask_stmt] + new_inner_body
             new_outer_body.append(
                 ast.For(
                     target=inner_for.target,
                     iter=new_inner_iter,
-                    body=new_inner_body,
+                    body=[mask_stmt, *new_inner_body],
                     orelse=[],
                 )
             )
-            inner_inserted = True
         else:
             new_outer_body.append(rewriter.visit(stmt))
 

@@ -3373,9 +3373,9 @@ def _active_loop_block_ids(fn: DeviceFunction) -> set[int]:
 # The backend subclasses live in per-backend modules under helion/_compiler/<backend>/backend.py.
 # Re-import them here so `from helion._compiler.backend import <Backend>` keeps resolving and the
 # classes register with the same timing as when they lived in this file -- no behavior change.
+from .ascend.backend import AscendBackend  # noqa: E402, F401
 from .cute.backend import CuteBackend  # noqa: E402, F401
 from .metal.backend import MetalBackend  # noqa: E402, F401
 from .pallas.backend import PallasBackend  # noqa: E402, F401
-from .ascend.backend import AscendBackend  # noqa: E402, F401
 from .triton.backend import TileIRBackend  # noqa: E402, F401
 from .triton.backend import TritonBackend  # noqa: E402, F401

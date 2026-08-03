@@ -145,7 +145,7 @@ def create_test_jagged_tensor(
     B: int,
     M: int,
     max_seqlen: int,
-    device: torch.device | str = "cuda",
+    device: torch.device | str = DEVICE,
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Create test jagged tensor data."""

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from . import _compat as _compat_module  # noqa: F401  # side-effect import
+from . import _compat as _compat_module  # side-effect import
 from . import _logging
 from . import exc
 from . import experimental as experimental  # keep helion.experimental importable
@@ -51,7 +51,7 @@ if hasattr(_torch, "npu") and _torch.npu.is_available():
     try:
         _compat_module.register_npu_backend()
         _compat_module._register_interface_for_device()
-    except Exception:  # pragma: no cover  # noqa: BLE001
+    except Exception:  # pragma: no cover
         import logging as _logging
 
         _logging.getLogger(__name__).debug(

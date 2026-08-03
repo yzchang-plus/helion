@@ -11,6 +11,8 @@ from ..triton.backend import TritonBackend
 if TYPE_CHECKING:
     import sympy
 
+    from ..host_function import HostFunction
+
 
 class AscendBackend(TritonBackend):
     """Triton backend targeting Ascend NPU via triton-ascend."""
@@ -75,7 +77,7 @@ class AscendBackend(TritonBackend):
     def inline_constexpr_at_module_level(self) -> bool:
         return False
 
-    def sympy_printer_expr(self, expr: "sympy.Expr") -> str:
+    def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         from ..triton.printer import ascend_texpr
 
         return ascend_texpr(expr)
@@ -95,15 +97,15 @@ class AscendBackend(TritonBackend):
         """Force explicit masks for all tiles on NPU (pointer indexing safety)."""
         return self.name != "tileir"
 
-    def customize_ast(self, hf) -> None:  # type: ignore[override]
+    def customize_ast(self, hf: HostFunction) -> None:
         """NPU AST rewrites to fit the 192 KB UB (split-K, jagged 2D, norm two-pass, gdn sub-tile)."""
         if self.name == "tileir":
             return
-        from .ast_split_k import split_k_matmuls
-        from .ast_jagged_2d import rewrite_jagged_3d_bmm
         from .ast_batch_hoist import hoist_bmm_batch
-        from .ast_norm_twopass import rewrite_norm_bwd
         from .ast_gdn_subtile import rewrite_gdn_fwd_h
+        from .ast_jagged_2d import rewrite_jagged_3d_bmm
+        from .ast_norm_twopass import rewrite_norm_bwd
+        from .ast_split_k import split_k_matmuls
 
         arg_names = [a.arg for a in hf.args.args]
         split_k_matmuls(hf.body)

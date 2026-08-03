@@ -20,6 +20,7 @@ import torch
 from triton.testing import do_bench
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
@@ -491,7 +492,7 @@ def test(
     n_ctx: int,
     head_dim: int,
     dtype: torch.dtype = torch.float32,
-    device: torch.device | str = "cuda",
+    device: torch.device | str = DEVICE,
 ) -> None:
     """
     Test the attention kernel implementation against PyTorch's native attention functions.
