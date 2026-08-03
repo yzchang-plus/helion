@@ -11,6 +11,7 @@ import os
 import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Callable
 from typing import Sequence
 
 import torch
@@ -120,12 +121,50 @@ class TritonBackend(Backend):
         return fragments
 
     def setup_compile_cache_dir(self, device_index: int) -> None:
-        if "TRITON_CACHE_DIR" not in os.environ:
-            from ...autotuner.local_cache import helion_triton_cache_dir
+        from ...autotuner.local_cache import get_per_config_triton_cache_override
+        from ...autotuner.local_cache import helion_triton_cache_dir
+        from ...autotuner.local_cache import npu_volatile_triton_cache_dir
+        from ...autotuner.local_cache import should_force_npu_volatile_triton_cache
 
+        override = get_per_config_triton_cache_override()
+        if override is not None:
+            os.environ["TRITON_CACHE_DIR"] = override
+            log.debug(
+                "Set TRITON_CACHE_DIR=%s (per-config autotune benchmark)", override
+            )
+            return
+        # Resolve the compile device for NPU volatile-cache detection.
+        try:
+            from ..compile_environment import CompileEnvironment
+
+            device = CompileEnvironment.current().device
+        except Exception:
+            device = None
+        # NPU: override TRITON_CACHE_DIR to avoid stale binaries.
+        if device is not None and should_force_npu_volatile_triton_cache(device):
+            triton_dir = npu_volatile_triton_cache_dir()
+            os.environ["TRITON_CACHE_DIR"] = triton_dir
+            log.debug("Set TRITON_CACHE_DIR=%s (NPU volatile)", triton_dir)
+            return
+        if "TRITON_CACHE_DIR" not in os.environ:
             triton_dir = helion_triton_cache_dir(device_index)
             os.environ["TRITON_CACHE_DIR"] = triton_dir
             log.debug("Set TRITON_CACHE_DIR=%s", triton_dir)
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]] | None:
+        # NPU: route to do_bench_npu.
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            from ...autotuner.benchmarking import default_do_bench
+
+            return default_do_bench()
+        return super().get_do_bench()
+
+    def get_interleaved_bench(self) -> Callable[..., list[float]] | None:
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            from ...autotuner.benchmarking import default_interleaved_bench
+
+            return default_interleaved_bench()
+        return super().get_interleaved_bench()
 
     def make_ephemeral_cache(
         self,
@@ -467,11 +506,26 @@ class TritonBackend(Backend):
             f"num_warps={num_warps}",
             f"num_stages={config.num_stages}",
             *(["launch_cooperative_grid=True"] if has_barrier else []),
-        ] + [
-            f"{x.removeprefix('_triton_config_')}={config[x]}"
-            for x in config
-            if x.startswith("_triton_config_")
         ]
+        # NPU: override triton-ascend multi-buffer/auto-bind/auto-blockify via env.
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            _mb = os.environ.get("HELION_NPU_MULTIBUFFER")
+            if _mb is not None:
+                args.append(f"multibuffer={int(_mb) != 0}")
+
+            _absb = os.environ.get("HELION_NPU_AUTO_BIND_SUB_BLOCK")
+            if _absb is not None:
+                args.append(f"enable_auto_bind_sub_block={int(_absb) != 0}")
+            _blk = os.environ.get("HELION_NPU_AUTO_BLOCKIFY_SIZE")
+            if _blk is not None:
+                args.append(f"auto_blockify_size={int(_blk)}")
+        # NPU: withhold _triton_config_* kwargs (triton-ascend does not recognise Blackwell-specific ones).
+        if not (hasattr(torch, "npu") and torch.npu.is_available()):
+            args += [
+                f"{x.removeprefix('_triton_config_')}={config[x]}"
+                for x in config
+                if x.startswith("_triton_config_")
+            ]
 
         from ...autotuner.config_spec import _get_backend_tunable_keys
 

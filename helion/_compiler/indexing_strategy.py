@@ -645,6 +645,16 @@ class PointerIndexingStrategy(IndexingStrategy):
             )
         extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
         extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
+        # Ascend MTE: clamp masked-out offsets to 0 so the DMA descriptor stays
+        # valid -- a negative offset (e.g. ``tile.index - size`` for elements
+        # outside a region) faults the vector core even though the masked
+        # result is discarded.
+        if indexing.has_mask() and CompileEnvironment.current().backend.clamp_masked_pointer_offsets():
+            offset_ast = expr_from_string(
+                "tl.where({mask}, {off}, 0)",
+                mask=indexing.mask_expr,
+                off=offset_ast,
+            )
         load_placeholders: dict[str, ast.AST] = {
             "offset": offset_ast,
             "mask": indexing.mask_expr,
@@ -748,6 +758,13 @@ class PointerIndexingStrategy(IndexingStrategy):
             offset_expr = expr_from_string(broadcast, offset=offset_expr)
 
         extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
+        # Ascend MTE: clamp masked-out offsets to 0 (see codegen_load).
+        if indexing.has_mask() and backend.clamp_masked_pointer_offsets():
+            offset_expr = expr_from_string(
+                "tl.where({mask}, {off}, 0)",
+                mask=indexing.mask_expr,
+                off=offset_expr,
+            )
         store_placeholders: dict[str, ast.AST] = {
             "value": value,
             "offset": offset_expr,
@@ -771,9 +788,17 @@ class PointerIndexingStrategy(IndexingStrategy):
     ) -> ast.AST:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript)
         name = state.device_function.tensor_arg(fake_tensor).name
+        offset = indexing.index_expr
+        # Ascend MTE: clamp masked-out offsets to 0 (see codegen_load).
+        if indexing.has_mask() and CompileEnvironment.current().backend.clamp_masked_pointer_offsets():
+            offset = expr_from_string(
+                "tl.where({mask}, {off}, 0)",
+                mask=indexing.mask_expr,
+                off=offset,
+            )
         return expr_from_string(
             f"tl.{op}({name} + {{offset}}, {{value}}, mask={{mask}}, sem={{sem}})",
-            offset=indexing.index_expr,
+            offset=offset,
             value=value,
             mask=indexing.mask_expr,
             sem=sem,
