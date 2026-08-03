@@ -374,6 +374,7 @@ class CompileEnvironment:
             backend=self.backend,
             target_device_capability=target_device_capability(device),
             device=device,
+            compile_device=self.device,
             num_sm=_num_sm,
             log_restrictions_verbose=settings.autotune_log_search_space_verbose,
         )
@@ -778,7 +779,11 @@ class CompileEnvironment:
             if not shape:
                 continue
             numel_expr = sympy.Mul(*shape) if len(shape) > 1 else shape[0]
-            if uses_triton_codegen:
+            # NPU-only: substitute specialized/fixed block symbols so numel constraints cover mixed-dim tensors.
+            if hasattr(torch, "npu") and torch.npu.is_available():
+                numel_expr = self.specialize_expr(numel_expr)
+                numel_expr = self._substitute_fixed_block_symbols(numel_expr)
+            elif uses_triton_codegen:
                 substitutions: dict[sympy.Basic, sympy.Basic] = {}
                 for symbol in numel_expr.free_symbols:
                     if (
@@ -870,6 +875,50 @@ class CompileEnvironment:
             # the full backend-rounded reduction dimension.
             extent = self.backend.static_rdim_size(extent)
         return extent
+
+    def _substitute_fixed_block_symbols(self, expr: sympy.Expr) -> sympy.Expr:
+        """Replace non-tunable (fixed) block-size symbols in *expr* with their
+        concrete tile values, leaving tunable block symbols as variables.
+
+        A tensor shape recorded during tracing may contain a fixed block symbol
+        (e.g. a ``hl.tile(dim, block_size=const)`` chunk dim, or a whole-loaded
+        reduction dim) alongside a tunable block.  Such symbols have no entry in
+        the tunable ``config_spec.block_sizes`` sequence, so the numel-constraint
+        extractor would otherwise skip the whole shape.  Substituting their
+        known concrete value lets the constraint be created over the remaining
+        tunable symbols.
+        """
+        cs_block_sizes = self.config_spec.block_sizes
+        tunable_ids = set(cs_block_sizes.valid_block_ids())
+        subs: dict[sympy.Symbol, sympy.Integer] = {}
+        for bs in self.block_sizes:
+            sym = bs.symbol()
+            if sym not in expr.free_symbols:
+                continue
+            if bs.block_id in tunable_ids:
+                continue  # tunable: keep as a variable for the constraint
+            val = self._fixed_block_tile_value(bs)
+            if val is not None:
+                subs[sym] = sympy.Integer(val)
+        if subs:
+            expr = expr.xreplace(subs)
+        return expr
+
+    def _fixed_block_tile_value(self, bs: BlockSizeInfo) -> int | None:
+        """Concrete tile value for a non-tunable block, if known at finalize."""
+        source = bs.block_size_source
+        if isinstance(source, FixedBlockSizeSource):
+            try:
+                return int(self.size_hint(source.value))
+            except Exception:
+                return None
+        if isinstance(source, ReductionLoopBlockSizeSource):
+            # Whole-loaded reduction dim: the tile is the full dimension size.
+            try:
+                return int(bs.size_hint())
+            except Exception:
+                return None
+        return None
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """
