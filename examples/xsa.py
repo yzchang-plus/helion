@@ -189,6 +189,11 @@ def check(
         "compile": lambda q, k, v: compiled_sdpa_xsa(q, k, v, eps),
         "ref": lambda q, k, v: ref_xsa(q, k, v, eps),
     }
+    # torch.compile/inductor hits an internal assertion on NPU
+    # (loop_body index/var_ranges mismatch); skip it there and verify
+    # against the eager SDPA + manual ref baselines instead.
+    if DEVICE.type == "npu":
+        del baselines["compile"]
 
     run_example(
         lambda q, k, v: xsa_kernel(q, k, v, eps),

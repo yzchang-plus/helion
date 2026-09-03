@@ -47,8 +47,33 @@ def _hoist_in_for_loop(for_node: ast.For, h_name: str) -> bool:
     """If this for-loop's body has torch.bmm, wrap in ``for h in hl.grid(H):``."""
     if not _body_has_bmm(for_node):
         return False
+    # Only hoist when ``h_name`` is actually the bmm *batch* dim -- i.e. it
+    # appears as the leading (dim-0) size of an ``hl.zeros``/``hl.full``
+    # accumulator in the body. Grabbing the first ``hl.specialize`` blindly
+    # misfires on kernels where the specialized value is a non-batch dim
+    # (e.g. attention's ``head_dim = hl.specialize(q_in.size(-1))`` is the
+    # trailing head dim of ``hl.zeros([tile_b, tile_m, head_dim])``, not the
+    # batch), which would strip it from the accumulator and corrupt shapes.
+    if not _h_is_leading_factory_dim(for_node, h_name):
+        return False
     _rewrite_to_2d(for_node, h_name)
     return True
+
+
+def _h_is_leading_factory_dim(node: ast.AST, h_name: str) -> bool:
+    """True if some ``hl.zeros``/``hl.full`` in ``node`` lists ``h_name`` as
+    its first (batch) shape element."""
+    for child in ast.walk(node):
+        if not (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)):
+            continue
+        if child.func.attr not in ("zeros", "full"):
+            continue
+        if not child.args or not isinstance(child.args[0], ast.List):
+            continue
+        elts = child.args[0].elts
+        if elts and isinstance(elts[0], ast.Name) and elts[0].id == h_name:
+            return True
+    return False
 
 
 def _body_has_bmm(node: ast.AST) -> bool:
@@ -66,7 +91,9 @@ def _rewrite_to_2d(for_node: ast.For, h_name: str) -> None:
     grid_loop = ast.For(
         target=ast.Name(id="h", ctx=ast.Store()),
         iter=ast.Call(
-            func=ast.Attribute(value=ast.Name(id="hl", ctx=ast.Load()), attr="grid", ctx=ast.Load()),
+            func=ast.Attribute(
+                value=ast.Name(id="hl", ctx=ast.Load()), attr="grid", ctx=ast.Load()
+            ),
             args=[ast.Name(id=h_name, ctx=ast.Load())],
             keywords=[],
         ),

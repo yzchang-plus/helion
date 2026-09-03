@@ -858,6 +858,31 @@ class CallableType(LiteralType):
         proxy_args = [x.tree_map(to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(to_proxy) for k, v in kwargs.items()}
 
+        # torch.{bmm,mm,matmul}(input, other, out_dtype=...) dispatches to
+        # aten.{bmm,mm}.dtype, which torch_npu does not implement (its CPU
+        # fallback lacks it too). Type propagation only needs the result
+        # shape/dtype, so run the ordinary op and cast the example to
+        # out_dtype. The aten.*.dtype lowering (a separate codegen path)
+        # still honors out_dtype for the actual accumulation, so kernel
+        # correctness is unaffected.
+        if (
+            hasattr(torch, "npu")
+            and torch.npu.is_available()
+            and self.value in (torch.bmm, torch.mm, torch.matmul)
+        ):
+            out_dtype: torch.dtype | None = None
+            kw_dtype = proxy_kwargs.get("out_dtype")
+            if len(proxy_args) == 3 and isinstance(proxy_args[2], torch.dtype):
+                out_dtype = proxy_args[2]
+                proxy_args = proxy_args[:2]
+            elif isinstance(kw_dtype, torch.dtype):
+                out_dtype = kw_dtype
+                proxy_kwargs.pop("out_dtype", None)
+            if out_dtype is not None:
+                example = self.value(*proxy_args, **proxy_kwargs)
+                assert isinstance(example, torch.Tensor)
+                return TypeInfo.from_example(example.to(out_dtype), origin)
+
         # special handling for symint arguments
         if any(
             (isinstance(x, torch.SymInt) and not isinstance(x._sympy_(), sympy.Integer))

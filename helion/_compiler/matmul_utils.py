@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     import ast
 
 original_matmul = torch.matmul
+original_bmm = torch.bmm
 
 
 def torch_matmul_replacement(
@@ -39,10 +40,28 @@ def torch_matmul_replacement(
     if a.dim() == 2 and b.dim() == 2:
         return original_matmul(a, b)
     if a.dim() == 3 and b.dim() == 3:
-        return torch.bmm(a, b)
+        return original_bmm(a, b)
     raise NotImplementedError(
         "torch.matmul with input tensor dim <2 or >3 is not supported in Helion kernel"
     )
+
+
+def torch_bmm_replacement(
+    a: torch.Tensor, b: torch.Tensor, *extra_args: object, **extra_kwargs: object
+) -> torch.Tensor:
+    if extra_kwargs and "out" in extra_kwargs:
+        raise NotImplementedError(
+            "torch.bmm(..., out=...) is not supported in Helion kernel"
+        )
+    # torch.bmm(input, mat2, out_dtype=...) dispatches to aten.bmm.dtype,
+    # which torch_npu does not implement and whose fake-mode dispatch
+    # errors on CPU-only builds. FX tracing only needs the result shape, so
+    # drop out_dtype and run the ordinary 2-arg bmm (producing
+    # aten.bmm.default). fp32 accumulation is preserved via
+    # _compute_out_dtype, which defaults to float32 for sub-32-bit inputs --
+    # the same path torch.matmul(out_dtype=...) takes via
+    # torch_matmul_replacement above.
+    return original_bmm(a, b)
 
 
 def tensor_matmul_replacement(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:

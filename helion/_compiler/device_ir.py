@@ -62,6 +62,7 @@ from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
 from .matmul_utils import tensor_matmul_replacement
+from .matmul_utils import torch_bmm_replacement
 from .matmul_utils import torch_matmul_replacement
 from .node_masking import defer_pallas_load_masks
 from .node_masking import remove_unnecessary_masking
@@ -243,6 +244,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
             [*torch.fx.proxy._COPY_META_FIELDS, "location"],
         ),
         patch.object(torch, "matmul", torch_matmul_replacement),
+        patch.object(torch, "bmm", torch_bmm_replacement),
         patch.object(
             torch.Tensor,
             "matmul",

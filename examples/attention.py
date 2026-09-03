@@ -834,7 +834,9 @@ def test(
         "flex": flex_compiled,
         "ref": ref_attention,
     }
-    if DEVICE.type == "tpu":
+    # flex_attention only supports CUDA/CPU/HPU devices (torch rejects NPU
+    # and TPU in _validate_device); skip it there like the existing TPU skip.
+    if DEVICE.type in ("tpu", "npu"):
         del baselines["flex"]
 
     run_example(lambda *args: attention(*args)[0], baselines, (q, k, v))
