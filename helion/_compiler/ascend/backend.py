@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import Callable
 
 import torch
 
@@ -16,6 +17,8 @@ if TYPE_CHECKING:
 
 class AscendBackend(TritonBackend):
     """Triton backend targeting Ascend NPU via triton-ascend."""
+
+    device_types = frozenset({"npu"})
 
     @property
     def name(self) -> str:
@@ -48,6 +51,17 @@ class AscendBackend(TritonBackend):
         if "BlockPtrAnalysis" in msg or "addptrRes.hasOneUse" in msg:
             return "debug"
         return super().classify_autotune_exception(err)
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]] | None:
+        """NPU profiler timing when triton-ascend provides it, else events."""
+        from ...autotuner.benchmarking import default_do_bench
+
+        return default_do_bench()
+
+    def get_interleaved_bench(self) -> Callable[..., list[float]] | None:
+        from ...autotuner.benchmarking import default_interleaved_bench
+
+        return default_interleaved_bench()
 
     @property
     def max_tensor_numel(self) -> int | None:

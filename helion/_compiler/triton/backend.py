@@ -11,7 +11,6 @@ import os
 import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import Callable
 from typing import Sequence
 
 import torch
@@ -49,6 +48,8 @@ def _triton_jit_supports_do_not_specialize() -> bool:
 
 class TritonBackend(Backend):
     """Triton code generation backend."""
+
+    device_types = frozenset({"cuda"})
 
     @property
     def name(self) -> str:
@@ -159,21 +160,6 @@ class TritonBackend(Backend):
             triton_dir = helion_triton_cache_dir(device_index)
             os.environ["TRITON_CACHE_DIR"] = triton_dir
             log.debug("Set TRITON_CACHE_DIR=%s", triton_dir)
-
-    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]] | None:
-        # NPU: route to do_bench_npu.
-        if hasattr(torch, "npu") and torch.npu.is_available():
-            from ...autotuner.benchmarking import default_do_bench
-
-            return default_do_bench()
-        return super().get_do_bench()
-
-    def get_interleaved_bench(self) -> Callable[..., list[float]] | None:
-        if hasattr(torch, "npu") and torch.npu.is_available():
-            from ...autotuner.benchmarking import default_interleaved_bench
-
-            return default_interleaved_bench()
-        return super().get_interleaved_bench()
 
     def make_ephemeral_cache(
         self,
