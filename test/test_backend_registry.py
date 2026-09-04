@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from typing import cast
 import unittest
@@ -7,11 +8,13 @@ from unittest import mock
 
 import torch
 
+import helion
 from helion import exc
 from helion._compiler import backend_registry
 from helion._compiler.aten_lowering import AtenLowering
 from helion._compiler.backend import Backend
 from helion._compiler.backend_registry import _REGISTRY
+from helion._compiler.backend_registry import BACKEND_ENV_VAR
 from helion._compiler.backend_registry import all_reserved_launch_param_names
 from helion._compiler.backend_registry import get_backend_class
 from helion._compiler.backend_registry import list_backends
@@ -104,6 +107,133 @@ class TestBackendRegistry(unittest.TestCase):
         # must be the union of all backends
         for cls in _REGISTRY.values():
             self.assertTrue(cls.reserved_launch_param_names().issubset(result))
+
+    def test_builtin_device_types(self) -> None:
+        from helion._compiler.backend_registry import find_backend_for_device
+
+        # Triton lowers for NVIDIA (cuda; ROCm reports the same type), Intel
+        # GPUs (xpu) and MTIA; pallas targets TPU; metal targets MPS.
+        self.assertEqual(find_backend_for_device("cuda"), "triton")
+        self.assertEqual(find_backend_for_device("xpu"), "triton")
+        self.assertEqual(find_backend_for_device("mtia"), "triton")
+        self.assertEqual(find_backend_for_device("tpu"), "pallas")
+        self.assertEqual(find_backend_for_device("mps"), "metal")
+        # No builtin backend opts into routing for cpu or unknown devices.
+        self.assertIsNone(find_backend_for_device("cpu"))
+        self.assertIsNone(find_backend_for_device("does_not_exist"))
+        # Experimental backends opt out of device routing entirely (in
+        # particular TileIRBackend must not inherit Triton's device_types).
+        self.assertEqual(get_backend_class("cute").device_types, frozenset())
+        self.assertEqual(get_backend_class("tileir").device_types, frozenset())
+
+    def _register_routing_backend(
+        self, name: str, device_types: frozenset[str]
+    ) -> type[Backend]:
+        from helion._compiler.triton.backend import TritonBackend
+
+        class _RoutingTestBackend(TritonBackend):
+            @property
+            def name(self) -> str:
+                return name
+
+        _RoutingTestBackend.device_types = device_types
+        # register_compiler_backend also mutates the _REPAIRED_CODEGEN_NAMES
+        # global; isolate it, and unregister on cleanup so test registration
+        # leaves no global state behind.
+        patcher = mock.patch.object(
+            backend_registry, "_REPAIRED_CODEGEN_NAMES", frozenset()
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(_REGISTRY.pop, name, None)
+        register_compiler_backend(_RoutingTestBackend)
+        return _RoutingTestBackend
+
+    def test_resolve_routes_to_backend_declaring_device(self) -> None:
+        from helion._compiler.backend_registry import resolve_backend_name
+
+        self._register_routing_backend("_route_test", frozenset({"cpu"}))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(BACKEND_ENV_VAR, None)
+            self.assertEqual(resolve_backend_name("cpu", "triton"), "_route_test")
+
+    def test_resolve_does_not_route_when_backend_explicit(self) -> None:
+        from helion._compiler.backend_registry import resolve_backend_name
+
+        # Use a device a builtin backend claims (mps -> metal): a broken
+        # env-var guard would reroute to "metal", making this discriminating.
+        with mock.patch.dict(os.environ, {BACKEND_ENV_VAR: "triton"}, clear=False):
+            self.assertEqual(resolve_backend_name("mps", "triton"), "triton")
+
+    def test_resolve_does_not_route_programmatic_backend_choice(self) -> None:
+        # A backend chosen programmatically via Settings(backend=...) (with no
+        # HELION_BACKEND set) is an explicit choice and must never be rerouted,
+        # even when another registered backend targets the active device.
+        from helion._compiler.backend_registry import resolve_backend_name
+
+        self._register_routing_backend("_route_explicit", frozenset({"tpu"}))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(BACKEND_ENV_VAR, None)
+            # Device "tpu" makes this discriminating: a broken explicit-name
+            # guard would reroute to the builtin "pallas" backend.
+            self.assertEqual(
+                resolve_backend_name("tpu", "_route_explicit"), "_route_explicit"
+            )
+
+    def test_resolve_keeps_default_when_no_backend_declares_device(self) -> None:
+        from helion._compiler.backend_registry import resolve_backend_name
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(BACKEND_ENV_VAR, None)
+            self.assertEqual(resolve_backend_name("cpu", "triton"), "triton")
+
+    def test_resolve_skips_routing_when_default_backend_opts_out(self) -> None:
+        # A default backend that opts out of device routing (empty
+        # device_types) is never rerouted, even when another registered
+        # backend declares the active device.
+        from helion._compiler.backend_registry import resolve_backend_name
+        from helion._compiler.triton.backend import TritonBackend
+
+        self._register_routing_backend("_route_test", frozenset({"cpu"}))
+        with (
+            mock.patch.dict(os.environ, {}, clear=False),
+            mock.patch.object(TritonBackend, "device_types", frozenset()),
+        ):
+            os.environ.pop(BACKEND_ENV_VAR, None)
+            self.assertEqual(resolve_backend_name("cpu", "triton"), "triton")
+
+    def test_min_dot_size_is_route_aware_for_tpu(self) -> None:
+        # TPU MXU tile floors must apply for a tpu device even when the
+        # implicit default backend is still "triton" (a kernel routed to
+        # pallas at bind time), not just with HELION_BACKEND=pallas.
+        from helion._compat import min_dot_size
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(BACKEND_ENV_VAR, None)
+            # A tpu-typed device (torch_tpu registers the type on TPU
+            # machines); a Mock stands in since this torch build lacks it.
+            tpu_device = mock.Mock()
+            tpu_device.type = "tpu"
+            self.assertEqual(
+                min_dot_size(tpu_device, torch.float16, torch.float16),
+                (8, 128, 128),
+            )
+            self.assertEqual(
+                min_dot_size(torch.device("cpu"), torch.float16, torch.float16),
+                (16, 16, 16),
+            )
+
+    def test_environment_applies_device_routing_end_to_end(self) -> None:
+        # One integration test: CompileEnvironment routes the default backend
+        # to the backend declaring the active device at bind time.
+        self._register_routing_backend("_route_test", frozenset({"cpu"}))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(BACKEND_ENV_VAR, None)
+            env = CompileEnvironment(
+                torch.device("cpu"),
+                helion.Settings(backend="triton"),
+            )
+        self.assertEqual(env.backend_name, "_route_test")
 
 
 class TestBackendCodegenRepair(unittest.TestCase):

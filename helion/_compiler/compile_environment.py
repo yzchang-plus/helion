@@ -37,6 +37,7 @@ from .._compat import target_device_capability
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend_registry import get_backend_class
+from .backend_registry import resolve_backend_name
 from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
@@ -325,7 +326,18 @@ class CompileEnvironment:
         )
         self._is_distributed = is_distributed
         self.process_group_name = None
-        self._backend = get_backend_class(settings.backend)()
+        # Route the implicit default backend to one targeting this device
+        # (e.g. "triton" -> "metal" on mps); see resolve_backend_name.
+        backend_name = resolve_backend_name(device.type, settings.backend)
+        if backend_name != settings.backend:
+            log.info(
+                "Device %s: using the '%s' backend (the default '%s' backend "
+                "does not target this device)",
+                device.type,
+                backend_name,
+                settings.backend,
+            )
+        self._backend = get_backend_class(backend_name)()
         self._backend.validate_environment()
         if self._backend.experimental:
             from torch._dynamo.utils import warn_once

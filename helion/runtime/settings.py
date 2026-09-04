@@ -22,6 +22,8 @@ from torch._environment import is_fbcode
 from .. import exc
 from .._compat import is_hip
 from .._compat import supports_tf32_precision_on_amd
+from .._compiler.backend_registry import BACKEND_ENV_VAR
+from .._compiler.backend_registry import DEFAULT_BACKEND_NAME
 from .._compiler.backend_registry import list_backends
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import InitialPopulation
@@ -365,8 +367,8 @@ def _get_dot_precision() -> DotPrecision:
 
 def _get_backend() -> str:
     return _env_get_literal(
-        "HELION_BACKEND",
-        "triton",
+        BACKEND_ENV_VAR,
+        DEFAULT_BACKEND_NAME,
         mapping={name: name for name in list_backends()},
     )
 
@@ -634,7 +636,9 @@ class Settings(_Settings):
         "backend": (
             "Code generation backend. One of 'triton' (default), 'pallas' (JAX/Pallas), "
             "'cute' (CUTLASS CuTe DSL), or 'metal' (Apple Metal MSL). "
-            "Set HELION_BACKEND=<backend> to override."
+            "Set HELION_BACKEND=<backend> to override. When unset, the default "
+            "backend is automatically routed to a registered backend targeting "
+            "the active device (e.g. 'metal' on MPS)."
         ),
         "ignore_warnings": (
             "Subtypes of exc.BaseWarning to ignore when compiling. "

@@ -168,6 +168,14 @@ class Backend(abc.ABC):
     - What decorators and annotations are used on generated functions
     """
 
+    # ``torch.device.type`` values this backend can target (e.g. ``{"cuda"}``).
+    # Used for automatic device routing: when the backend selected by default
+    # does not target the active device type but another registered backend
+    # does, :class:`CompileEnvironment` routes to that backend (e.g. the
+    # default ``triton`` backend routes to ``metal`` on ``mps``). An empty
+    # frozenset (the default) opts out of device routing entirely.
+    device_types: frozenset[str] = frozenset()
+
     @property
     @abc.abstractmethod
     def name(self) -> str:

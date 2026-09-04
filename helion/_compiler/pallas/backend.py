@@ -154,6 +154,10 @@ def _slice_addressing(
 class PallasBackend(Backend):
     """Pallas (JAX) code generation backend for TPU."""
 
+    # TPU only; the CPU "pallas interpret" mode is an explicit debug setting,
+    # not an automatic device-routing target.
+    device_types = frozenset({"tpu"})
+
     @property
     def name(self) -> str:
         return "pallas"

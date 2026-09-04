@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 class MetalBackend(Backend):
     """Metal Shading Language (MSL) code generation backend for macOS."""
 
+    device_types = frozenset({"mps"})
+
     @staticmethod
     def _get_dtype_to_metal() -> dict[torch.dtype, str]:
         from torch._inductor.codegen.mps import DTYPE_TO_METAL

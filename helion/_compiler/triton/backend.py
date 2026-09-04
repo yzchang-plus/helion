@@ -49,6 +49,10 @@ def _triton_jit_supports_do_not_specialize() -> bool:
 class TritonBackend(Backend):
     """Triton code generation backend."""
 
+    # NVIDIA (``cuda``; ROCm reports the same device type), Intel GPUs
+    # (``xpu``), and Meta MTIA (``mtia``) all lower through Triton.
+    device_types = frozenset({"cuda", "xpu", "mtia"})
+
     @property
     def name(self) -> str:
         return "triton"
@@ -590,6 +594,10 @@ class TritonBackend(Backend):
 
 class TileIRBackend(TritonBackend):
     """TileIR code generation backend (extends Triton)."""
+
+    # Experimental and selected explicitly (ENABLE_TILE); do not inherit
+    # Triton's device routing declarations.
+    device_types = frozenset()
 
     @property
     def name(self) -> str:

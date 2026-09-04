@@ -6,6 +6,7 @@ All backend lookup and instantiation should go through this module.
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 import threading
 import types
@@ -31,6 +32,11 @@ _BUILTIN_BACKENDS: list[type[Backend]] = [
 _REGISTRY: dict[str, type[Backend]] = {}
 _CODEGEN_REPAIR_LOCK = threading.RLock()
 _REPAIRED_CODEGEN_NAMES: frozenset[str] = frozenset()
+
+# Backend override env var and the compiled-in default backend name. Kept here
+# so both settings defaults and device routing share one definition.
+BACKEND_ENV_VAR = "HELION_BACKEND"
+DEFAULT_BACKEND_NAME = "triton"
 
 
 def register_compiler_backend(backend_class: type[Backend]) -> None:
@@ -63,6 +69,55 @@ def get_backend_class(name: str) -> type[Backend]:
 def list_backends() -> list[str]:
     """Return the names of all registered backends."""
     return list(_REGISTRY.keys())
+
+
+def find_backend_for_device(device_type: str) -> str | None:
+    """Return the name of a registered backend that targets ``device_type``.
+
+    A backend participates in device routing only when its ``device_types``
+    class attribute is non-empty. When several backends declare the same
+    device type, the first registered wins (registration order is stable).
+    Returns ``None`` when no backend targets the device.
+    """
+    for name, backend_cls in _REGISTRY.items():
+        if device_type in backend_cls.device_types:
+            return name
+    return None
+
+
+def is_default_backend_selection(backend_name: str) -> bool:
+    """Whether ``backend_name`` is eligible for automatic device routing: the
+    compiled-in default backend name with ``HELION_BACKEND`` unset. An explicit
+    ``HELION_BACKEND`` or a ``Settings(backend=<other name>)`` is never routed;
+    a programmatic ``Settings(backend=<default name>)`` is indistinguishable
+    from the implicit default and is eligible."""
+    return not os.environ.get(BACKEND_ENV_VAR) and backend_name == DEFAULT_BACKEND_NAME
+
+
+def resolve_backend_name(device_type: str, backend_name: str) -> str:
+    """Resolve the backend to use for ``device_type``.
+
+    Returns ``backend_name`` unchanged unless routing applies: the selection
+    is the implicit default (:func:`is_default_backend_selection`), that
+    backend opts into routing via ``device_types`` but does not target
+    ``device_type``, and another registered backend does -- in which case
+    that backend's name is returned (first registered wins). Explicit choices
+    and devices no backend declares are returned unchanged.
+
+    Called at bind time in :class:`CompileEnvironment`; code that reads the
+    backend before then (e.g. ``settings.backend`` at Kernel construction)
+    sees the unresolved name. One such construction-time path is the
+    zero-warmup TPU compile-capture registration, which therefore still
+    requires an explicit ``HELION_BACKEND=pallas``.
+    """
+    if not is_default_backend_selection(backend_name):
+        return backend_name
+    selected_cls = get_backend_class(backend_name)
+    if selected_cls.device_types and device_type not in selected_cls.device_types:
+        routed = find_backend_for_device(device_type)
+        if routed is not None:
+            return routed
+    return backend_name
 
 
 def all_reserved_launch_param_names() -> frozenset[str]:

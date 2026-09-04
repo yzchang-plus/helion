@@ -246,10 +246,11 @@ if triton_is_available():
         device: torch.device, lhs: torch.dtype, rhs: torch.dtype
     ) -> tuple[int, int, int]:
         # Helion's Pallas backend always targets TPU's Mosaic MXU, even in
-        # interpret mode where the actual device is "cpu".
+        # interpret mode where the actual device is "cpu". The device.type
+        # check also covers kernels routed to pallas implicitly at bind time.
         from .runtime.settings import _get_backend
 
-        if _get_backend() == "pallas":
+        if _get_backend() == "pallas" or device.type == "tpu":
             # TPU Mosaic MXU tile: (8, 128) sublane × lane.
             # pl.dot(lhs[M,K], rhs[K,N]) needs M>=8, K>=128, N>=128.
             return (8, 128, 128)
@@ -334,7 +335,9 @@ else:
     ) -> tuple[int, int, int]:
         from .runtime.settings import _get_backend
 
-        if _get_backend() == "pallas":
+        # device.type == "tpu" covers implicitly routed pallas kernels; see
+        # the triton-installed version above.
+        if _get_backend() == "pallas" or device.type == "tpu":
             return (8, 128, 128)
         return (16, 16, 16)
 
