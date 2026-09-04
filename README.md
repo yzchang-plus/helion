@@ -322,6 +322,39 @@ To enable the CuTe backend:
    export HELION_BACKEND=cute
    ```
 
+## Ascend NPU Backend (fork-maintained)
+
+This fork adds an **Ascend NPU** backend (`ascend`) that lowers Helion kernels
+through Triton with the [triton-ascend](https://github.com/Ascend/triton-ascend)
+plugin. It is maintained in this fork (branches `npu-release` / `npu-dev`) and is
+not part of upstream PyTorch Helion.
+
+**Requirements (pinned):** torch 2.10.0+cpu, torch_npu 2.10.0, triton 3.2.0,
+triton-ascend 3.2.1; Ascend 910B4 tested.
+
+On an NPU machine the default `triton` backend is automatically routed to
+`ascend` — no environment variable needed. Explicitly `HELION_BACKEND=triton`
+(and no NPU) behaves exactly as upstream.
+
+**Support matrix (v0.4.0-npu.1, 2026-09-04, Ascend 910B4):**
+
+| 范围 | 状态 |
+|---|---|
+| examples/ 顶层算子 | 45 / 58 pass |
+| examples/ 子目录单卡算子（acfs + linear） | 8 / 9 pass |
+| **单卡算子合计** | **53 / 67 pass (79%)** |
+| examples/distributed（需 CUDA+nccl） | 不支持 |
+| pretuned_kernels/（CUDA dashboard 配方：jax/CUTLASS/cudagraph/cuda 分配/sm90-121 heuristic） | 不支持 |
+| benchmarks/（tritonbench）、notebooks/ | 未验证 |
+
+Known gaps (14 failing single-card examples): hardware-unsupported dtypes
+(fp8/nvfp4/Blackwell instructions, 7), framework/UB-capacity/precision gaps
+(int4_gemm coreDim, rope/layer_norm UB overflow, squeeze_and_excitation_net bwd
+mismatch, vanilla_linear_attn accuracy, sparse_attn_indexer lowering, jsd OOM,
+flex_attention device check). See `npu_dev_acceptance_report.md` (fork only) for
+the per-operator report; `epilogue_subtiling` passes correctness but needs real
+autotuning (pathologically slow under `HELION_AUTOTUNE_EFFORT=none`).
+
 ## Settings for Development and Debugging
 
 When developing kernels with Helion, you might prefer skipping autotuning for faster iteration. To
