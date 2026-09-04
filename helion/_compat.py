@@ -359,7 +359,9 @@ if triton_is_available():
     # a process, and computing here keeps the per-launch ``supports_launch_cooperative_grid``
     # call free of dynamic imports (Dynamo-safe under torch.compile).
     try:
-        _SUPPORTS_LAUNCH_COOPERATIVE_GRID: bool = _compute_launch_cooperative_grid_support()
+        _SUPPORTS_LAUNCH_COOPERATIVE_GRID: bool = (
+            _compute_launch_cooperative_grid_support()
+        )
     except Exception:
         _SUPPORTS_LAUNCH_COOPERATIVE_GRID = True
 
@@ -492,6 +494,8 @@ def get_device_name(device: torch.device | None = None) -> str | None:
     if device is None:
         if torch.cuda.is_available():
             device = torch.device("cuda", torch.cuda.current_device())
+        elif getattr(torch, "npu", None) is not None and torch.npu.is_available():
+            device = torch.device("npu", torch.npu.current_device())
         elif getattr(torch, "tpu", None) is not None and torch.tpu.is_available():
             # torch_tpu (PrivateUse1) exposes no per-chip name; report the
             # generation so dashboard rows land on the "tpu" platform instead of
@@ -510,6 +514,13 @@ def get_device_name(device: torch.device | None = None) -> str | None:
         if name.startswith("NVIDIA H100"):
             return "NVIDIA H100"
         return name
+
+    if (
+        device.type == "npu"
+        and getattr(torch, "npu", None) is not None
+        and torch.npu.is_available()
+    ):
+        return torch.npu.get_device_properties(device).name
 
     if (
         device.type == "xpu"

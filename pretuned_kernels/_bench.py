@@ -26,6 +26,7 @@ from typing import cast
 import torch
 
 from helion import exc
+from helion._compat import get_device_name
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.logger import classify_triton_exception
 from helion.autotuner.logger import match_unrecoverable_runtime_error
@@ -137,15 +138,23 @@ def bench_pre_captured_cudagraph(call: Callable[[], object], rep: int = 100) -> 
 
 
 def thermal_warmup(duration_ms: int) -> None:
-    """Raise GPU clocks with device work before a latency sweep."""
+    """Raise accelerator clocks with device work before a latency sweep."""
     if duration_ms <= 0:
         return
-    value = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+    if torch.cuda.is_available():
+        device = "cuda"
+        synchronize = torch.cuda.synchronize
+    elif getattr(torch, "npu", None) is not None and torch.npu.is_available():
+        device = "npu"
+        synchronize = torch.npu.synchronize
+    else:
+        return
+    value = torch.randn(4096, 4096, device=device, dtype=torch.bfloat16)
     end = time.monotonic() + duration_ms / 1000
     while time.monotonic() < end:
         for _ in range(50):
             value = value @ value
-        torch.cuda.synchronize()
+        synchronize()
 
 
 class CapturedCudagraphBenchmarkProvider(LocalBenchmarkProvider, abc.ABC):
@@ -252,7 +261,7 @@ def run_sweep(
             print(*args)
 
     if verbose:
-        _p(f"GPU: {torch.cuda.get_device_name()}")
+        _p(f"Device: {get_device_name() or 'unknown'}")
     speedups_by_base: dict[str, list[float]] = {}
     best_speedups: list[float] = []
     helion_wins = 0
