@@ -42,8 +42,11 @@ BLOCK_SIZE_CHOICES = (32, 256)
 
 
 @helion.kernel
-def device_loop_3d(x: torch.Tensor) -> torch.Tensor:
-    out = torch.empty_like(x)
+def device_loop_3d(x: torch.Tensor, output: torch.Tensor | None = None) -> torch.Tensor:
+    if output is None:
+        out = torch.empty_like(x)
+    else:
+        out = output
     a, b, c, d = x.shape
     for tile_a in hl.tile(a):
         for tile_b, tile_c, tile_d in hl.tile([b, c, d]):
@@ -105,6 +108,29 @@ def atomic_then_independent_reduction(
             acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
         out[tile_m, tile_n] = acc
     return x, out
+
+
+@helion.kernel()
+def store_with_output_metadata(x: torch.Tensor, out: torch.Tensor) -> None:
+    for tile in hl.tile(x.size(0), block_size=1):
+        _metadata = (
+            out.device,
+            out.dim(),
+            out.dtype,
+            out.ndim,
+            out.ndimension(),
+            out.shape,
+            out.size(),
+            out.stride(),
+        )
+        hl.store(out, [tile], x[tile].to(out.dtype))
+
+
+@helion.kernel()
+def store_with_output_read(x: torch.Tensor, out: torch.Tensor) -> None:
+    for tile in hl.tile(x.size(0), block_size=1):
+        prior = hl.load(out, [tile])
+        hl.store(out, [tile], (x[tile] + prior).to(out.dtype))
 
 
 @onlyBackends(["triton", "cute", "pallas"])
@@ -218,7 +244,10 @@ class TestLoops(RefEagerTestBase, TestCase):
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop1(self):
-        args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
+        x = torch.randn([128, 128, 128, 128], device=DEVICE)
+        # An output argument retains the serial loop axes under CuTe's
+        # fresh-output partition promotion, so these controls remain exercised.
+        args = (x, torch.empty_like(x))
         code, result = code_and_output(
             device_loop_3d,
             args,
@@ -231,7 +260,8 @@ class TestLoops(RefEagerTestBase, TestCase):
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop2(self):
-        args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
+        x = torch.randn([128, 128, 128, 128], device=DEVICE)
+        args = (x, torch.empty_like(x))
         code, result = code_and_output(
             device_loop_3d,
             args,
@@ -246,7 +276,8 @@ class TestLoops(RefEagerTestBase, TestCase):
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop3(self):
-        args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
+        x = torch.randn([128, 128, 128, 128], device=DEVICE)
+        args = (x, torch.empty_like(x))
         code, result = code_and_output(
             device_loop_3d,
             args,
@@ -1042,6 +1073,26 @@ class TestLoops(RefEagerTestBase, TestCase):
         args = (torch.randn([16, 16], device=DEVICE),)
         spec = nested_loop_kernel.bind(args).config_spec
         self.assertGreater(len(spec.range_num_stages), 0)
+
+    @xfailIfPallas("range_num_stages is Triton-specific")
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_output_metadata_read_does_not_disable_range_num_stages(self):
+        x = torch.randn([16], device=DEVICE)
+        out = torch.empty_like(x)
+        spec = store_with_output_metadata.bind((x, out)).config_spec
+        self.assertGreater(len(spec.range_num_stages), 0)
+        normalized = spec.normalized_config(
+            helion.Config(pid_type="persistent_blocked", range_num_stages=[1])
+        )
+        self.assertEqual(normalized.range_num_stages, [1])
+
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_output_data_read_disables_range_num_stages(self):
+        x = torch.randn([16], device=DEVICE)
+        out = torch.empty_like(x)
+        spec = store_with_output_read.bind((x, out)).config_spec
+        self.assertEqual(len(spec.range_num_stages), 0)
 
     @skipIfRefEager("not supported in ref eager mode")
     def test_range_num_stages_removed_for_inplace_kernel(self):

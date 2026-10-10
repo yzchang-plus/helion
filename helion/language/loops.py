@@ -13,9 +13,7 @@ from typing import cast
 from typing import overload
 
 import torch
-from torch._inductor.runtime.triton_heuristics import (
-    get_max_y_grid,  # type: ignore[import-untyped]
-)
+from torch._inductor.runtime.triton_heuristics import get_max_y_grid  # type: ignore[import-untyped]
 
 from .. import exc
 from .._compat import use_tileir_tunables

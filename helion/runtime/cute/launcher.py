@@ -40,6 +40,10 @@ from torch.utils.weak import WeakIdKeyDictionary
 
 from ... import exc
 from ..._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
+from ..._compiler.cute.grouped_full_coverage import full_coverage_index_domain
+from ..._compiler.cute.grouped_row_union import (
+    schedule_by_name as row_union_schedule_by_name,
+)
 from ..._compiler.cute.grouped_worklist import GroupedWorklistRows
 from ..._compiler.cute.grouped_worklist import Tcgen05GroupedWorklistValidationError
 from ..._compiler.cute.grouped_worklist import (
@@ -53,6 +57,9 @@ from ..._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from ..._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from ..._compiler.cute.strategies import tcgen05_smem_layout_expr
 from ..._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL,
+)
+from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS,
 )
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_RUNTIME_TILE_FIELD_COUNT
@@ -64,8 +71,13 @@ from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
 )
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+from ..._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE,
+)
 from ..._compiler.cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
+from ..._compiler.cute.tcgen05_grouped_descriptors import WrappedGroupedDescriptorPlan
 from ..triton.launcher import get_num_sm
+from .source_dependencies import wrapper_source_dependencies
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
@@ -286,7 +298,65 @@ def _append_cute_wrapper_plan(
     call_args: list[str],
     plan: dict[str, object],
     num_sm: int | None = None,
+    schema_key: Sequence[tuple[object, ...]] | None = None,
 ) -> None:
+    descriptor_identity = plan.get("wrapped_grouped_descriptors")
+    descriptors = (
+        WrappedGroupedDescriptorPlan.from_identity(descriptor_identity)
+        if descriptor_identity is not None
+        else None
+    )
+    if descriptors is not None:
+        if plan.get("orientation") != "nm":
+            raise exc.BackendUnsupported(
+                "cute", "wrapped descriptors require N,M orientation"
+            )
+        if plan.get("kind") in ("tcgen05_grouped_rna", "tcgen05_grouped_tma_rn"):
+            expected_provider = (
+                "typed_flat_element_bases_v1",
+                descriptors.groups,
+                (
+                    descriptors.rows * descriptors.reduction,
+                    descriptors.reduction,
+                    descriptors.reduction,
+                    16,
+                ),
+                (
+                    descriptors.rows * descriptors.columns,
+                    descriptors.columns,
+                    descriptors.columns,
+                    16,
+                ),
+                128,
+                128,
+                descriptors.offset_bits,
+                (0, 1, 2, 3, "a_element_base", 5, 6, 7, "output_element_base"),
+            )
+            if (
+                plan.get("flat_provider") != expected_provider
+                or not plan.get("fixed_ab_tensormaps")
+                or not plan.get("fixed_grouped_b_rank3")
+                or plan.get("dynamic_ab_tensormaps")
+                or plan.get("m_size") != descriptors.rows
+                or plan.get("n_size") != descriptors.columns
+                or plan.get("k_total_size") != descriptors.reduction
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "wrapped descriptors disagree with typed provider"
+                )
+        elif plan.get("kind") == "tcgen05_d_tma":
+            if (
+                not plan.get("rank3_mnl_tensor")
+                or plan.get("output_dtype") != "cutlass.Float32"
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "wrapped output requires the flat FP32 store"
+                )
+        else:
+            raise exc.BackendUnsupported(
+                "cute", "wrapped descriptors require typed grouped RNA"
+            )
+
     def plan_int(key: str, default: int | None = None) -> int:
         value = plan.get(key, default) if default is not None else plan[key]
         assert isinstance(value, int)
@@ -409,6 +479,11 @@ def _append_cute_wrapper_plan(
             if worklist_nm_store
             else f"(arg{tensor_idx}_stride0, arg{tensor_idx}_stride1, 0)"
         )
+        gmem_layout = (
+            descriptors.layout(f"arg{tensor_idx}", output=True)
+            if descriptors is not None
+            else f"{rank3_gmem_shape}, stride={rank3_gmem_stride}"
+        )
         # Keep these layout arguments in sync with the device-side
         # ``make_smem_layout_epi`` calls; the wrapper's TMA atom and the kernel's
         # SMEM staging must slice the same epilogue tile shape.
@@ -427,7 +502,7 @@ def _append_cute_wrapper_plan(
                             f"    {gmem_tensor} = cute.make_tensor("
                             f"arg{tensor_idx}.iterator, "
                             "layout=cute.make_layout("
-                            f"{rank3_gmem_shape}, stride={rank3_gmem_stride}))"
+                            f"{gmem_layout}))"
                         ),
                     )
                     if rank3_mnl_tensor
@@ -446,6 +521,172 @@ def _append_cute_wrapper_plan(
         call_args.extend(kernel_args)
 
     kind = plan["kind"]
+    if kind == "block_scaled_mma":
+        if (
+            plan_int("bn") not in (128, 256)
+            or plan_int("bk") not in (64, 128, 256)
+            or plan_int("stages") not in (2, 3, 4, 5)
+            or plan_int("cluster_m") not in (1, 2)
+            or any(plan_int(key) <= 0 for key in ("m", "n", "k", "workspace_bytes"))
+            or plan_int("k") % 16
+            or type(plan.get("persistent")) is not bool
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "invalid block-scaled wrapper geometry"
+            )
+        return
+    if kind == "gathered_mma_tma":
+        bn = plan_int("bn")
+        stages = plan_int("stages")
+        kernel_args = plan["kernel_args"]
+        if (
+            bn not in (128, 256, 512)
+            or stages not in (2, 3, 4)
+            or (128 + bn) * 64 * 2 * stages + 18432 > 232448
+            or not isinstance(kernel_args, (list, tuple))
+            or len(kernel_args) != 6
+            or not all(isinstance(name, str) for name in kernel_args)
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "invalid gathered MMA wrapper geometry"
+            )
+        parameters = cast("Sequence[str]", kernel_args)
+        extent = (
+            f"arg{plan_int('m_extent_idx')}"
+            if "m_extent_idx" in plan
+            else str(plan_int("m_extent"))
+        )
+        body.extend(
+            (
+                (
+                    f"    {', '.join(parameters)} = _helion_make_gathered_tma("
+                    f"arg{plan_int('lhs_idx')}, arg{plan_int('rhs_idx')}, {bn}, {stages})"
+                ),
+                (
+                    f"    grid_x = cutlass.Int32({plan_int('groups') * ((plan_int('n_size') + bn - 1) // bn)}) * "
+                    f"cutlass.Int32(cutlass.min({plan_int('grid_cap')}, cutlass.max(1, "
+                    f"(cutlass.Int64(cutlass.Int32({extent})) + 127) // 128)))"
+                ),
+                "    grid_y = cutlass.Int32(1)",
+                "    grid_z = cutlass.Int32(1)",
+            )
+        )
+        call_args.extend(parameters)
+        return
+    if kind == "chunk_recurrence_sm100":
+        outputs_scaled = plan.get("outputs_scaled")
+        factor_key_xor = plan.get("factor_key_xor")
+        if (
+            plan_int("chunk_size") != 16
+            or plan_int("key_size") != 128
+            or plan_int("value_size") != 128
+            or plan_int("threads") != 512
+            or plan_int("workspace_layout_version") != 2
+            or outputs_scaled is not False
+            or factor_key_xor != 8
+            or plan_int("device_abi") != 2
+            or plan_int("input_stages") != 8
+            or plan_int("tma_stages") != 6
+            or plan_int("factor_tma_value_splits") != 2
+            or plan_int("output_acc_stages") != 2
+            or plan_int("output_smem_stages") != 7
+            or plan_int("output_store_wait_groups") != 6
+            or plan_int("tmem_cols") != 512
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "invalid SM100 chunk-recurrence schedule ABI"
+            )
+        return
+    if kind == "gdn_recurrence_sm100":
+        _validate_gdn_recurrence_plan(plan)
+        return
+    if kind == "chunk_recurrence_warp_dv4":
+        outputs_scaled = plan.get("outputs_scaled")
+        factor_key_xor = plan.get("factor_key_xor")
+        if (
+            plan_int("chunk_size") != 16
+            or plan_int("key_size") != 128
+            or plan_int("value_size") != 128
+            or plan_int("threads") != 192
+            or plan_int("smem_bytes") != 97_536
+            or plan_int("workspace_layout_version") != 2
+            or outputs_scaled is not False
+            or factor_key_xor != 8
+            or plan_int("device_abi") != 3
+            or plan_int("input_stages") != 6
+            or plan_int("tma_stages") != 6
+            or plan_int("factor_tma_value_splits") != 1
+            or plan_int("output_acc_stages") != 2
+            or plan_int("output_smem_stages") != 3
+            or plan_int("output_store_wait_groups") != 0
+            or plan_int("tmem_cols") != 0
+            or plan_int("dv_partitions") != 4
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "invalid SM100 warp-DV4 chunk-recurrence schedule ABI"
+            )
+        desc_args = plan.get("desc_args")
+        if (
+            not isinstance(desc_args, (list, tuple))
+            or len(desc_args) != 7
+            or not all(isinstance(name, str) for name in desc_args)
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "invalid SM100 warp-DV4 descriptor ABI"
+            )
+        body.extend(
+            (
+                f"    grid_x = cutlass.Int32({4 * plan_int('sequences')})",
+                f"    grid_y = cutlass.Int32({plan_int('heads')})",
+                "    grid_z = cutlass.Int32(1)",
+            )
+        )
+        call_args.extend(cast("Sequence[str]", desc_args))
+        return
+    if kind == "chunk_prepare_tma":
+        outputs_scaled = plan.get("outputs_scaled")
+        factor_key_xor = plan.get("factor_key_xor")
+        device_abi = plan_int("device_abi")
+        schedule = plan.get("schedule")
+        split_alias_schedules = tuple(
+            f"split_alias_cpc{chunks_per_cta}" for chunks_per_cta in range(1, 6)
+        )
+        expected_smem = 21_968 if schedule in split_alias_schedules else None
+        if (
+            plan_int("chunk_size") != 16
+            or plan_int("key_size") != 128
+            or plan_int("chunks_per_cta") not in (1, 2, 3, 4, 5)
+            or (
+                schedule in split_alias_schedules
+                and schedule != f"split_alias_cpc{plan_int('chunks_per_cta')}"
+            )
+            or expected_smem is None
+            or plan_int("smem_bytes") != expected_smem
+            or plan_int("bf16_mma_count") != 168
+            or plan_int("fp16_mma_count") != 24
+            or type(outputs_scaled) is not bool
+            or device_abi != (3 if outputs_scaled else 4)
+            or factor_key_xor != (0 if outputs_scaled else 8)
+        ):
+            raise exc.BackendUnsupported("cute", "invalid chunk-prepare schedule ABI")
+        desc_args = plan.get("desc_args")
+        if (
+            not isinstance(desc_args, (list, tuple))
+            or len(desc_args) != 4
+            or not all(isinstance(name, str) for name in desc_args)
+        ):
+            raise exc.BackendUnsupported("cute", "invalid chunk-prepare descriptor ABI")
+        chunks_per_cta = plan_int("chunks_per_cta")
+        grid_x = (plan_int("total_chunks") + chunks_per_cta - 1) // chunks_per_cta
+        body.extend(
+            (
+                f"    grid_x = cutlass.Int32({grid_x})",
+                f"    grid_y = cutlass.Int32({plan_int('heads')})",
+                "    grid_z = cutlass.Int32(1)",
+            )
+        )
+        call_args.extend(cast("Sequence[str]", desc_args))
+        return
     if kind == "helion_small_biased_attention":
         batch = plan_int("batch")
         seq = plan_int("seq")
@@ -453,6 +694,48 @@ def _append_cute_wrapper_plan(
             [
                 f"    grid_x = cutlass.Int32({seq})",
                 f"    grid_y = cutlass.Int32({batch})",
+                "    grid_z = cutlass.Int32(1)",
+            ]
+        )
+        return
+    if kind == "helion_flash_row_mma":
+        # Register-MMA row programs: one CTA per (batch*head, row tile), plain
+        # tensor arguments, no host-side descriptors. The body moves 16-byte
+        # cp.async and st.global.v4 packets from the tensor bases; codegen
+        # resolves bindings with an under-aligned base to the tcgen05
+        # families, and a wrapper schema that still proves one only 8-byte
+        # aligned is refused here rather than faulting on the device.
+        if schema_key is not None:
+            aux_keys = tuple(
+                f"epi_aux{index}_idx"
+                for index in range(plan_int("epi_aux_count", default=0))
+            )
+            for key in ("q_idx", "k_idx", "v_idx", "o_idx", "lse_idx", *aux_keys):
+                index = plan_optional_int(key)
+                if index is not None and (
+                    _cute_schema_pointer_alignment(schema_key[index]) % 16
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "row_mma flash requires 16-byte-aligned q/k/v/o/lse "
+                        "and row-epilogue aux bases",
+                    )
+        body.extend(
+            [
+                f"    grid_x = cutlass.Int32({plan_int('total_tiles')})",
+                "    grid_y = cutlass.Int32(1)",
+                "    grid_z = cutlass.Int32(1)",
+            ]
+        )
+        return
+
+    if kind == "helion_warp_mma_gemm":
+        # Register-MMA GEMM tiles: one CTA per (batch, m, n) output tile,
+        # plain tensor arguments, no host-side descriptors.
+        body.extend(
+            [
+                f"    grid_x = cutlass.Int32({plan_int('total_tiles')})",
+                "    grid_y = cutlass.Int32(1)",
                 "    grid_z = cutlass.Int32(1)",
             ]
         )
@@ -488,7 +771,11 @@ def _append_cute_wrapper_plan(
         use_cga2_local_cta = bool(plan.get("use_cga2_local_cta"))
         use_clc_scheduler = bool(plan.get("use_clc_scheduler"))
         cluster_m = 2 if use_2cta_instrs or use_cga2_local_cta else 1
-        num_kv = (seq + 127) // 128
+        # KV tile width. 128 is the historical fixed value; a wider tile
+        # amortizes the per-tile softmax correction over more columns, which is
+        # where FA4's tuned plans get their edge on sm_103.
+        kv_n = plan_int("kv_tile_n", default=128)
+        num_kv = (seq + kv_n - 1) // kv_n
         # Static-persistent scheduler: total_tiles = num_bh * num_m_tiles (the
         # flat tile-id space the device-body strided while loop walks). When
         # persistent, the host clamps grid_x down to min(total_tiles, num_SMs)
@@ -510,9 +797,12 @@ def _append_cute_wrapper_plan(
         # dense FA4 4D-TMA knob instead treats the same flat storage as
         # (S, D, H, Z), matching FA4's tensor-map rank for contiguous q[z,h,s,d].
         bw = "cutlass.utils.blackwell_helpers"
-        mma_m = 256 if use_2cta_instrs else 128
-        qkd = f"({mma_m}, 128, {hd})"
-        pvd = f"({mma_m}, {hd}, 128)"
+        # Query-tile height: the two-warpgroup ws_overlap body can run 64-row
+        # (tcgen05 M=64) tiles; fa4 and the 2-CTA families stay at 128/256.
+        q_tile_m = plan_int("q_tile_m", default=128)
+        mma_m = 256 if use_2cta_instrs else q_tile_m
+        qkd = f"({mma_m}, {kv_n}, {hd})"
+        pvd = f"({mma_m}, {hd}, {kv_n})"
         if use_tensor_4d_tma:
             bh_stride = seq * hd
             batch_stride = tensor_4d_heads * bh_stride
@@ -549,7 +839,7 @@ def _append_cute_wrapper_plan(
             # V is MN-major: (D, S, B).
             f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {dsb})",
             f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb})",
-            f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg}, ({mma_m}, 128))",
+            f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg}, ({mma_m}, {kv_n}))",
             f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg}, ({mma_m}, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
             f"_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout(({2 if use_2cta_instrs else 1}, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
             f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {dtype}, {q_stage})",
@@ -593,6 +883,14 @@ def _append_cute_wrapper_plan(
                     ),
                 ]
             )
+        # Fused row-epilogue inputs share O's (S, D, B) view so the device body
+        # can partition them exactly like the O store.
+        epi_aux_count = plan_int("epi_aux_count", default=0)
+        for index in range(epi_aux_count):
+            aux_idx = plan_int(f"epi_aux{index}_idx")
+            flash_lines.append(
+                f"_flash_mEpiAux{index} = cute.make_tensor(arg{aux_idx}.iterator, {sdb})"
+            )
         if pass_dynamic_tile_counts:
             flash_lines.extend(
                 [
@@ -610,12 +908,17 @@ def _append_cute_wrapper_plan(
             # Build the O smem layout for epilogue-warp store paths. The TMA
             # variant also builds the O TMA STORE atom; the STG variant reuses
             # the layout but stores with a universal-copy tiled copy in device code.
-            otile = f"(128, {hd})"
+            # One sO stage per resident Q tile: the fa4 topology drains both
+            # Q tiles of a work item, ws_overlap stages its single tile.
+            # Per-CTA output tile: 128 rows for fa4 (also under CtaGroup.TWO,
+            # where each CTA stores its own half) or the ws_overlap tile height.
+            otile = f"({q_tile_m}, {hd})"
             flash_lines.extend(
                 [
                     (
                         f"_flash_osl = {bw}.make_smem_layout_epi("
-                        f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {otile}, 2)"
+                        f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {otile}, "
+                        f"{q_stage})"
                     ),
                 ]
             )
@@ -636,6 +939,23 @@ def _append_cute_wrapper_plan(
                 )
             else:
                 flash_lines.append("_flash_mOt = _flash_mO")
+            if plan.get("epi_aux_tma"):
+                # The fused row epilogue's aux tile is TMA-loaded into the free
+                # sO stage with the output tile's smem layout.
+                flash_lines.extend(
+                    [
+                        (
+                            "_flash_aux_cta_v = cute.composition("
+                            f"cute.make_identity_layout(_flash_mEpiAux0.shape), {otile})"
+                        ),
+                        (
+                            "_flash_tma_aux0, _flash_mEpiAux0t = "
+                            "cute.nvgpu.cpasync.make_tiled_tma_atom("
+                            "cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(), _flash_mEpiAux0, "
+                            "cute.select(_flash_osl, mode=[0, 1]), _flash_aux_cta_v)"
+                        ),
+                    ]
+                )
         else:
             # mO stays the (S, D, B) view (no TMA atom; the epilogue uses
             # autovec_copy straight to gmem).
@@ -670,6 +990,10 @@ def _append_cute_wrapper_plan(
             # The default root grid would launch batch * seq // 128; override it
             # to the halved fa4 tile count.
             body.append(f"    grid_x = cutlass.Int32({total_tiles * cluster_m})")
+        elif q_tile_m != 128:
+            # 64-row ws_overlap tiles: one CTA per (bh, 64-row tile), twice the
+            # default 128-row root grid.
+            body.append(f"    grid_x = cutlass.Int32({total_tiles})")
         call_args.extend(
             [
                 "_flash_qk_mma",
@@ -703,6 +1027,312 @@ def _append_cute_wrapper_plan(
             call_args.extend(["_flash_tma_o", "_flash_osl"])
         elif epi_stg:
             call_args.append("_flash_osl")
+        call_args.extend(f"_flash_mEpiAux{index}" for index in range(epi_aux_count))
+        if plan.get("epi_aux_tma"):
+            call_args.extend(["_flash_tma_aux0", "_flash_mEpiAux0t"])
+        return
+    if kind == "helion_flash_gated":
+        # Imported here: the gated module pulls in the compiler's device IR,
+        # which imports the runtime package this module belongs to.
+        from ..._compiler.cute.cute_flash_gated import GATED_KERNEL_PARAMS
+
+        # Fused tcgen05 gated attention over jagged rows: Q/K/V/O are rank-3
+        # ``[rows, D, lanes]`` (or ``[lanes, rows, D]``) host tensors. The TMA
+        # descriptors cover the whole tensor with its runtime row extent so the
+        # device body can ``domain_offset`` to any row base and partial tiles
+        # past the end are zero-filled. Layout literals come from the
+        # ``arg{i}_shape{d}`` / ``arg{i}_stride{d}`` wrapper bindings.
+        q_idx = plan_int("q_idx")
+        k_idx = plan_int("k_idx")
+        v_idx = plan_int("v_idx")
+        o_idx = plan_int("o_idx")
+        hd = plan_int("head_dim")
+        bn = plan_int("kv_tile")
+        bm = plan_int("q_tile", default=128)
+        kv_stage = plan_int("kv_stage")
+        dtype = str(plan.get("dtype", "cutlass.Float16"))
+        assert dtype in ("cutlass.Float16", "cutlass.BFloat16", "cutlass.Float32")
+        # fp32 tensors run the MMA as tf32 (Helion's default dot precision):
+        # the gmem tensors keep Float32, the smem layouts / MMA use TFloat32
+        # and the TMA descriptors recast via ``internal_type`` (same width).
+        mma_dtype = str(plan.get("mma_dtype", dtype))
+        tma_internal = (
+            ", internal_type=cutlass.TFloat32"
+            if mma_dtype == "cutlass.TFloat32"
+            else ""
+        )
+
+        def rows_layout(idx: int, key: str) -> str:
+            row_dim = plan_int(f"{key}_row_dim")
+            lane_dim = plan_int(f"{key}_lane_dim")
+            return (
+                f"cute.make_layout((arg{idx}_shape{row_dim}, {hd}, "
+                f"arg{idx}_shape{lane_dim}), stride=(arg{idx}_stride{row_dim}, 1, "
+                f"arg{idx}_stride{lane_dim}))"
+            )
+
+        def cols_layout(idx: int, key: str) -> str:
+            row_dim = plan_int(f"{key}_row_dim")
+            lane_dim = plan_int(f"{key}_lane_dim")
+            return (
+                f"cute.make_layout(({hd}, arg{idx}_shape{row_dim}, "
+                f"arg{idx}_shape{lane_dim}), stride=(1, arg{idx}_stride{row_dim}, "
+                f"arg{idx}_stride{lane_dim}))"
+            )
+
+        bw = "cutlass.utils.blackwell_helpers"
+        qkd = f"({bm}, {bn}, {hd})"
+        pvd = f"({bm}, {hd}, {bn})"
+        majk = "cute.nvgpu.OperandMajorMode.K"
+        cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
+        sel = "cute.select"
+        gated_lines = [
+            f"_flash_mQ = cute.make_tensor(arg{q_idx}.iterator, {rows_layout(q_idx, 'q')})",
+            f"_flash_mK = cute.make_tensor(arg{k_idx}.iterator, {rows_layout(k_idx, 'k')})",
+            f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {cols_layout(v_idx, 'v')})",
+            f"_flash_mOt = cute.make_tensor(arg{o_idx}.iterator, {rows_layout(o_idx, 'o')})",
+            f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({mma_dtype}, {mma_dtype}, {majk}, {majk}, cutlass.Float32, {cg1}, ({bm}, {bn}))",
+            f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({mma_dtype}, {mma_dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg1}, ({bm}, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            "_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout((1, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
+            f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {mma_dtype}, 1)",
+            f"_flash_ksl = {bw}.make_smem_layout_b(_flash_qk_mma, {qkd}, {mma_dtype}, {kv_stage})",
+            f"_flash_vsl = {bw}.make_smem_layout_b(_flash_pv_mma, {pvd}, {mma_dtype}, {kv_stage})",
+            f"_flash_ptl = {bw}.make_smem_layout_a(_flash_pv_mma, {pvd}, {mma_dtype}, 1)",
+            f"_flash_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg1})",
+            f"_flash_tma_q, _flash_mQt = cute.nvgpu.make_tiled_tma_atom_A(_flash_op, _flash_mQ, {sel}(_flash_qsl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape{tma_internal})",
+            f"_flash_tma_k, _flash_mKt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mK, {sel}(_flash_ksl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape{tma_internal})",
+            f"_flash_tma_v, _flash_mVt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mV, {sel}(_flash_vsl, mode=[0, 1, 2]), {pvd}, _flash_pv_mma, _flash_cluster_layout_vmnk.shape{tma_internal})",
+        ]
+        body.extend(f"    {line}" for line in gated_lines)
+        call_args.extend(GATED_KERNEL_PARAMS)
+        return
+    if kind == "helion_flash_bwd" and plan.get("two_cta"):
+        # 2-CTA cluster variant (FA4 SM100 backward layout): all M-widened
+        # tiled_mmas are CtaGroup.TWO; Q/dO get separate natural- and
+        # transposed-orientation half loads; Kt spans the 256-row cluster KV
+        # tile; sdS is the exchanged dQ A operand.
+        q_idx = plan_int("q_idx")
+        k_idx = plan_int("k_idx")
+        v_idx = plan_int("v_idx")
+        do_idx = plan_int("do_idx")
+        lse_idx = plan_int("lse_idx")
+        delta_idx = plan_int("delta_idx")
+        dq_idx = plan_int("dq_idx")
+        dk_idx = plan_int("dk_idx")
+        dv_idx = plan_int("dv_idx")
+        hd = plan_int("head_dim")
+        tq = plan_int("total_q_rows")
+        tk = plan_int("total_kv_rows")
+        dtype = str(plan.get("dtype", "cutlass.Float16"))
+        assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
+        bw = "cutlass.utils.blackwell_helpers"
+        ssd = f"(256, 128, {hd})"
+        tsd = f"(256, {hd}, 128)"
+        dqd = f"(128, {hd}, 256)"
+        majk = "cute.nvgpu.OperandMajorMode.K"
+        majmn = "cute.nvgpu.OperandMajorMode.MN"
+        cg2 = "cute.nvgpu.tcgen05.CtaGroup.TWO"
+        sel = "cute.select"
+        q_sdb = f"cute.make_layout(({tq}, {hd}, 1), stride=({hd}, 1, {tq * hd}))"
+        k_sdb = f"cute.make_layout(({tk}, {hd}, 1), stride=({hd}, 1, {tk * hd}))"
+        q_dsb = f"cute.make_layout(({hd}, {tq}, 1), stride=(1, {hd}, {tq * hd}))"
+        k_dsb = f"cute.make_layout(({hd}, {tk}, 1), stride=(1, {hd}, {tk * hd}))"
+        fbwd_lines = [
+            f"_fbwd_mQ = cute.make_tensor(arg{q_idx}.iterator, {q_sdb})",
+            f"_fbwd_mK = cute.make_tensor(arg{k_idx}.iterator, {k_sdb})",
+            f"_fbwd_mV = cute.make_tensor(arg{v_idx}.iterator, {k_sdb})",
+            f"_fbwd_mdO = cute.make_tensor(arg{do_idx}.iterator, {q_sdb})",
+            f"_fbwd_mQT = cute.make_tensor(arg{q_idx}.iterator, {q_dsb})",
+            f"_fbwd_mdOT = cute.make_tensor(arg{do_idx}.iterator, {q_dsb})",
+            f"_fbwd_mKT = cute.make_tensor(arg{k_idx}.iterator, {k_dsb})",
+            f"_fbwd_ss_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg2}, (256, 128))",
+            f"_fbwd_ts_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg2}, (256, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_fbwd_dq_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majmn}, {majmn}, cutlass.Float32, {cg2}, (128, {hd}))",
+            "_fbwd_cluster_vmnk = cute.tiled_divide(cute.make_layout((2, 1, 1)), (_fbwd_ss_mma.thr_id.shape,))",
+            f"_fbwd_ksl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_vsl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_qsl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_dosl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_ptl = {bw}.make_smem_layout_a(_fbwd_ts_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_dotl = {bw}.make_smem_layout_b(_fbwd_ts_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_qtl = {bw}.make_smem_layout_b(_fbwd_ts_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_ktl = {bw}.make_smem_layout_b(_fbwd_dq_mma, {dqd}, {dtype}, 1)",
+            f"_fbwd_dssl = {bw}.make_smem_layout_a(_fbwd_dq_mma, {dqd}, {dtype}, 1)",
+            f"_fbwd_op2 = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg2})",
+            f"_fbwd_tma_k, _fbwd_mKt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mK, {sel}(_fbwd_ksl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_v, _fbwd_mVt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mV, {sel}(_fbwd_vsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_q, _fbwd_mQt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mQ, {sel}(_fbwd_qsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_dot, _fbwd_mdOtN = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mdO, {sel}(_fbwd_dosl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_do2, _fbwd_mdOtT = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mdOT, {sel}(_fbwd_dotl, mode=[0, 1, 2]), {tsd}, _fbwd_ts_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_qt, _fbwd_mQtT = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mQT, {sel}(_fbwd_qtl, mode=[0, 1, 2]), {tsd}, _fbwd_ts_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_kt, _fbwd_mKtT = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mKT, {sel}(_fbwd_ktl, mode=[0, 1, 2]), {dqd}, _fbwd_dq_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_mLSE = cute.make_tensor(arg{lse_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDelta = cute.make_tensor(arg{delta_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDQ = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq * hd},)))",
+            f"_fbwd_mDQ2 = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_dqsl = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 32), 4)",
+            "_fbwd_tma_dq, _fbwd_mDQt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp(), _fbwd_mDQ2, cute.select(_fbwd_dqsl, mode=[0, 1]), (32, 32))",
+            f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_epil = {bw}.make_smem_layout_epi({dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (128, 64), {hd // 64})",
+            "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
+            "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
+        ]
+        body.extend(f"    {line}" for line in fbwd_lines)
+        call_args.extend(
+            [
+                "_fbwd_ss_mma",
+                "_fbwd_ts_mma",
+                "_fbwd_dq_mma",
+                "_fbwd_cluster_vmnk",
+                "_fbwd_tma_q",
+                "_fbwd_mQt",
+                "_fbwd_tma_k",
+                "_fbwd_mKt",
+                "_fbwd_tma_v",
+                "_fbwd_mVt",
+                "_fbwd_tma_dot",
+                "_fbwd_mdOtN",
+                "_fbwd_tma_do2",
+                "_fbwd_mdOtT",
+                "_fbwd_tma_qt",
+                "_fbwd_mQtT",
+                "_fbwd_tma_kt",
+                "_fbwd_mKtT",
+                "_fbwd_qsl",
+                "_fbwd_ksl",
+                "_fbwd_vsl",
+                "_fbwd_dosl",
+                "_fbwd_ptl",
+                "_fbwd_dotl",
+                "_fbwd_qtl",
+                "_fbwd_ktl",
+                "_fbwd_dssl",
+                "_fbwd_mLSE",
+                "_fbwd_mDelta",
+                "_fbwd_mDQ",
+                "_fbwd_tma_dq",
+                "_fbwd_mDQt",
+                "_fbwd_dqsl",
+                "_fbwd_mdK",
+                "_fbwd_mdV",
+                "_fbwd_epil",
+                "_fbwd_tma_dv",
+                "_fbwd_mdVt",
+                "_fbwd_tma_dk",
+                "_fbwd_mdKt",
+            ]
+        )
+        return
+    if kind == "helion_flash_bwd":
+        # Fused tcgen05 attention-backward host setup: four tiled_mmas (S/dP
+        # smem-smem, dV tmem-A, dK smem K-major, dQ smem MN-major), TMA atoms
+        # for K/V (per-CTA single tiles) and Q/dO (inner-loop rings), plus the
+        # raw fp32 LSE/delta/dq views and the dK/dV output views.
+        q_idx = plan_int("q_idx")
+        k_idx = plan_int("k_idx")
+        v_idx = plan_int("v_idx")
+        do_idx = plan_int("do_idx")
+        lse_idx = plan_int("lse_idx")
+        delta_idx = plan_int("delta_idx")
+        dq_idx = plan_int("dq_idx")
+        dk_idx = plan_int("dk_idx")
+        dv_idx = plan_int("dv_idx")
+        hd = plan_int("head_dim")
+        tq = plan_int("total_q_rows")
+        tk = plan_int("total_kv_rows")
+        q_stage = plan_int("q_stage")
+        do_stage = plan_int("do_stage")
+        kv_stage = plan_int("kv_stage", 1)
+        epi_stages = hd // 64 * kv_stage
+        dtype = str(plan.get("dtype", "cutlass.Float16"))
+        assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
+        bw = "cutlass.utils.blackwell_helpers"
+        ssd = f"(128, 128, {hd})"
+        tsd = f"(128, {hd}, 128)"
+        majk = "cute.nvgpu.OperandMajorMode.K"
+        majmn = "cute.nvgpu.OperandMajorMode.MN"
+        cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
+        sel = "cute.select"
+        q_sdb = f"cute.make_layout(({tq}, {hd}, 1), stride=({hd}, 1, {tq * hd}))"
+        k_sdb = f"cute.make_layout(({tk}, {hd}, 1), stride=({hd}, 1, {tk * hd}))"
+        fbwd_lines = [
+            f"_fbwd_mQ = cute.make_tensor(arg{q_idx}.iterator, {q_sdb})",
+            f"_fbwd_mK = cute.make_tensor(arg{k_idx}.iterator, {k_sdb})",
+            f"_fbwd_mV = cute.make_tensor(arg{v_idx}.iterator, {k_sdb})",
+            f"_fbwd_mdO = cute.make_tensor(arg{do_idx}.iterator, {q_sdb})",
+            f"_fbwd_ss_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg1}, (128, 128))",
+            f"_fbwd_ts_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_fbwd_dsk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}))",
+            f"_fbwd_dq_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majmn}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}))",
+            "_fbwd_cluster_vmnk = cute.tiled_divide(cute.make_layout((1, 1, 1)), (_fbwd_ss_mma.thr_id.shape,))",
+            f"_fbwd_ksl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, {kv_stage})",
+            f"_fbwd_vsl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, {kv_stage})",
+            f"_fbwd_qsl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, {q_stage})",
+            f"_fbwd_dosl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, {do_stage})",
+            f"_fbwd_ptl = {bw}.make_smem_layout_a(_fbwd_ts_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_dotl = {bw}.make_smem_layout_b(_fbwd_ts_mma, {tsd}, {dtype}, {do_stage})",
+            f"_fbwd_qtl = {bw}.make_smem_layout_b(_fbwd_dsk_mma, {tsd}, {dtype}, {q_stage})",
+            f"_fbwd_dsnk = {bw}.make_smem_layout_a(_fbwd_dsk_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_dssl = {bw}.make_smem_layout_a(_fbwd_dq_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_ktl = {bw}.make_smem_layout_b(_fbwd_dq_mma, {tsd}, {dtype}, {kv_stage})",
+            "_fbwd_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cute.nvgpu.tcgen05.CtaGroup.ONE)",
+            f"_fbwd_tma_k, _fbwd_mKt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op, _fbwd_mK, {sel}(_fbwd_ksl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_v, _fbwd_mVt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op, _fbwd_mV, {sel}(_fbwd_vsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_q, _fbwd_mQt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op, _fbwd_mQ, {sel}(_fbwd_qsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_do, _fbwd_mdOt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op, _fbwd_mdO, {sel}(_fbwd_dosl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_mLSE = cute.make_tensor(arg{lse_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDelta = cute.make_tensor(arg{delta_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDQ = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq * hd},)))",
+            f"_fbwd_mDQ2 = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_dqsl = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 32), 8)",
+            "_fbwd_tma_dq, _fbwd_mDQt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp(), _fbwd_mDQ2, cute.select(_fbwd_dqsl, mode=[0, 1]), (32, 32))",
+            f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_epil = {bw}.make_smem_layout_epi({dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (128, 64), {epi_stages})",
+            "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
+            "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
+        ]
+        body.extend(f"    {line}" for line in fbwd_lines)
+        call_args.extend(
+            [
+                "_fbwd_ss_mma",
+                "_fbwd_ts_mma",
+                "_fbwd_dsk_mma",
+                "_fbwd_dq_mma",
+                "_fbwd_tma_q",
+                "_fbwd_mQt",
+                "_fbwd_tma_k",
+                "_fbwd_mKt",
+                "_fbwd_tma_v",
+                "_fbwd_mVt",
+                "_fbwd_tma_do",
+                "_fbwd_mdOt",
+                "_fbwd_qsl",
+                "_fbwd_ksl",
+                "_fbwd_vsl",
+                "_fbwd_dosl",
+                "_fbwd_ptl",
+                "_fbwd_qtl",
+                "_fbwd_dotl",
+                "_fbwd_ktl",
+                "_fbwd_dssl",
+                "_fbwd_dsnk",
+                "_fbwd_mLSE",
+                "_fbwd_mDelta",
+                "_fbwd_mDQ",
+                "_fbwd_tma_dq",
+                "_fbwd_mDQt",
+                "_fbwd_dqsl",
+                "_fbwd_mdK",
+                "_fbwd_mdV",
+                "_fbwd_epil",
+                "_fbwd_tma_dv",
+                "_fbwd_mdVt",
+                "_fbwd_tma_dk",
+                "_fbwd_mdKt",
+            ]
+        )
         return
     if kind == "tcgen05_d_tma":
         d_idx = plan_int("d_idx")
@@ -825,7 +1455,7 @@ def _append_cute_wrapper_plan(
             call_args.append(total_clusters_arg)
         call_args.extend(f"cutlass.Int32({quota})" for quota in quotas)
         return
-    if kind != "tcgen05_ab_tma":
+    if kind not in ("tcgen05_ab_tma", "tcgen05_grouped_rna", "tcgen05_grouped_tma_rn"):
         raise exc.BackendUnsupported("cute", f"wrapper plan kind: {kind}")
 
     lhs_idx = plan_int("lhs_idx")
@@ -842,9 +1472,39 @@ def _append_cute_wrapper_plan(
     # the plan's TFloat32 via ``internal_type`` (both are 4 bytes wide, so the
     # SMEM layout/byte math is unchanged). Mirrors quack's gemm_sm100 fp32
     # handling.
-    tma_internal_type_arg = (
-        ", internal_type=cutlass.TFloat32" if input_dtype == "cutlass.TFloat32" else ""
-    )
+    if kind == "tcgen05_grouped_rna":
+        # RNA conversion consumes raw FP32 words after TMA completion. Keep
+        # the descriptor in FP32: TMA rounding would change tie/NaN semantics.
+        if (
+            input_dtype != "cutlass.TFloat32"
+            or cluster_m != 1
+            or cluster_n != 1
+            or plan.get("operand_transform") != "tf32_rna"
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "raw RNA descriptors require one-CTA TF32 MMA"
+            )
+        tma_internal_type_arg = ", internal_type=cutlass.Float32"
+    elif kind == "tcgen05_grouped_tma_rn":
+        if (
+            input_dtype != "cutlass.TFloat32"
+            or cluster_m != 1
+            or cluster_n != 1
+            or plan.get("operand_transform") != "tf32_tma_rn"
+            or type(plan.get("converter_warps")) is not int
+            or plan["converter_warps"] != 0
+            or plan.get("scheduler_self_consumer") is not False
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "TF32 TMA RN requires its converter-free one-CTA schedule"
+            )
+        tma_internal_type_arg = ", internal_type=cutlass.TFloat32"
+    else:
+        tma_internal_type_arg = (
+            ", internal_type=cutlass.TFloat32"
+            if input_dtype == "cutlass.TFloat32"
+            else ""
+        )
     ab_stage_count = plan_int("ab_stage_count", 2)
     # Optional ``smem_swizzle_*`` overrides recorded by the device-side
     # codegen when the user opts into a non-default A/B SMEM atom
@@ -867,6 +1527,7 @@ def _append_cute_wrapper_plan(
     rhs_tma_order = plan_optional_order("rhs_tma_order")
     rhs_rank3_grouped_nt = bool(plan.get("rhs_rank3_grouped_nt"))
     lhs_rank3_grouped_nt = bool(plan.get("lhs_rank3_grouped_nt"))
+    shared_rhs = bool(plan.get("shared_rhs"))
     orientation = _tcgen05_plan_orientation(plan)
     swapped_nm = orientation == "nm"
     dynamic_ab_tensormaps = bool(plan.get("dynamic_ab_tensormaps"))
@@ -882,7 +1543,35 @@ def _append_cute_wrapper_plan(
             "fixed full-allocation A/B TensorMaps require the N,M worklist "
             "orientation and cannot also be dynamic",
         )
-    if swapped_nm and not (dynamic_ab_tensormaps or fixed_ab_tensormaps):
+    row_union_schedule = plan.get("row_union_schedule")
+    row_profile = row_union_schedule_by_name(row_union_schedule)
+    if row_union_schedule is not None and row_profile is None:
+        raise exc.BackendUnsupported("cute", "unknown row-union physical descriptor")
+    if row_profile is not None:
+        expected = {
+            "row_union_schedule": row_profile.name,
+            "bm": row_profile.mma_m,
+            "bn": row_profile.mma_n,
+            "bk": row_profile.block_k,
+            "orientation": "nm",
+            "cluster_m": row_profile.cluster_m,
+            "cluster_n": row_profile.cluster_n,
+            "ab_stage_count": row_profile.ab_stages,
+            "a_producer_partition": row_profile.producer_cluster,
+            "lhs_tma_order": (1, 0),
+            "rhs_tma_order": (0, 1),
+            "input_dtype": "cutlass.BFloat16",
+            "acc_dtype": "cutlass.Float32",
+            "a_k_major": False,
+            "b_k_major": True,
+        }
+        if any(plan.get(key) != value for key, value in expected.items()) or (
+            dynamic_ab_tensormaps or fixed_ab_tensormaps or shared_rhs
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "row-union physical descriptor contract"
+            )
+    if swapped_nm and not (dynamic_ab_tensormaps or fixed_ab_tensormaps or row_profile):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 N,M-oriented A/B TensorMaps require dynamic per-group or "
@@ -891,6 +1580,16 @@ def _append_cute_wrapper_plan(
     dynamic_ab_tensormap_rank2 = (
         dynamic_ab_tensormaps and _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) == 2
     )
+    if shared_rhs and (
+        not swapped_nm
+        or not dynamic_ab_tensormap_rank2
+        or lhs_rank3_grouped_nt
+        or rhs_rank3_grouped_nt
+        or fixed_ab_tensormaps
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "shared rank-2 RHS requires the N,M dynamic rank-2 worklist route"
+        )
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     assert len(kernel_args) == 4
     tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
@@ -936,12 +1635,20 @@ def _append_cute_wrapper_plan(
     )
     rhs_tma = f"{tma_atom_b}_rhs_tma"
     if swapped_nm:
-        if not lhs_rank3_grouped_nt:
+        if not (lhs_rank3_grouped_nt or shared_rhs or row_profile):
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 N,M-oriented A/B TensorMaps require grouped rank-3 logical A",
             )
-        if fixed_ab_tensormaps:
+        if shared_rhs or row_profile is not None:
+            # Physical A is the one shared logical B[K,N]. Its immutable
+            # rank-2 descriptor is reused for every group; only the packed
+            # logical A and output descriptors require per-group updates.
+            lhs_tma_layout = (
+                f"(arg{lhs_idx}_shape1, arg{lhs_idx}_shape0), "
+                f"stride=(arg{lhs_idx}_stride1, arg{lhs_idx}_stride0)"
+            )
+        elif fixed_ab_tensormaps:
             if fixed_grouped_b_rank3:
                 lhs_tma_layout = (
                     f"(arg{lhs_idx}_shape1, arg{lhs_idx}_shape2, "
@@ -983,6 +1690,8 @@ def _append_cute_wrapper_plan(
                 f"(arg{rhs_idx}_shape0, arg{rhs_idx}_shape1, 1), "
                 f"stride=(arg{rhs_idx}_stride0, arg{rhs_idx}_stride1, 0)"
             )
+        if descriptors is not None:
+            rhs_tma_layout = descriptors.layout(f"arg{rhs_idx}")
         lhs_tma_setup = (
             (
                 f"    {lhs_tma} = cute.make_tensor("
@@ -1120,7 +1829,13 @@ def _append_cute_wrapper_plan(
                 f"{lhs_tma_arg}, "
                 f"cute.slice_({smem_a_layout}, (None, None, None, 0)), "
                 f"({bm}, {bn}, {bk}), {tiled_mma}"
-                + (f", {cluster_layout_vmnk}.shape" if cluster_n > 1 else "")
+                + (
+                    f", cute.tiled_divide(cute.make_layout({row_profile.producer_cluster!r}), ({tiled_mma}.thr_id.shape,)).shape"
+                    if row_profile is not None
+                    else f", {cluster_layout_vmnk}.shape"
+                    if cluster_n > 1
+                    else ""
+                )
                 + tma_internal_type_arg
                 + ")"
             ),
@@ -1132,8 +1847,12 @@ def _append_cute_wrapper_plan(
                 "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_B("
                 f"{cluster_shape}, {tiled_mma}.thr_id), "
                 f"{rhs_tma}, "
-                f"cute.slice_({smem_b_layout}, (None, None, None, 0)), "
-                f"({bm}, {bn}, {bk}), {tiled_mma}, {cluster_layout_vmnk}.shape"
+                + (
+                    f"cute.select({smem_b_layout}, mode=[0, 1, 2]), "
+                    if row_profile is not None
+                    else f"cute.slice_({smem_b_layout}, (None, None, None, 0)), "
+                )
+                + f"({bm}, {bn}, {bk}), {tiled_mma}, {cluster_layout_vmnk}.shape"
                 f"{tma_internal_type_arg})"
             ),
         )
@@ -1160,6 +1879,16 @@ def _cute_cluster_shape_from_wrapper_plans(
     return (cluster_m, cluster_n, 1)
 
 
+def _cute_use_pdl(cute_kernel: object) -> bool:
+    """Whether the generated kernel asked for programmatic dependent launch.
+
+    The device function then waits (``griddepcontrol_wait``) before its first
+    global memory access, so the launch and prologue overlap the previous
+    kernel in the stream.
+    """
+    return getattr(cast("Any", cute_kernel), "_helion_cute_use_pdl", False) is True
+
+
 def _cute_cluster_shape(
     cute_kernel: object, wrapper_plans: list[dict[str, object]]
 ) -> tuple[int, int, int] | None:
@@ -1178,6 +1907,329 @@ def _cute_cluster_shape(
             f"invalid _helion_cute_cluster_shape: {explicit_cluster_shape!r}",
         )
     return _cute_cluster_shape_from_wrapper_plans(wrapper_plans)
+
+
+def _append_sm100_chunk_recurrence_host_call(
+    body: list[str], plan: dict[str, object]
+) -> None:
+    """Build the tensor views consumed by the SM100 recurrence host schedule."""
+
+    def plan_int(key: str) -> int:
+        value = plan.get(key)
+        if type(value) is not int:
+            raise exc.BackendUnsupported(
+                "cute", f"invalid SM100 chunk-recurrence {key}"
+            )
+        return value
+
+    def tensor_arg(key: str) -> str:
+        return f"arg{plan_int(key)}"
+
+    output_scale = f"arg{plan_int('scale_idx')}"
+
+    heads = plan_int("heads")
+    sequences = plan_int("sequences")
+    total_tokens = plan_int("total_tokens")
+    total_chunks = plan_int("total_chunks")
+    rows = total_chunks * 16
+    kd = tensor_arg("kd_idx")
+    qd = tensor_arg("qd_idx")
+    ak = tensor_arg("ak_idx")
+    aq = tensor_arg("aq_idx")
+    gt = tensor_arg("gt_idx")
+    values = tensor_arg("v_idx")
+    output = tensor_arg("out_idx")
+    state = tensor_arg("state_idx")
+    cu_seqlens = tensor_arg("cu_seqlens_idx")
+    cu_chunks = tensor_arg("cu_chunks_idx")
+
+    factor_shape = (1, heads, rows, 128)
+    factor_stride = (heads * rows * 128, rows * 128, 128, 1)
+    aq_shape = (1, heads, total_chunks, 256)
+    aq_stride = (heads * total_chunks * 256, total_chunks * 256, 256, 1)
+    gt_shape = (1, heads, total_chunks, 128)
+    gt_stride = (heads * total_chunks * 128, total_chunks * 128, 128, 1)
+    activation_shape = (1, total_tokens, heads, 128)
+    activation_stride = (total_tokens * heads * 128, heads * 128, 128, 1)
+
+    def append_view(
+        name: str, source: str, shape: tuple[int, ...], stride: tuple[int, ...]
+    ) -> None:
+        body.append(
+            f"    {name} = cute.make_tensor({source}.iterator, "
+            f"layout=cute.make_layout({shape!r}, stride={stride!r}))"
+        )
+
+    append_view("_chunk_kd", kd, factor_shape, factor_stride)
+    append_view("_chunk_qd", qd, factor_shape, factor_stride)
+    append_view("_chunk_ak", ak, factor_shape, factor_stride)
+    append_view("_chunk_aq", aq, aq_shape, aq_stride)
+    append_view("_chunk_gt", gt, gt_shape, gt_stride)
+    append_view("_chunk_v", values, activation_shape, activation_stride)
+    append_view("_chunk_out", output, activation_shape, activation_stride)
+    host_call = (
+        "    _helion_sm100_chain_host("
+        "_chunk_v, "
+        f"{cu_seqlens}, {cu_chunks}, "
+        "_chunk_kd, _chunk_qd, _chunk_ak, _chunk_aq, _chunk_gt, "
+        f"{state}, _chunk_out, stream, "
+        f"cutlass.Int32(0), cutlass.Int32({heads}), "
+        f"cutlass.Float32({output_scale}), "
+        "512)"
+    )
+    body.extend(("    _helion_cute_kernel_tag = 'chunk_recurrence_sm100'", host_call))
+
+    if sequences <= 0:
+        raise exc.BackendUnsupported("cute", "empty SM100 recurrence launch")
+
+
+def _gdn_recurrence_plan_int(plan: dict[str, object], key: str) -> int:
+    value = plan.get(key)
+    if type(value) is not int:
+        raise exc.BackendUnsupported("cute", f"invalid gdn recurrence plan {key}")
+    return value
+
+
+_GDN_RECURRENCE_HOST_CONSTEXPR_KEYS: tuple[str, ...] = (
+    "block_v",
+    "chunk",
+    "dhead",
+    "epilogue_warps",
+    "stages",
+    "token_groups",
+    "mma_m",
+    "state_col",
+    "state_image_col",
+    "acc_col",
+    "update_image_col",
+    "tmem_cols",
+)
+
+
+def _validate_gdn_recurrence_plan(plan: dict[str, object]) -> None:
+    """Re-prove the gdn recurrence schedule ABI carried by the wrapper plan."""
+
+    from ..._compiler.cute.gdn_recurrence_geometry import GDN_RECURRENCE_DEVICE_ABI
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_cta_warps
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_epilogue_warp_choices
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_mma_m_choices
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_shape_admitted
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_smem_bytes
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_stage_choices
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_tmem_layout
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_token_group_choices
+
+    values = {
+        key: _gdn_recurrence_plan_int(plan, key)
+        for key in (
+            "batch",
+            "heads",
+            "seqlen",
+            "num_chunks",
+            "threads",
+            "smem_bytes",
+            "device_abi",
+            *_GDN_RECURRENCE_HOST_CONSTEXPR_KEYS,
+        )
+    }
+    tmem = gdn_tmem_layout(values["dhead"], values["chunk"])
+    if (
+        values["device_abi"] != GDN_RECURRENCE_DEVICE_ABI
+        or min(values["batch"], values["heads"], values["seqlen"]) <= 0
+        or values["num_chunks"] != -(-values["seqlen"] // values["chunk"])
+        or not gdn_shape_admitted(
+            dhead=values["dhead"],
+            chunk=values["chunk"],
+            dstate=_gdn_recurrence_plan_int(plan, "dstate"),
+            block_v=values["block_v"],
+        )
+        or values["epilogue_warps"]
+        not in gdn_epilogue_warp_choices(values["chunk"], values["dhead"])
+        or values["mma_m"]
+        not in gdn_mma_m_choices(
+            values["chunk"],
+            values["dhead"],
+            values["block_v"],
+            values["epilogue_warps"],
+        )
+        or values["stages"]
+        not in gdn_stage_choices(
+            values["chunk"], values["dhead"], values["block_v"], values["mma_m"]
+        )
+        or values["threads"]
+        != 32
+        * gdn_cta_warps(values["block_v"], values["epilogue_warps"], values["mma_m"])
+        or values["token_groups"]
+        not in gdn_token_group_choices(
+            values["chunk"],
+            values["block_v"],
+            values["epilogue_warps"],
+            values["mma_m"],
+        )
+        or values["smem_bytes"]
+        != gdn_smem_bytes(
+            values["chunk"],
+            values["dhead"],
+            values["block_v"],
+            values["stages"],
+            values["mma_m"],
+        )
+        or tmem is None
+        or (
+            values["state_col"],
+            values["state_image_col"],
+            values["acc_col"],
+            values["update_image_col"],
+            values["tmem_cols"],
+        )
+        != (
+            tmem.state_col,
+            tmem.state_image_col,
+            tmem.acc_col,
+            tmem.update_image_col,
+            tmem.alloc_cols,
+        )
+    ):
+        raise exc.BackendUnsupported("cute", "invalid gdn recurrence schedule ABI")
+
+
+def _append_gdn_recurrence_host_call(body: list[str], plan: dict[str, object]) -> None:
+    """Call the gdn recurrence host schedule with the wrapper's tensor views."""
+
+    _validate_gdn_recurrence_plan(plan)
+    tensors = ", ".join(
+        f"arg{_gdn_recurrence_plan_int(plan, key)}"
+        for key in ("k_idx", "w_idx", "u_idx", "g_idx", "h_idx")
+    )
+    constexprs = ", ".join(
+        str(_gdn_recurrence_plan_int(plan, key))
+        for key in _GDN_RECURRENCE_HOST_CONSTEXPR_KEYS
+    )
+    body.extend(
+        (
+            "    _helion_cute_kernel_tag = 'gdn_recurrence_sm100'",
+            f"    _helion_gdn_recurrence_host({tensors}, stream, {constexprs})",
+        )
+    )
+
+
+def _validate_gdn_recurrence_launch_args(
+    plan: dict[str, object], args: tuple[object, ...]
+) -> None:
+    """Check the runtime tensors against the geometry baked into the plan."""
+
+    from ..._compiler.cute.gdn_recurrence_geometry import GDN_TMA_ALIGNMENT_BYTES
+
+    _validate_gdn_recurrence_plan(plan)
+    batch = _gdn_recurrence_plan_int(plan, "batch")
+    heads = _gdn_recurrence_plan_int(plan, "heads")
+    seqlen = _gdn_recurrence_plan_int(plan, "seqlen")
+    dhead = _gdn_recurrence_plan_int(plan, "dhead")
+    dstate = _gdn_recurrence_plan_int(plan, "dstate")
+    num_chunks = _gdn_recurrence_plan_int(plan, "num_chunks")
+    expected = (
+        ("k_idx", torch.bfloat16, (batch, seqlen, heads, dhead)),
+        ("w_idx", torch.bfloat16, (batch, seqlen, heads, dhead)),
+        ("u_idx", torch.bfloat16, (batch, seqlen, heads, dstate)),
+        ("g_idx", torch.float32, (batch, seqlen, heads)),
+        ("h_idx", torch.bfloat16, (batch, num_chunks, heads, dhead, dstate)),
+    )
+    tensors: list[torch.Tensor] = []
+    for key, dtype, shape in expected:
+        index = _gdn_recurrence_plan_int(plan, key)
+        tensor = args[index] if 0 <= index < len(args) else None
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.dtype != dtype
+            or tuple(tensor.shape) != shape
+            or not tensor.is_contiguous()
+            or tensor.device.type != "cuda"
+        ):
+            raise exc.BackendUnsupported(
+                "cute", f"gdn recurrence {key} does not match the compiled geometry"
+            )
+        tensors.append(tensor)
+    if any(tensor.device != tensors[0].device for tensor in tensors):
+        raise exc.BackendUnsupported(
+            "cute", "gdn recurrence tensors must share one CUDA device"
+        )
+    output = tensors[-1]
+    output_begin = output.data_ptr()
+    output_end = output_begin + output.numel() * output.element_size()
+    for tensor in tensors[:-1]:
+        begin = tensor.data_ptr()
+        end = begin + tensor.numel() * tensor.element_size()
+        if begin < output_end and output_begin < end:
+            raise exc.BackendUnsupported(
+                "cute", "gdn recurrence output must not alias its inputs"
+            )
+    # k, w and u are read through TMA tensor maps.
+    if any(tensor.data_ptr() % GDN_TMA_ALIGNMENT_BYTES for tensor in tensors[:3]):
+        raise exc.BackendUnsupported("cute", "gdn recurrence TMA base is misaligned")
+
+
+def _append_sm100_warp_dv4_host_call(body: list[str], plan: dict[str, object]) -> None:
+    """Launch the selected warp-HMMA DV4 schedule through its pinned host entry."""
+
+    def plan_int(key: str) -> int:
+        value = plan.get(key)
+        if type(value) is not int:
+            raise exc.BackendUnsupported(
+                "cute", f"invalid SM100 warp-DV4 recurrence {key}"
+            )
+        return value
+
+    def tensor_arg(key: str) -> str:
+        return f"arg{plan_int(key)}"
+
+    desc_args = plan.get("desc_args")
+    if not isinstance(desc_args, (tuple, list)) or not all(
+        isinstance(name, str) for name in desc_args
+    ):
+        raise exc.BackendUnsupported("cute", "invalid warp-DV4 descriptor arguments")
+
+    heads = plan_int("heads")
+    sequences = plan_int("sequences")
+    total_tokens = plan_int("total_tokens")
+    output = tensor_arg("out_idx")
+    cu_seqlens = tensor_arg("cu_seqlens_idx")
+    cu_chunks = tensor_arg("cu_chunks_idx")
+    output_scale = f"arg{plan_int('scale_idx')}"
+    body.extend(
+        (
+            (
+                "    _chunk_output = cute.make_tensor("
+                f"{output}.iterator, cute.make_layout("
+                f"({total_tokens * heads * 128},), stride=(1,)))"
+            ),
+            (
+                "    _chunk_cu_seqlens = cute.make_tensor("
+                f"{cu_seqlens}.iterator, cute.make_layout("
+                f"({sequences + 1},), stride=(1,)))"
+            ),
+            (
+                "    _chunk_cu_chunks = cute.make_tensor("
+                f"{cu_chunks}.iterator, cute.make_layout("
+                f"({sequences + 1},), stride=(1,)))"
+            ),
+            "    _helion_cute_kernel_tag = 'chunk_recurrence_warp_dv4'",
+            "    _helion_sm100_warp_dv4_host("
+            + ", ".join(
+                (
+                    "_chunk_output",
+                    "_chunk_cu_seqlens",
+                    "_chunk_cu_chunks",
+                    *cast("Sequence[str]", desc_args),
+                    f"cutlass.Int32({heads})",
+                    f"cutlass.Float32({output_scale})",
+                    "grid_x",
+                    "grid_y",
+                    "stream",
+                )
+            )
+            + ")",
+        )
+    )
 
 
 def _create_cute_wrapper(
@@ -1203,13 +2255,14 @@ def _create_cute_wrapper(
         if kind == "tensor":
             ptr_name = f"arg{i}_ptr"
             params.append(f"{ptr_name}: cute.Pointer")
-            if len(entry) == 5:
-                # ("tensor", dtype, rank, sizes, strides) — baked layout.
+            if len(entry) in (5, 6):
+                # ("tensor", dtype, rank, sizes, strides[, alignment]) — baked
+                # layout. An omitted alignment denotes the original 16-byte ABI.
                 # Wrapper plans (matmul TMA) also reference
                 # ``arg{i}_shape{d}`` / ``arg{i}_stride{d}`` names, so we
                 # bind those names to their literal values in the wrapper
                 # body before constructing the tensor.
-                (_, _dtype, rank, sizes_t, strides_t) = entry
+                (_, _dtype, rank, sizes_t, strides_t) = entry[:5]
                 assert isinstance(rank, int)
                 assert isinstance(sizes_t, tuple) and len(sizes_t) == rank
                 assert isinstance(strides_t, tuple) and len(strides_t) == rank
@@ -1234,7 +2287,7 @@ def _create_cute_wrapper(
                 )
                 call_args.append(f"arg{i}")
                 continue
-            (_, _dtype, rank) = entry
+            (_, _dtype, rank) = entry[:3]
             assert isinstance(rank, int)
             shape_names = [f"arg{i}_shape{d}" for d in range(rank)]
             stride_names = [f"arg{i}_stride{d}" for d in range(rank)]
@@ -1253,7 +2306,7 @@ def _create_cute_wrapper(
             continue
 
         if kind == "wrapper_tensor":
-            (_, name, _dtype, rank, sizes_t, strides_t) = entry
+            (_, name, _dtype, rank, sizes_t, strides_t) = entry[:6]
             assert isinstance(name, str)
             assert isinstance(rank, int)
             assert isinstance(sizes_t, tuple) and len(sizes_t) == rank
@@ -1279,7 +2332,7 @@ def _create_cute_wrapper(
             continue
 
         if kind == "wrapper_tensor_runtime_leading_extent":
-            (_, name, _dtype, rank, tail_sizes, strides) = entry
+            (_, name, _dtype, rank, tail_sizes, strides) = entry[:6]
             assert isinstance(name, str)
             assert isinstance(rank, int)
             assert isinstance(tail_sizes, tuple) and len(tail_sizes) == rank - 1
@@ -1345,12 +2398,93 @@ def _create_cute_wrapper(
         cast("dict[str, object]", plan)
         for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
     ]
+    wrapped = [plan.get("wrapped_grouped_descriptors") for plan in wrapper_plans]
+    if any(identity is not None for identity in wrapped) and (
+        len(wrapper_plans) != 2
+        or [plan.get("kind") for plan in wrapper_plans]
+        not in (
+            ["tcgen05_grouped_rna", "tcgen05_d_tma"],
+            ["tcgen05_grouped_tma_rn", "tcgen05_d_tma"],
+        )
+        or wrapped[0] is None
+        or wrapped[0] != wrapped[1]
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "wrapped input and output descriptors require one shared proof"
+        )
+    if any(
+        plan.get("kind") == "tcgen05_grouped_tma_rn" for plan in wrapper_plans
+    ) and block != (32, 8, 1):
+        raise exc.BackendUnsupported(
+            "cute", "TF32 TMA RN requires its proved 256-thread block"
+        )
     for plan in wrapper_plans:
-        _append_cute_wrapper_plan(body, call_args, plan, num_sm=num_sm)
+        _append_cute_wrapper_plan(
+            body, call_args, plan, num_sm=num_sm, schema_key=schema_key
+        )
+    gathered_plans = [
+        plan for plan in wrapper_plans if plan.get("kind") == "gathered_mma_tma"
+    ]
+    if gathered_plans:
+        if (
+            len(wrapper_plans) != 1
+            or tuple(cast("Sequence[int]", gathered_plans[0]["source_block"])) != block
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "gathered MMA requires its proved source launch"
+            )
+        block = (288, 1, 1)
+    sm100_recurrence_plans = [
+        plan for plan in wrapper_plans if plan.get("kind") == "chunk_recurrence_sm100"
+    ]
+    warp_dv4_recurrence_plans = [
+        plan
+        for plan in wrapper_plans
+        if plan.get("kind") == "chunk_recurrence_warp_dv4"
+    ]
+    block_scaled_plans = [
+        plan for plan in wrapper_plans if plan.get("kind") == "block_scaled_mma"
+    ]
+    gdn_recurrence_plans = [
+        plan for plan in wrapper_plans if plan.get("kind") == "gdn_recurrence_sm100"
+    ]
+    if block_scaled_plans and (len(wrapper_plans) != 1 or block != (192, 1, 1)):
+        raise exc.BackendUnsupported(
+            "cute", "native block scaling must own the complete device root"
+        )
+    if len(gdn_recurrence_plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple gdn recurrence plans")
+    if gdn_recurrence_plans and len(wrapper_plans) != 1:
+        raise exc.BackendUnsupported(
+            "cute", "gdn recurrence must own the complete device root"
+        )
+    if len(sm100_recurrence_plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple SM100 recurrence plans")
+    if len(warp_dv4_recurrence_plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple SM100 warp-DV4 plans")
+    if (sm100_recurrence_plans or warp_dv4_recurrence_plans) and len(
+        wrapper_plans
+    ) != 1:
+        raise exc.BackendUnsupported(
+            "cute", "SM100 recurrence must own the complete device root"
+        )
     launch_suffix = f", block={block!r}"
     cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
     if cluster_shape is not None:
         launch_suffix += f", cluster={list(cluster_shape)!r}"
+    preferred_smem_carveout = getattr(
+        cast("Any", cute_kernel), "_helion_cute_preferred_smem_carveout", None
+    )
+    if preferred_smem_carveout is not None:
+        if (
+            type(preferred_smem_carveout) is not int
+            or not 0 <= preferred_smem_carveout <= 100
+        ):
+            raise ValueError(
+                "invalid _helion_cute_preferred_smem_carveout: "
+                f"{preferred_smem_carveout!r}"
+            )
+        launch_suffix += f", preferred_smem_carveout={preferred_smem_carveout}"
     # G2-H (cute_plan.md, see plan: G2-H CLC): CLC kernels need PDL
     # enabled at the host launch so ``nvvm.clusterlaunchcontrol_try_cancel``
     # returns valid responses. ``use_pdl`` is set on the per-matmul
@@ -1358,7 +2492,7 @@ def _create_cute_wrapper(
     # ``Tcgen05PersistenceModel.CLC_PERSISTENT`` is active. Reading
     # from the plan rather than a kernel-level side-channel attribute
     # mirrors how ``cluster_m``/``cluster_n`` flow through this layer.
-    if any(plan.get("use_pdl") for plan in wrapper_plans):
+    if any(plan.get("use_pdl") for plan in wrapper_plans) or _cute_use_pdl(cute_kernel):
         launch_suffix += ", use_pdl=True"
     # The fa4 flash topology (16-warp/512-thread) uses ``cute.arch.setmaxregister``
     # for per-warp register reallocation (softmax warps inc to 200; mma/corr/load/empty
@@ -1378,14 +2512,41 @@ def _create_cute_wrapper(
         launch_suffix += f", min_blocks_per_mp={explicit_min_blocks}"
     elif any(plan.get("topology") == "fa4" for plan in wrapper_plans):
         launch_suffix += ", min_blocks_per_mp=1"
-    body.extend(
-        (
-            f"    _helion_cute_kernel_tag = {kernel_tag!r}",
-            "    _kernel("
-            + ", ".join(call_args)
-            + f").launch(grid=(grid_x, grid_y, grid_z){launch_suffix}, stream=stream)",
+    if block_scaled_plans:
+        plan = block_scaled_plans[0]
+        arguments = [
+            f"arg{plan[key]}"
+            for key in (
+                "lhs_idx",
+                "rhs_idx",
+                "lhs_scale_idx",
+                "rhs_scale_idx",
+                "workspace_idx",
+                "out_idx",
+            )
+        ]
+        alpha = (
+            f"arg{plan['scale_idx']}"
+            if "scale_idx" in plan
+            else "_helion_block_scaled_alpha"
         )
-    )
+        arguments.extend((f"cutlass.Float32({alpha})", "stream"))
+        body.append("    _helion_block_scaled_entry(" + ", ".join(arguments) + ")")
+    elif sm100_recurrence_plans:
+        _append_sm100_chunk_recurrence_host_call(body, sm100_recurrence_plans[0])
+    elif warp_dv4_recurrence_plans:
+        _append_sm100_warp_dv4_host_call(body, warp_dv4_recurrence_plans[0])
+    elif gdn_recurrence_plans:
+        _append_gdn_recurrence_host_call(body, gdn_recurrence_plans[0])
+    else:
+        body.extend(
+            (
+                f"    _helion_cute_kernel_tag = {kernel_tag!r}",
+                "    _kernel("
+                + ", ".join(call_args)
+                + f").launch(grid=(grid_x, grid_y, grid_z){launch_suffix}, stream=stream)",
+            )
+        )
 
     source = "\n".join(
         [
@@ -1401,6 +2562,32 @@ def _create_cute_wrapper(
         "CUstream": cuda_driver.CUstream,
         "_kernel": cute_kernel,
     }
+    if gathered_plans:
+        from ..._compiler.cute.gathered_mma_runtime import make_tma_arguments
+
+        namespace["_helion_make_gathered_tma"] = make_tma_arguments
+    if block_scaled_plans:
+        from ..._compiler.cute.block_scaled_prepare import make_block_scaled_entry
+
+        namespace["_helion_block_scaled_entry"] = make_block_scaled_entry(
+            block_scaled_plans[0]
+        )
+        if "scale_value" in block_scaled_plans[0]:
+            namespace["_helion_block_scaled_alpha"] = block_scaled_plans[0][
+                "scale_value"
+            ]
+    if sm100_recurrence_plans:
+        from ..._compiler.cute.chunk_recurrence_sm100 import host_chain_dv2
+
+        namespace["_helion_sm100_chain_host"] = host_chain_dv2
+    elif warp_dv4_recurrence_plans:
+        from ..._compiler.cute.chunk_recurrence_dv4_sm100 import _recurrence_entry
+
+        namespace["_helion_sm100_warp_dv4_host"] = _recurrence_entry
+    elif gdn_recurrence_plans:
+        from ..._compiler.cute.gdn_recurrence_sm100 import host_gdn_recurrence
+
+        namespace["_helion_gdn_recurrence_host"] = host_gdn_recurrence
     filename = f"<helion_cute_launcher:{kernel_tag}:{schema_key!r}:{block!r}>"
     linecache.cache[filename] = (
         len(source),
@@ -1553,6 +2740,14 @@ class _CompiledCuteLauncher:
                 asBytecode=True,
                 bytecode_reader=read_bytecode_and_check_crc32,
             )
+            if (
+                self._compile_options
+                and _TVM_FFI_COMPILE_OPTION in self._compile_options.split()
+            ):
+                # Compilation imports this runtime through the SDK's FFI
+                # provider. A fresh-process disk hit must also load its global
+                # symbols before the cached host module is linked.
+                importlib.import_module("tvm_ffi")
             dsl = CuTeDSL._get_dsl()
             engine = dsl.compiler_provider.jit(
                 module, shared_libs=dsl.get_shared_libs()
@@ -1730,10 +2925,12 @@ def _cute_disk_cache_key(
     hash is unavailable.  The key must be computable *before* the kernel is
     compiled (so a hit can skip recompilation), so it is derived from the
     inputs that determine the lowered IR rather than from the IR itself:
-    generated device-kernel source, full input specialization (dtypes, ranks,
-    baked shapes/strides, constexpr values), launch shape (block/cluster), CuTe
-    compile options, the IR-affecting ``CUTE_DSL_*`` env vars (target SM arch
-    among them), and the cutlass version.
+    generated device-kernel source, external compiled-helper sources, full input
+    specialization (dtypes, ranks,
+    pointer alignments, baked shapes/strides, constexpr values), launch shape
+    (block/cluster), preferred shared-memory carveout, CuTe compile options,
+    the IR-affecting
+    ``CUTE_DSL_*`` env vars (target SM arch among them), and the cutlass version.
 
     ``num_sm`` is the device SM count the persistent flash wrapper bakes into
     its grid clamp as a literal (``cute.compile`` lowers that literal into the
@@ -1747,6 +2944,17 @@ def _cute_disk_cache_key(
     source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
     if source_hash is None:
         return None
+    plans = cast(
+        "Sequence[dict[str, object]]",
+        getattr(cute_kernel, "_helion_cute_wrapper_plans", ()),
+    )
+    helper_kinds = [cast("str", plan.get("kind", "")) for plan in plans]
+    helper_kinds.extend(
+        cast("Sequence[str]", getattr(cute_kernel, "_helion_cute_helper_kinds", ()))
+    )
+    helper_sources = wrapper_source_dependencies(helper_kinds)
+    if helper_sources is None:
+        return None
     try:
         import cutlass
 
@@ -1755,16 +2963,23 @@ def _cute_disk_cache_key(
         cutlass_version = ""
     payload = repr(
         (
-            "helion-cute-cache-v1",
+            "helion-cute-cache-v2",
             source_hash,
+            helper_sources,
             schema_key,
             block,
             wrapper_plans,
             repr(cluster_shape),
+            getattr(
+                cast("Any", cute_kernel),
+                "_helion_cute_preferred_smem_carveout",
+                None,
+            ),
             compile_options or "",
             _cute_cache_relevant_env(),
             cutlass_version,
             num_sm,
+            _cute_use_pdl(cute_kernel),
         )
     )
     digest = hashlib.sha256(payload.encode("utf-8")).digest()
@@ -1871,6 +3086,12 @@ class _CuteCUDAGraph(torch.cuda.CUDAGraph):
     def replay(self) -> None:
         self._helion_resources.record_replay_streams()
         super().replay()
+
+    def reset(self) -> None:
+        # Descriptor storage must outlive every graph node that holds its raw
+        # address, so destroy the graph before dropping retained ownership.
+        super().reset()
+        self._helion_resources.release()
 
 
 _CUTE_ACTIVE_CUDA_GRAPH: contextvars.ContextVar[_CuteCUDAGraph | None] = (
@@ -2103,8 +3324,119 @@ def _cute_scalar_cache_value(scalar_kind: str, scalar_value: object) -> object:
 def _validate_cute_launcher_tensor(arg: torch.Tensor) -> None:
     if arg.device.type != "cuda":
         raise exc.BackendUnsupported("cute", "launcher requires CUDA tensors")
-    if arg.ndim <= 0:
-        raise exc.BackendUnsupported("cute", "launcher requires tensor rank >= 1")
+
+
+def _cute_launcher_tensor_layout(
+    arg: torch.Tensor,
+) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+    """Return ``(rank, sizes, strides)`` for the cute tensor built by the wrapper.
+
+    ``cute.make_layout`` has no rank-0 form, so a 0-d tensor (``scale[()]``)
+    is marshalled as a one-element rank-1 view. Device code reads it through
+    the base pointer only, so the view never changes which element is read.
+    """
+    if arg.ndim == 0:
+        return 1, (1,), (1,)
+    sizes = tuple(int(arg.size(d)) for d in range(arg.ndim))
+    strides = tuple(int(arg.stride(d)) for d in range(arg.ndim))
+    return arg.ndim, sizes, strides
+
+
+def _cute_pointer_alignment(data_ptr: int) -> int:
+    """Prove at most 16-byte alignment from the actual argument pointer."""
+    return min(16, data_ptr & -data_ptr) if data_ptr else 16
+
+
+def _cute_schema_with_pointer_alignment(
+    entry: tuple[object, ...], alignment: int
+) -> tuple[object, ...]:
+    # Keep aligned schemas/cache keys unchanged. Lower-alignment pointer types
+    # require distinct compiled wrappers, including in the on-disk cache.
+    return entry if alignment == 16 else (*entry, alignment)
+
+
+def _cute_schema_pointer_alignment(entry: tuple[object, ...]) -> int:
+    """Read a tensor/wrapper tensor entry's optional alignment specialization."""
+    has_alignment = len(entry) in (4, 6) if entry[0] == "tensor" else len(entry) == 7
+    return cast("int", entry[-1]) if has_alignment else 16
+
+
+# Wrapper plans whose device bodies address the named tensors with 16-byte-wide
+# instructions: TMA tensor maps over q/k/v (and the outputs the epilogues store
+# or reduce through TMA), 128-bit copies of the output tile, the row programs'
+# 16-byte packets. A TMA descriptor encodes its global address in 16-byte
+# units, and the CuTe DSL builds one over a pointer whose assumed alignment
+# is only 8 bytes without complaint: the base is rounded down to 16 bytes and
+# every tile reads (or writes) 8 bytes before the tensor, giving a wrong
+# result instead of a fault. ``default_cute_launcher`` therefore stages an
+# under-aligned binding of these operands through a 16-byte-aligned copy and
+# copies the outputs back after the launch. Values are (input index keys,
+# output index keys); the flash kinds add their ``epi_aux{i}_idx`` inputs.
+_CUTE_STAGED_PLAN_OPERANDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "helion_flash": (
+        ("q_idx", "k_idx", "v_idx", "bias_idx", "alibi_idx", "document_idx"),
+        ("o_idx", "lse_idx"),
+    ),
+    "helion_flash_row_mma": (("q_idx", "k_idx", "v_idx"), ("o_idx", "lse_idx")),
+    "helion_flash_gated": (("q_idx", "k_idx", "v_idx"), ("o_idx",)),
+    "helion_flash_bwd": (
+        ("q_idx", "k_idx", "v_idx", "do_idx", "lse_idx", "delta_idx"),
+        ("dq_idx", "dk_idx", "dv_idx"),
+    ),
+}
+_CUTE_STAGED_OPERAND_ALIGNMENT = 16
+
+
+def _cute_staged_plan_operands(
+    cute_kernel: object,
+) -> tuple[tuple[int, bool], ...]:
+    """The (argument index, is_output) operands the kernel's plans stage."""
+    operands: dict[int, bool] = {}
+    for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()):
+        kind = str(plan.get("kind"))
+        roles = _CUTE_STAGED_PLAN_OPERANDS.get(kind)
+        if roles is None:
+            continue
+        input_keys, output_keys = roles
+        if kind in ("helion_flash", "helion_flash_row_mma"):
+            aux_count = plan.get("epi_aux_count", 0)
+            assert isinstance(aux_count, int)
+            input_keys += tuple(f"epi_aux{i}_idx" for i in range(aux_count))
+        for keys, is_output in ((input_keys, False), (output_keys, True)):
+            for key in keys:
+                index = plan.get(key)
+                if isinstance(index, int):
+                    operands[index] = operands.get(index, False) or is_output
+    return tuple(operands.items())
+
+
+def _cute_stage_under_aligned_operands(
+    cute_kernel: object, args: tuple[object, ...]
+) -> tuple[tuple[object, ...], list[tuple[torch.Tensor, torch.Tensor]]] | None:
+    """Replace under-aligned staged operands by 16-byte-aligned copies.
+
+    Returns the launch arguments with each such operand cloned (a fresh
+    allocation is at least 16-byte aligned) and the (destination, copy) pairs
+    to write back after the launch, or None when every operand is aligned.
+    """
+    staged: list[object] | None = None
+    copy_backs: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for index, is_output in _cute_staged_plan_operands(cute_kernel):
+        tensor = args[index]
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.data_ptr() % _CUTE_STAGED_OPERAND_ALIGNMENT == 0
+        ):
+            continue
+        if staged is None:
+            staged = list(args)
+        copy = tensor.clone()
+        staged[index] = copy
+        if is_output:
+            copy_backs.append((tensor, copy))
+    if staged is None:
+        return None
+    return tuple(staged), copy_backs
 
 
 def _validate_tcgen05_grouped_tensor_devices(
@@ -2385,6 +3717,79 @@ def _tcgen05_grouped_static_layout_arg(
     return layout
 
 
+def _tcgen05_grouped_device_source_m_tile_supported(plan: dict[str, object]) -> bool:
+    """Keep legacy widths and admit source64 only with its compiler proof."""
+    source_m_tile = plan.get("source_m_tile")
+    if source_m_tile in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES:
+        return True
+    if (
+        type(source_m_tile) is not int
+        or source_m_tile != TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE
+    ):
+        return False
+    profile = plan.get("source64_profile")
+    expected_profile = {
+        "full_coverage_mode": TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL,
+        "consumer_local": True,
+        "use_2cta_instrs": False,
+        "ab_stage_count": 4,
+        "acc_stage_count": 2,
+        "c_stage_count": 2,
+        "consumer_regs": 256,
+        "input_dtype": "cutlass.BFloat16",
+        "acc_dtype": "cutlass.Float32",
+        "offset_dtype": "torch.int32",
+    }
+    if type(profile) is not dict or profile.keys() != expected_profile.keys():
+        return False
+    if any(
+        type(profile[key]) is not type(value) or profile[key] != value
+        for key, value in expected_profile.items()
+    ):
+        return False
+    required_plan = {
+        "kind": "tcgen05_grouped_static_persistent",
+        "scheduler_mode": "device_group_search",
+        "bm": 128,
+        "bn": 64,
+        "bk": 128,
+        "cluster_m": 1,
+        "cluster_n": 1,
+        "orientation": "nm",
+        "shared_rhs": True,
+        "worklist_metadata": True,
+        "device_split_sizes": True,
+        "device_layout_kind": "offsets",
+        "dynamic_ab_tensormaps": True,
+        "dynamic_ab_tensormap_rank": 2,
+        "dynamic_d_tensormap": True,
+    }
+    if any(
+        type(plan.get(key)) is not type(value) or plan.get(key) != value
+        for key, value in required_plan.items()
+    ):
+        return False
+    if any(
+        plan.get(key, False) is not False
+        for key in (
+            "fixed_tensormaps",
+            "direct_pointer_metadata",
+            "external_direct_pointer_metadata",
+            "use_2cta_instrs",
+        )
+    ):
+        return False
+    return full_coverage_index_domain(
+        cast("int", plan.get("group_count")),
+        cast("int", plan.get("m_size")),
+        cast("int", plan.get("n_size")),
+        cast("int", plan.get("k_total_size")),
+        source_m_tile,
+        128,
+        128,
+    )
+
+
 def _validate_tcgen05_grouped_device_split_sizes(
     plan: dict[str, object],
     split_sizes: torch.Tensor,
@@ -2420,7 +3825,7 @@ def _validate_tcgen05_grouped_device_split_sizes(
         )
     if (
         bk not in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
-        or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+        or not _tcgen05_grouped_device_source_m_tile_supported(plan)
         or n_size % TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[2] != 0
         or k_total_size % bk != 0
     ):
@@ -2429,6 +3834,13 @@ def _validate_tcgen05_grouped_device_split_sizes(
             "tcgen05 grouped device split_sizes requires block_k 64 or 128, "
             "a validated source M tile, output N divisible by 32, and K "
             "divisible by the CTA K tile",
+        )
+    if (
+        source_m_tile == TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE
+        and split_sizes.dtype != torch.int32
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "source64 device offsets require the proved Int32 layout dtype"
         )
     if (
         not bool(plan.get("dynamic_ab_tensormaps"))
@@ -2464,7 +3876,7 @@ def _tcgen05_grouped_device_split_total_clusters(
         or m_size <= 0
         or n_size <= 0
         or physical_mma_m <= 0
-        or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+        or not _tcgen05_grouped_device_source_m_tile_supported(plan)
     ):
         raise exc.BackendUnsupported(
             "cute",
@@ -2892,6 +4304,42 @@ def _validate_tcgen05_grouped_dynamic_ab_tensormaps(
             "cute",
             "tcgen05 grouped dynamic A/B TensorMaps require rank-2 A",
         )
+    if bool(plan.get("shared_rhs")):
+        if (
+            rank != 2
+            or _tcgen05_plan_orientation(plan) != "nm"
+            or rhs.ndim != 2
+            or lhs.dtype not in (torch.float16, torch.bfloat16)
+            or rhs.dtype != lhs.dtype
+            or lhs.shape
+            != (_plan_int_value(plan, "m_size"), _plan_int_value(plan, "k_total_size"))
+            or rhs.shape
+            != (_plan_int_value(plan, "k_total_size"), _plan_int_value(plan, "n_size"))
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "shared RHS worklist requires matching rank-2 FP16/BF16 matrices",
+            )
+        rhs_k_contiguous = rhs.stride(0) == 1 and rhs.stride(1) == rhs.size(0)
+        rhs_n_contiguous = rhs.stride(1) == 1 and rhs.stride(0) == rhs.size(1)
+        if lhs.stride() != (lhs.size(1), 1) or not (
+            rhs_k_contiguous or rhs_n_contiguous
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "shared RHS worklist requires contiguous matrix storage"
+            )
+        rhs_outer_stride = rhs.stride(1) if rhs_k_contiguous else rhs.stride(0)
+        if (
+            int(lhs.data_ptr()) % 16
+            or int(rhs.data_ptr()) % 16
+            or int(lhs.stride(0)) * lhs.element_size() % 16
+            or int(rhs_outer_stride) * rhs.element_size() % 16
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "shared RHS worklist requires 16-byte-aligned bases and outer strides",
+            )
+        return
     if rhs.ndim != 3:
         raise exc.BackendUnsupported(
             "cute",
@@ -2988,8 +4436,8 @@ def _validate_tcgen05_grouped_fixed_tensormaps(
     bk = _plan_int_value(plan, "bk")
     physical_mma_m = _plan_int_value(plan, "bm")
     if (
-        lhs.dtype is not torch.bfloat16
-        or rhs.dtype is not torch.bfloat16
+        lhs.dtype not in (torch.float16, torch.bfloat16)
+        or rhs.dtype != lhs.dtype
         or int(lhs.size(1)) != k_total_size
         or int(rhs.size(1)) != n_size
         or int(rhs.size(2)) != k_total_size
@@ -2999,7 +4447,7 @@ def _validate_tcgen05_grouped_fixed_tensormaps(
     ):
         raise exc.BackendUnsupported(
             "cute",
-            "fixed full-allocation TensorMaps require contiguous BF16 "
+            "fixed full-allocation TensorMaps require matching contiguous FP16/BF16 "
             "A[Mtotal,K] and B[G,N,K], N divisible by the physical MMA-M "
             "tile, and K divisible by block_k",
         )
@@ -3030,14 +4478,14 @@ def _validate_tcgen05_grouped_fixed_tensormaps(
         )
     if (
         output.device.type != "cuda"
-        or output.dtype is not torch.bfloat16
+        or output.dtype != lhs.dtype
         or output.ndim != 2
         or tuple(int(size) for size in output.shape) != (int(lhs.size(0)), n_size)
         or tuple(int(stride) for stride in output.stride()) != (n_size, 1)
     ):
         raise exc.BackendUnsupported(
             "cute",
-            "fixed full-allocation TensorMaps require contiguous BF16 "
+            "fixed full-allocation TensorMaps require matching contiguous FP16/BF16 "
             "D[Mtotal,N] matching packed A and grouped B",
         )
     alignment = 16
@@ -3943,10 +5391,26 @@ def _retain_cute_capture_owned_launch_tensors(
     owned_tensors: tuple[torch.Tensor, ...],
 ) -> None:
     """Keep raw-pointer launch tensors alive for captured graph replays."""
-    capture_contexts = tuple(
-        context for context in grouped_launch_contexts if context[3] is not None
-    )
-    if not capture_contexts or not owned_tensors:
+    if not owned_tensors:
+        return
+    contexts = list(grouped_launch_contexts)
+    contexts_by_device = {
+        (context[0], context[1]): context for context in grouped_launch_contexts
+    }
+    # Grouped tcgen05 plans already contribute their stream/capture context.
+    # Other launcher-owned allocations (notably KDA's raw TensorMap descriptor
+    # storage) have no grouped plan, so derive the missing contexts from the
+    # tensors whose pointers the captured launch embeds.
+    for tensor in owned_tensors:
+        device_key = (tensor.device.type, tensor.device.index)
+        if device_key in contexts_by_device:
+            continue
+        stream_handle, capture_id = _cuda_stream_capture_context(tensor.device)
+        context = (*device_key, stream_handle, capture_id)
+        contexts_by_device[device_key] = context
+        contexts.append(context)
+    capture_contexts = tuple(context for context in contexts if context[3] is not None)
+    if not capture_contexts:
         return
     cache = cast(
         "dict[tuple[_CuteGroupedLaunchContext, ...], dict[int, torch.Tensor]]",
@@ -4035,7 +5499,17 @@ def _build_cached_cute_schema_and_args(
 
 def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
     kind = str(plan.get("kind", ""))
-    if kind == "helion_small_biased_attention":
+    if kind in {
+        "helion_small_biased_attention",
+        "helion_flash_row_mma",
+        "helion_warp_mma_gemm",
+        "chunk_prepare_tma",
+        "chunk_recurrence_sm100",
+        "chunk_recurrence_warp_dv4",
+        "gdn_recurrence_sm100",
+        "gathered_mma_tma",
+        "block_scaled_mma",
+    }:
         return True
     if not kind.startswith("tcgen05"):
         return False
@@ -4052,6 +5526,530 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
         if type(extent) is not int or type(block) is not int or extent % block:
             return False
     return True
+
+
+@dataclass(frozen=True)
+class _ChunkPrepareTensorMapSpec:
+    dtype: torch.dtype
+    base_ptr: int
+    global_dim: tuple[int, ...]
+    global_stride_bytes: tuple[int, ...]
+    box_dim: tuple[int, ...]
+
+
+def _chunk_prepare_expected_tensor_map_specs(
+    *,
+    total_tokens: int,
+    total_chunks: int,
+    heads: int,
+    q_ptr: int,
+    k_ptr: int,
+    gate_ptr: int,
+    factor_ptr: int,
+    gate_dtype: torch.dtype,
+) -> tuple[_ChunkPrepareTensorMapSpec, ...]:
+    """Build descriptor geometry from already-validated ABI metadata."""
+
+    def activation_spec(dtype: torch.dtype, pointer: int) -> _ChunkPrepareTensorMapSpec:
+        element_bytes = dtype.itemsize
+        segment = 32 if dtype is torch.float32 else 64
+        segments = 128 // segment
+        return _ChunkPrepareTensorMapSpec(
+            dtype=dtype,
+            base_ptr=pointer,
+            global_dim=(segment, total_tokens, heads, segments),
+            global_stride_bytes=(
+                heads * 128 * element_bytes,
+                128 * element_bytes,
+                segment * element_bytes,
+            ),
+            box_dim=(segment, 16, 1, segments),
+        )
+
+    return (
+        activation_spec(torch.bfloat16, q_ptr),
+        activation_spec(torch.bfloat16, k_ptr),
+        activation_spec(gate_dtype, gate_ptr),
+        _ChunkPrepareTensorMapSpec(
+            dtype=torch.bfloat16,
+            base_ptr=factor_ptr,
+            global_dim=(128, total_chunks * 16, 3 * heads),
+            global_stride_bytes=(128 * 2, 128 * total_chunks * 16 * 2),
+            box_dim=(64, 16, 1),
+        ),
+    )
+
+
+def _chunk_prepare_plan_tensor(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+    key: str,
+) -> torch.Tensor:
+    index = plan.get(key)
+    if type(index) is not int or not 0 <= index < len(args):
+        raise exc.BackendUnsupported("cute", f"invalid chunk-prepare {key}")
+    tensor = args[index]
+    if not isinstance(tensor, torch.Tensor):
+        raise exc.BackendUnsupported("cute", f"chunk-prepare {key} is not a tensor")
+    return tensor
+
+
+def _chunk_prepare_tensor_map_specs(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+) -> tuple[_ChunkPrepareTensorMapSpec, ...]:
+    """Validate the five-factor ABI and return the four exact TMA maps."""
+
+    def plan_int(key: str) -> int:
+        value = plan.get(key)
+        if type(value) is not int:
+            raise exc.BackendUnsupported("cute", f"invalid chunk-prepare {key}")
+        return value
+
+    schedule = plan.get("schedule")
+    split_alias_schedules = tuple(
+        f"split_alias_cpc{chunks_per_cta}" for chunks_per_cta in range(1, 6)
+    )
+    if (
+        plan_int("device_abi") not in (3, 4)
+        or plan_int("chunk_size") != 16
+        or plan_int("key_size") != 128
+        or plan_int("chunks_per_cta") not in (1, 2, 3, 4, 5)
+        or (
+            schedule in split_alias_schedules
+            and schedule != f"split_alias_cpc{plan_int('chunks_per_cta')}"
+        )
+        or type(plan.get("outputs_scaled")) is not bool
+        or plan_int("device_abi") != (3 if plan["outputs_scaled"] else 4)
+        or plan.get("factor_key_xor") != (0 if plan["outputs_scaled"] else 8)
+        or schedule not in split_alias_schedules
+    ):
+        raise exc.BackendUnsupported("cute", "unsupported chunk-prepare ABI")
+    total_tokens = plan_int("total_tokens")
+    total_chunks = plan_int("total_chunks")
+    heads = plan_int("heads")
+    if total_tokens <= 0 or total_chunks <= 0 or heads <= 0:
+        raise exc.BackendUnsupported("cute", "empty chunk-prepare launch")
+
+    names = (
+        "q_idx",
+        "k_idx",
+        "g_idx",
+        "beta_idx",
+        "a_log_idx",
+        "dt_idx",
+        "cu_seqlens_idx",
+        "cu_chunks_idx",
+        "chunk_to_seq_idx",
+        "kd_idx",
+        "qd_idx",
+        "ak_idx",
+        "aq_idx",
+        "gt_idx",
+    )
+    (
+        q,
+        k,
+        gate,
+        beta,
+        a_log,
+        dt_bias,
+        cu_seqlens,
+        cu_chunks,
+        chunk_to_seq,
+        kd,
+        qd,
+        ak,
+        aq,
+        g_total,
+    ) = tuple(_chunk_prepare_plan_tensor(plan, args, name) for name in names)
+    tensors = (
+        q,
+        k,
+        gate,
+        beta,
+        a_log,
+        dt_bias,
+        cu_seqlens,
+        cu_chunks,
+        chunk_to_seq,
+        kd,
+        qd,
+        ak,
+        aq,
+        g_total,
+    )
+    if any(tensor.device != q.device for tensor in tensors):
+        raise exc.BackendUnsupported("cute", "chunk-prepare tensors span devices")
+    if q.device.type != "cuda" or any(not tensor.is_contiguous() for tensor in tensors):
+        raise exc.BackendUnsupported(
+            "cute", "chunk-prepare tensors must be contiguous CUDA tensors"
+        )
+
+    token_rows = total_tokens * heads
+    rows = total_chunks * 16
+    expected = (
+        (q, torch.bfloat16, (token_rows, 128)),
+        (k, torch.bfloat16, (token_rows, 128)),
+        (
+            gate,
+            torch.float32 if bool(plan.get("gate_is_fp32")) else torch.bfloat16,
+            (token_rows, 128),
+        ),
+        (beta, torch.bfloat16, (token_rows,)),
+        (a_log, torch.float32, (heads,)),
+        (dt_bias, torch.float32, (heads, 128)),
+        (chunk_to_seq, torch.int32, (total_chunks,)),
+        (kd, torch.bfloat16, (heads * rows, 128)),
+        (qd, torch.bfloat16, (heads * rows, 128)),
+        (ak, torch.bfloat16, (heads * rows, 128)),
+        (aq, torch.bfloat16, (heads * total_chunks, 256)),
+        (g_total, torch.float32, (heads * total_chunks, 128)),
+    )
+    for tensor, dtype, shape in expected:
+        if tensor.dtype is not dtype or tuple(tensor.shape) != shape:
+            raise exc.BackendUnsupported(
+                "cute", "chunk-prepare tensor dtype/shape ABI mismatch"
+            )
+    if (
+        cu_seqlens.dtype is not torch.int32
+        or cu_chunks.dtype is not torch.int32
+        or cu_seqlens.ndim != 1
+        or tuple(cu_chunks.shape) != tuple(cu_seqlens.shape)
+    ):
+        raise exc.BackendUnsupported("cute", "chunk-prepare metadata ABI mismatch")
+
+    vector_bytes = heads * rows * 128 * 2
+    aq_bytes = heads * total_chunks * 256 * 2
+    kd_ptr = kd.data_ptr()
+    expected_ptrs = (
+        kd_ptr,
+        kd_ptr + vector_bytes,
+        kd_ptr + 2 * vector_bytes,
+        kd_ptr + 3 * vector_bytes,
+        kd_ptr + 3 * vector_bytes + aq_bytes,
+    )
+    actual_ptrs = tuple(tensor.data_ptr() for tensor in (kd, qd, ak, aq, g_total))
+    output_storages = tuple(
+        tensor.untyped_storage() for tensor in (kd, qd, ak, aq, g_total)
+    )
+    storage_bases = tuple(storage.data_ptr() for storage in output_storages)
+    workspace_bytes = (
+        3 * vector_bytes + aq_bytes + g_total.numel() * g_total.element_size()
+    )
+    if (
+        kd_ptr % 256
+        or actual_ptrs != expected_ptrs
+        or len(set(storage_bases)) != 1
+        or storage_bases[0] != kd_ptr
+        or any(storage.nbytes() < workspace_bytes for storage in output_storages)
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "chunk-prepare factors must use the exact packed workspace ABI"
+        )
+
+    output_begin = kd_ptr
+    output_end = g_total.data_ptr() + g_total.numel() * g_total.element_size()
+    for tensor in (
+        q,
+        k,
+        gate,
+        beta,
+        a_log,
+        dt_bias,
+        cu_seqlens,
+        cu_chunks,
+        chunk_to_seq,
+    ):
+        begin = tensor.data_ptr()
+        end = begin + tensor.numel() * tensor.element_size()
+        if begin < output_end and output_begin < end:
+            raise exc.BackendUnsupported("cute", "chunk-prepare input aliases output")
+    if any(tensor.data_ptr() % 16 for tensor in (q, k, gate, kd)):
+        raise exc.BackendUnsupported("cute", "chunk-prepare TMA base is misaligned")
+
+    return _chunk_prepare_expected_tensor_map_specs(
+        total_tokens=total_tokens,
+        total_chunks=total_chunks,
+        heads=heads,
+        q_ptr=q.data_ptr(),
+        k_ptr=k.data_ptr(),
+        gate_ptr=gate.data_ptr(),
+        factor_ptr=kd_ptr,
+        gate_dtype=gate.dtype,
+    )
+
+
+def _encode_chunk_prepare_tensor_map(spec: _ChunkPrepareTensorMapSpec) -> bytes:
+    cuda_driver = importlib.import_module("cuda.bindings.driver")
+    dtype = (
+        cuda_driver.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
+        if spec.dtype is torch.bfloat16
+        else cuda_driver.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_FLOAT32
+    )
+    rank = len(spec.global_dim)
+    if (
+        rank not in (3, 4)
+        or len(spec.global_stride_bytes) != rank - 1
+        or len(spec.box_dim) != rank
+    ):
+        raise exc.BackendUnsupported("cute", "invalid chunk-prepare tensor-map rank")
+    error, tensor_map = cuda_driver.cuTensorMapEncodeTiled(
+        dtype,
+        rank,
+        spec.base_ptr,
+        [cuda_driver.cuuint64_t(value) for value in spec.global_dim],
+        [cuda_driver.cuuint64_t(value) for value in spec.global_stride_bytes],
+        [cuda_driver.cuuint32_t(value) for value in spec.box_dim],
+        [cuda_driver.cuuint32_t(1)] * rank,
+        cuda_driver.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+        cuda_driver.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B,
+        cuda_driver.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+        cuda_driver.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+    )
+    if int(error) != 0:
+        raise exc.BackendUnsupported(
+            "cute", f"chunk-prepare tensor-map encoding failed: {error}"
+        )
+    return bytes(ctypes.string_at(tensor_map.getPtr(), 128))
+
+
+def _build_chunk_prepare_tensor_maps(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+) -> tuple[torch.Tensor, tuple[int, int, int, int]]:
+    specs = _chunk_prepare_tensor_map_specs(plan, args)
+    payload = bytearray().join(_encode_chunk_prepare_tensor_map(spec) for spec in specs)
+    q = _chunk_prepare_plan_tensor(plan, args, "q_idx")
+    storage = torch.frombuffer(payload, dtype=torch.uint8).clone().to(q.device)
+    if storage.data_ptr() % 64:
+        raise exc.BackendUnsupported(
+            "cute", "chunk-prepare tensor-map storage is misaligned"
+        )
+    base = storage.data_ptr()
+    return storage, cast(
+        "tuple[int, int, int, int]",
+        tuple(base + 128 * index for index in range(4)),
+    )
+
+
+def _chunk_recurrence_plan_tensor(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+    key: str,
+) -> torch.Tensor:
+    index = plan.get(key)
+    if type(index) is not int or not 0 <= index < len(args):
+        raise exc.BackendUnsupported("cute", f"invalid chunk-recurrence {key}")
+    tensor = args[index]
+    if not isinstance(tensor, torch.Tensor):
+        raise exc.BackendUnsupported("cute", f"chunk-recurrence {key} is not a tensor")
+    return tensor
+
+
+def _chunk_recurrence_tensor_map_specs(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+    *,
+    validate_only: bool = False,
+) -> dict[str, Any]:
+    """Validate v2-workspace recurrence arguments and describe DV4 TensorMaps."""
+
+    def plan_int(key: str) -> int:
+        value = plan.get(key)
+        if type(value) is not int:
+            raise exc.BackendUnsupported("cute", f"invalid chunk-recurrence {key}")
+        return value
+
+    kind = plan.get("kind")
+    if (
+        kind not in ("chunk_recurrence_sm100", "chunk_recurrence_warp_dv4")
+        or plan_int("workspace_layout_version") != 2
+        or plan.get("outputs_scaled") is not False
+        or plan.get("factor_key_xor") != 8
+        or plan_int("chunk_size") != 16
+        or plan_int("key_size") != 128
+        or plan_int("value_size") != 128
+    ):
+        raise exc.BackendUnsupported("cute", "unsupported chunk-recurrence ABI")
+    total_tokens = plan_int("total_tokens")
+    total_chunks = plan_int("total_chunks")
+    heads = plan_int("heads")
+    sequences = plan_int("sequences")
+    if min(total_tokens, total_chunks, heads, sequences) <= 0:
+        raise exc.BackendUnsupported("cute", "empty chunk-recurrence launch")
+
+    names = (
+        "kd_idx",
+        "qd_idx",
+        "ak_idx",
+        "aq_idx",
+        "gt_idx",
+        "v_idx",
+        "out_idx",
+        "state_idx",
+        "cu_seqlens_idx",
+        "cu_chunks_idx",
+    )
+    (
+        kd,
+        qd,
+        ak,
+        aq,
+        g_total,
+        values,
+        output,
+        state,
+        cu_seqlens,
+        cu_chunks,
+    ) = tuple(_chunk_recurrence_plan_tensor(plan, args, name) for name in names)
+    tensors = (kd, qd, ak, aq, g_total, values, output, state, cu_seqlens, cu_chunks)
+    if kd.device.type != "cuda" or any(
+        tensor.device != kd.device for tensor in tensors
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "chunk-recurrence tensors must share one CUDA device"
+        )
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise exc.BackendUnsupported(
+            "cute", "chunk-recurrence tensors must be contiguous"
+        )
+
+    rows = total_chunks * 16
+    expected = (
+        (kd, torch.bfloat16, (heads * rows, 128)),
+        (qd, torch.bfloat16, (heads * rows, 128)),
+        (ak, torch.bfloat16, (heads * rows, 128)),
+        (aq, torch.bfloat16, (heads * total_chunks, 256)),
+        (g_total, torch.float32, (heads * total_chunks, 128)),
+        (values, torch.bfloat16, (total_tokens * heads, 128)),
+        (output, torch.bfloat16, (total_tokens * heads, 128)),
+        (state, torch.bfloat16, (sequences, heads, 128, 128)),
+        (cu_seqlens, torch.int32, (sequences + 1,)),
+        (cu_chunks, torch.int32, (sequences + 1,)),
+    )
+    for tensor, dtype, shape in expected:
+        if tensor.dtype is not dtype or tuple(tensor.shape) != shape:
+            raise exc.BackendUnsupported(
+                "cute", "chunk-recurrence tensor dtype/shape ABI mismatch"
+            )
+
+    vector_bytes = heads * rows * 128 * 2
+    aq_bytes = heads * total_chunks * 256 * 2
+    kd_ptr = kd.data_ptr()
+    expected_ptrs = (
+        kd_ptr,
+        kd_ptr + vector_bytes,
+        kd_ptr + 2 * vector_bytes,
+        kd_ptr + 3 * vector_bytes,
+        kd_ptr + 3 * vector_bytes + aq_bytes,
+    )
+    factor_tensors = (kd, qd, ak, aq, g_total)
+    actual_ptrs = tuple(tensor.data_ptr() for tensor in factor_tensors)
+    storages = tuple(tensor.untyped_storage() for tensor in factor_tensors)
+    storage_bases = tuple(storage.data_ptr() for storage in storages)
+    workspace_bytes = (
+        3 * vector_bytes + aq_bytes + g_total.numel() * g_total.element_size()
+    )
+    if (
+        kd_ptr % 256
+        or actual_ptrs != expected_ptrs
+        or len(set(storage_bases)) != 1
+        or storage_bases[0] != kd_ptr
+        or any(storage.nbytes() < workspace_bytes for storage in storages)
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "chunk-recurrence factors must use the exact packed workspace ABI"
+        )
+
+    def byte_range(tensor: torch.Tensor) -> tuple[int, int]:
+        begin = tensor.data_ptr()
+        return begin, begin + tensor.numel() * tensor.element_size()
+
+    def overlaps(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+        lhs_begin, lhs_end = byte_range(lhs)
+        rhs_begin, rhs_end = byte_range(rhs)
+        return lhs_begin < rhs_end and rhs_begin < lhs_end
+
+    value_range = byte_range(values)
+    output_range = byte_range(output)
+    if value_range != output_range and overlaps(values, output):
+        raise exc.BackendUnsupported(
+            "cute", "chunk-recurrence value/output must alias exactly or be disjoint"
+        )
+    for name, tensor in (("cu_seqlens", cu_seqlens), ("cu_chunks", cu_chunks)):
+        if overlaps(output, tensor):
+            raise exc.BackendUnsupported(
+                "cute", f"chunk-recurrence output aliases {name}"
+            )
+    for tensor in (*factor_tensors, values, output, cu_seqlens, cu_chunks):
+        if overlaps(state, tensor):
+            raise exc.BackendUnsupported("cute", "chunk-recurrence state aliases input")
+    factor_begin = kd_ptr
+    factor_end = kd_ptr + workspace_bytes
+    for tensor in (values, output, state, cu_seqlens, cu_chunks):
+        begin, end = byte_range(tensor)
+        if begin < factor_end and factor_begin < end:
+            raise exc.BackendUnsupported(
+                "cute", "chunk-recurrence factor workspace aliases another argument"
+            )
+    if any(
+        tensor.data_ptr() % 16 for tensor in (kd, aq, g_total, values, output, state)
+    ):
+        raise exc.BackendUnsupported("cute", "chunk-recurrence TMA base is misaligned")
+
+    if validate_only:
+        return {}
+
+    # The DV2 host schedule builds CuTe TensorMaps from the validated tensor
+    # views itself.  Only the external warp-DV4 schedule consumes raw encoded
+    # descriptors owned by this launcher.
+    if kind != "chunk_recurrence_warp_dv4":
+        raise exc.BackendUnsupported(
+            "cute", "raw chunk-recurrence TensorMaps require the warp-DV4 schedule"
+        )
+
+    from helion._compiler.cute.chunk_recurrence_dv4_sm100 import (
+        recurrence_tensor_map_specs,
+    )
+
+    return recurrence_tensor_map_specs(
+        kd_ptr=kd_ptr,
+        aq_ptr=aq.data_ptr(),
+        gt_ptr=g_total.data_ptr(),
+        v_ptr=values.data_ptr(),
+        out_ptr=output.data_ptr(),
+        heads=heads,
+        total_tokens=total_tokens,
+        total_chunks=total_chunks,
+        sequences=sequences,
+        state_ptr=state.data_ptr(),
+    )
+
+
+def _build_chunk_recurrence_tensor_maps(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+) -> tuple[torch.Tensor, tuple[int, int, int, int, int, int, int]]:
+    if plan.get("kind") != "chunk_recurrence_warp_dv4":
+        raise exc.BackendUnsupported("cute", "unsupported chunk-recurrence plan")
+    from helion._compiler.cute.chunk_recurrence_dv4_sm100 import ROLES
+    from helion._compiler.cute.chunk_recurrence_dv4_sm100 import (
+        build_recurrence_tensor_maps,
+    )
+
+    specs = _chunk_recurrence_tensor_map_specs(plan, args)
+    kd = _chunk_recurrence_plan_tensor(plan, args, "kd_idx")
+    try:
+        tensor_maps = build_recurrence_tensor_maps(specs, kd.device)
+    except (RuntimeError, ValueError) as error:
+        raise exc.BackendUnsupported(
+            "cute", f"chunk-recurrence tensor-map construction failed: {error}"
+        ) from error
+    return tensor_maps.storage, cast(
+        "tuple[int, int, int, int, int, int, int]",
+        tuple(tensor_maps.address(role) for role in ROLES),
+    )
 
 
 def _build_cute_schema_and_args(
@@ -4080,19 +6078,15 @@ def _build_cute_schema_and_args(
     for i, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
             _validate_cute_launcher_tensor(arg)
-            ndim = arg.ndim
-            if ndim <= 0:
-                raise exc.BackendUnsupported(
-                    "cute", "launcher requires tensor rank >= 1"
-                )
-            sizes_t = tuple(int(arg.size(d)) for d in range(ndim))
-            strides_t = tuple(int(arg.stride(d)) for d in range(ndim))
+            ndim, sizes_t, strides_t = _cute_launcher_tensor_layout(arg)
+            data_ptr = int(arg.data_ptr())
+            alignment = _cute_pointer_alignment(data_ptr)
             launch_args.append(
                 make_ptr(
                     cast("Any", _torch_dtype_to_cutlass(arg.dtype)),
-                    arg.data_ptr(),
+                    data_ptr,
                     gmem_space,
-                    assumed_align=16,
+                    assumed_align=alignment,
                 )
             )
             # ``cute.make_layout`` rejects a 0 in any shape dimension, so
@@ -4105,9 +6099,17 @@ def _build_cute_schema_and_args(
                 # constant strides — typically a 2-3x reduction in
                 # ``smsp__inst_executed`` for reduction kernels where the
                 # inner loop is dominated by stride multiplies.
-                schema.append(("tensor", str(arg.dtype), ndim, sizes_t, strides_t))
+                schema.append(
+                    _cute_schema_with_pointer_alignment(
+                        ("tensor", str(arg.dtype), ndim, sizes_t, strides_t), alignment
+                    )
+                )
             else:
-                schema.append(("tensor", str(arg.dtype), ndim))
+                schema.append(
+                    _cute_schema_with_pointer_alignment(
+                        ("tensor", str(arg.dtype), ndim), alignment
+                    )
+                )
                 launch_args.extend(sizes_t)
                 launch_args.extend(strides_t)
             continue
@@ -4144,35 +6146,43 @@ def _build_cute_schema_and_args(
         _validate_cute_launcher_tensor(tensor)
         sizes = tuple(int(tensor.size(d)) for d in range(tensor.ndim))
         strides = tuple(int(tensor.stride(d)) for d in range(tensor.ndim))
+        data_ptr = int(tensor.data_ptr())
+        alignment = _cute_pointer_alignment(data_ptr)
         launch_args.append(
             make_ptr(
                 cast("Any", _torch_dtype_to_cutlass(tensor.dtype)),
-                tensor.data_ptr(),
+                data_ptr,
                 gmem_space,
-                assumed_align=16,
+                assumed_align=alignment,
             )
         )
         if runtime_leading_extent:
             schema.append(
-                (
-                    "wrapper_tensor_runtime_leading_extent",
-                    name,
-                    str(tensor.dtype),
-                    tensor.ndim,
-                    sizes[1:],
-                    strides,
+                _cute_schema_with_pointer_alignment(
+                    (
+                        "wrapper_tensor_runtime_leading_extent",
+                        name,
+                        str(tensor.dtype),
+                        tensor.ndim,
+                        sizes[1:],
+                        strides,
+                    ),
+                    alignment,
                 )
             )
             launch_args.append(sizes[0])
         else:
             schema.append(
-                (
-                    "wrapper_tensor",
-                    name,
-                    str(tensor.dtype),
-                    tensor.ndim,
-                    sizes,
-                    strides,
+                _cute_schema_with_pointer_alignment(
+                    (
+                        "wrapper_tensor",
+                        name,
+                        str(tensor.dtype),
+                        tensor.ndim,
+                        sizes,
+                        strides,
+                    ),
+                    alignment,
                 )
             )
         if owned:
@@ -4249,6 +6259,85 @@ def _build_cute_schema_and_args(
         schema.append(("wrapper_host_scalar", total_name, "int"))
         launch_args.append(total_clusters)
         owned_tensors.extend(metadata_result.tensors())
+
+    chunk_prepare_plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "chunk_prepare_tma"
+    ]
+    if len(chunk_prepare_plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple chunk-prepare wrapper plans")
+    if chunk_prepare_plans:
+        plan = chunk_prepare_plans[0]
+        storage, descriptors = _build_chunk_prepare_tensor_maps(plan, args)
+        desc_args = plan.get("desc_args")
+        if not isinstance(desc_args, (list, tuple)) or len(desc_args) != len(
+            descriptors
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "invalid chunk-prepare descriptor arguments"
+            )
+        for name, address in zip(desc_args, descriptors, strict=True):
+            if not isinstance(name, str):
+                raise exc.BackendUnsupported(
+                    "cute", "invalid chunk-prepare descriptor argument name"
+                )
+            schema.append(("wrapper_host_scalar", name, "int"))
+            launch_args.append(address)
+        owned_tensors.append(storage)
+
+    chunk_recurrence_plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "chunk_recurrence_warp_dv4"
+    ]
+    if len(chunk_recurrence_plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple chunk-recurrence wrapper plans")
+    if chunk_recurrence_plans:
+        plan = chunk_recurrence_plans[0]
+        storage, descriptors = _build_chunk_recurrence_tensor_maps(plan, args)
+        desc_args = plan.get("desc_args")
+        if not isinstance(desc_args, (list, tuple)) or len(desc_args) != len(
+            descriptors
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "invalid chunk-recurrence descriptor arguments"
+            )
+        for name, address in zip(desc_args, descriptors, strict=True):
+            if not isinstance(name, str):
+                raise exc.BackendUnsupported(
+                    "cute", "invalid chunk-recurrence descriptor argument name"
+                )
+            schema.append(("wrapper_host_scalar", name, "int"))
+            launch_args.append(address)
+        owned_tensors.append(storage)
+
+    sm100_recurrence_plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "chunk_recurrence_sm100"
+    ]
+    if len(sm100_recurrence_plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple SM100 recurrence plans")
+    if sm100_recurrence_plans:
+        # Reuse the strict packed-workspace and alias checks while the SM100
+        # path is brought up.  It constructs no raw descriptor storage here;
+        # the nested CuTe host creates TensorMaps from the validated views.
+        _chunk_recurrence_tensor_map_specs(
+            sm100_recurrence_plans[0], args, validate_only=True
+        )
+
+    gdn_recurrence_plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "gdn_recurrence_sm100"
+    ]
+    if len(gdn_recurrence_plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple gdn recurrence plans")
+    if gdn_recurrence_plans:
+        # The nested CuTe host builds its TMA descriptors from the baked tensor
+        # views, so the runtime tensors must match the compiled geometry.
+        _validate_gdn_recurrence_launch_args(gdn_recurrence_plans[0], args)
 
     launch_args.extend(grid)
     # The stream is intentionally NOT appended here; it is sampled fresh per
@@ -4371,6 +6460,12 @@ def _cute_last_launch_arg_guard(
 
 
 _CUTE_FASTPATH_MISS: tuple[bool, None] = (False, None)
+# Lowest value the fast relaunch probe treats as a host heap address it may
+# dereference. Python's mmap-backed allocator places ctypes cells above this on
+# 64-bit Linux, the only platform the CUDA-only fast path runs on; by-value
+# integers such as tensor extents stay below it. macOS arm64 user space sits
+# entirely below this floor, so the probe never dereferences there.
+_CUTE_HOST_CELL_ADDRESS_FLOOR = 1 << 40
 
 
 class _CuteFastRelaunch:
@@ -4388,7 +6483,7 @@ class _CuteFastRelaunch:
 
     This caches the marshalled ``exe_args`` once and per call only:
 
-    1. checks the metadata guard (no pointer equality),
+    1. checks metadata and compiled pointer alignment (no pointer equality),
     2. writes each tensor arg's ``data_ptr()`` into its probe-verified
        ``exe_args`` slot (tensor pointers marshal by value),
     3. refreshes the CUDA stream slot(s), and
@@ -4430,7 +6525,15 @@ class _CuteFastRelaunch:
         executor: object,
         exe_args: list[object],
         tensor_guards: tuple[
-            tuple[int, str, int | None, torch.dtype, tuple[int, ...], tuple[int, ...]],
+            tuple[
+                int,
+                str,
+                int | None,
+                torch.dtype,
+                tuple[int, ...],
+                tuple[int, ...],
+                int,
+            ],
             ...,
         ],
         scalar_guards: tuple[_CuteLastScalarArgGuard, ...],
@@ -4484,6 +6587,7 @@ class _CuteFastRelaunch:
             dtype,
             shape,
             stride,
+            alignment,
         ) in self.tensor_guards:
             tensor = args[index]
             if (
@@ -4493,6 +6597,7 @@ class _CuteFastRelaunch:
                 or tensor.device.index != device_index
                 or tensor.size() != shape
                 or tensor.stride() != stride
+                or tensor.data_ptr() % alignment != 0
             ):
                 return _CUTE_FASTPATH_MISS
         for guard in self.scalar_guards:
@@ -4571,15 +6676,38 @@ def _cute_build_fast_relaunch(
         return None
     if _cute_dynamic_tensormap_contexts(cute_kernel, args):
         return None
+    # These whole-root plans pass host-encoded TensorMap descriptor
+    # addresses as scalar wrapper arguments.  Their descriptor payload embeds
+    # the tensor data pointers, so patching only the ordinary tensor-pointer
+    # slots would leave a relaunch aimed at the first invocation's buffers.
+    # Keep them on the pointer-keyed launch cache until the fastpath can also
+    # rebuild or patch raw TensorMap descriptors.
+    wrapper_plans = getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+    if any(
+        plan.get("kind")
+        in {
+            "chunk_prepare_tma",
+            "chunk_recurrence_sm100",
+            "chunk_recurrence_warp_dv4",
+            "gdn_recurrence_sm100",
+            "gathered_mma_tma",
+            "block_scaled_mma",
+        }
+        for plan in wrapper_plans
+    ):
+        return None
     device_index: int | None = None
-    tensors: list[tuple[int, torch.Tensor]] = []
+    tensors: list[tuple[int, torch.Tensor, int]] = []
     for index, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
             if arg.device.type != "cuda":
                 return None
             if device_index is None:
                 device_index = arg.device.index
-            tensors.append((index, arg))
+            alignment = _cute_schema_pointer_alignment(launch.schema[index])
+            if arg.data_ptr() % alignment != 0:
+                return None
+            tensors.append((index, arg, alignment))
     if device_index is None:
         device_index = torch.cuda.current_device()
     try:
@@ -4600,12 +6728,12 @@ def _cute_build_fast_relaunch(
         if len(base_ptr_positions) != len(tensors):
             return None
         own_base = list(orig_base)
-        for k, (_arg_index, tensor) in enumerate(tensors):
+        for k, (_arg_index, tensor, alignment) in enumerate(tensors):
             own_base[base_ptr_positions[k]] = make_ptr(
                 cast("Any", _torch_dtype_to_cutlass(tensor.dtype)),
                 int(tensor.data_ptr()),
                 gmem_space,
-                assumed_align=16,
+                assumed_align=alignment,
             )
         base = tuple(own_base)
         stream_a = cuda_driver.CUstream(raw0)
@@ -4633,7 +6761,11 @@ def _cute_build_fast_relaunch(
             # low canonical range.  Large by-value integers (e.g. tensor
             # extents) must never be dereferenced — from_address on a
             # non-address segfaults uncatchably.
-            if isinstance(addr, int) and addr > (1 << 40) and addr % 8 == 0:
+            if (
+                isinstance(addr, int)
+                and addr > _CUTE_HOST_CELL_ADDRESS_FLOOR
+                and addr % 8 == 0
+            ):
                 return int(ctypes.c_uint64.from_address(addr).value)
             return None
 
@@ -4644,14 +6776,14 @@ def _cute_build_fast_relaunch(
         # the address of a per-object ctypes cell containing it).
         alt_base = list(base)
         shifts: list[int] = []
-        for k, (_arg_index, tensor) in enumerate(tensors):
+        for k, (_arg_index, tensor, alignment) in enumerate(tensors):
             shift = 512 * (k + 1)
             shifts.append(shift)
             alt_base[base_ptr_positions[k]] = make_ptr(
                 cast("Any", _torch_dtype_to_cutlass(tensor.dtype)),
                 int(tensor.data_ptr()) + shift,
                 gmem_space,
-                assumed_align=16,
+                assumed_align=alignment,
             )
         exe4, _adapted4 = execution_args.generate_execution_args(
             (*tuple(alt_base), stream_a), {}
@@ -4660,7 +6792,7 @@ def _cute_build_fast_relaunch(
         if len(n4) != len(n1):
             return None
         tensor_slots: list[tuple[int, int | None, object | None]] = []
-        for k, (arg_index, tensor) in enumerate(tensors):
+        for k, (arg_index, tensor, _alignment) in enumerate(tensors):
             ptr = int(tensor.data_ptr())
             want = ptr + shifts[k]
             by_val = [
@@ -4722,7 +6854,15 @@ def _cute_build_fast_relaunch(
         # --- Metadata guards (no pointer equality).
         constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
         tensor_guards: list[
-            tuple[int, str, int | None, torch.dtype, tuple[int, ...], tuple[int, ...]]
+            tuple[
+                int,
+                str,
+                int | None,
+                torch.dtype,
+                tuple[int, ...],
+                tuple[int, ...],
+                int,
+            ]
         ] = []
         scalar_guards: list[_CuteLastScalarArgGuard] = []
         for index, arg in enumerate(args):
@@ -4735,6 +6875,7 @@ def _cute_build_fast_relaunch(
                         arg.dtype,
                         tuple(int(arg.size(d)) for d in range(arg.ndim)),
                         tuple(int(arg.stride(d)) for d in range(arg.ndim)),
+                        _cute_schema_pointer_alignment(launch.schema[index]),
                     )
                 )
                 continue
@@ -4863,6 +7004,31 @@ def default_cute_launcher(
         )
         if hit:
             return result
+    # Under-aligned TMA/vector operands of the staged plan kinds never reach
+    # the compiled wrapper: the fast path's alignment guard rejected them
+    # above, and the copies below are what the slower paths see and cache.
+    staging = _cute_stage_under_aligned_operands(cute_kernel, args_tuple)
+    if staging is None:
+        return _launch_cute_marshalled(
+            cute_kernel, args_tuple, grid_xyz, block_xyz, cute_compile_options
+        )
+    staged_args, copy_backs = staging
+    result = _launch_cute_marshalled(
+        cute_kernel, staged_args, grid_xyz, block_xyz, cute_compile_options
+    )
+    for destination, copy in copy_backs:
+        destination.copy_(copy)
+    return result
+
+
+def _launch_cute_marshalled(
+    cute_kernel: object,
+    args_tuple: tuple[object, ...],
+    grid_xyz: tuple[int, int, int],
+    block_xyz: tuple[int, int, int],
+    cute_compile_options: str | None,
+) -> object:
+    """Launch through the last-launch cache or the schema-cached build path."""
     last_launch = _cute_last_launch_cache_entry(
         cute_kernel,
         args_tuple,
@@ -4871,6 +7037,11 @@ def default_cute_launcher(
         cute_compile_options,
     )
     if last_launch is not None:
+        _retain_cute_capture_owned_launch_tensors(
+            cute_kernel,
+            grouped_launch_contexts=last_launch.arg_guard.grouped_launch_contexts,
+            owned_tensors=last_launch.launch.owned_tensors,
+        )
         _record_cute_owned_launch_tensors(last_launch.launch.owned_tensors)
         return cast("Any", last_launch.compiled)(
             *last_launch.launch.launch_args,

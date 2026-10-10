@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import inspect
+import operator
+import threading
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
@@ -9,6 +12,7 @@ from typing import Hashable
 from typing import cast
 import unittest
 from unittest.mock import patch
+import weakref
 
 import sympy
 import torch
@@ -19,16 +23,41 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.compile_environment import RuntimeInputSpecialization
 from helion._compiler.compile_environment import _symint_free_symbols
+from helion._compiler.cute.memory_ops import (
+    _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
+)
+from helion._compiler.cute.memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+from helion._compiler.cute.memory_ops import _persistent_vec_alignment_matrix_signature
+from helion._compiler.cute.memory_ops import _tensor_storage_disjoint_matrix_signature
+from helion._compiler.cute.memory_ops import runtime_tensor_has_specialized_alignment
+from helion._compiler.cute.memory_ops import runtime_tensors_are_proven_disjoint
+from helion._compiler.device_function import DeviceFunction
+from helion._compiler.device_function import StaticShape
 from helion._compiler.device_ir import _finalize_cute_tcgen05_search_planning
+from helion._compiler.type_info import CallableType
+from helion._compiler.type_info import TensorType
+from helion._compiler.type_info import TypeInfo
+from helion._compiler.variable_origin import ArgumentOrigin
+from helion._compiler.variable_origin import NameOrigin
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
+from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
+import helion.language as hl
+from helion.language.constexpr import ConstExpr
 from helion.language.matmul_ops import _plan_cute_tcgen05_search_candidate
 from helion.runtime.cute.launcher import _Tcgen05GroupedWorklistCompatibilityClassifier
 from helion.runtime.kernel import BoundKernel
+from helion.runtime.kernel import Kernel
 from helion.runtime.kernel import _input_tensor_aliases
+from helion.runtime.kernel import _partition_prepared_extra_guards
+from helion.runtime.kernel import _PreparedCall
+from helion.runtime.kernel import _PreparedMetadataSpecializationExtractor
+from helion.runtime.kernel import _RuntimeInputSpecializationExtractor
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -261,6 +290,515 @@ class TestCuteRuntimeInputSpecialization(unittest.TestCase):
 
 
 class TestRuntimeInputSpecialization(unittest.TestCase):
+    def test_tensor_alias_key_flat_and_structured_arguments(self) -> None:
+        @dataclasses.dataclass
+        class Inputs:
+            first: torch.Tensor
+            second: torch.Tensor
+
+        x = torch.randn(4, 8)
+        y = torch.nn.Parameter(torch.randn(4, 8))
+        cases = (
+            ((), None),
+            ((x,), None),
+            ((x, y, 1e-5, None), None),
+            ((x, x.view_as(x)), None),
+            ((x, ConstExpr(x), y), None),
+            ((x, 1e-5, x, y), (0, 0, 1)),
+            (([x, x],), (0, 0)),
+            ((x, [y, x]), (0, 1, 0)),
+            (({"b": y, "a": x}, x), (0, 1, 0)),
+            (({"a": x, "b": y}, x), (0, 1, 0)),
+            ((Inputs(x, y), x), (0, 1, 0)),
+        )
+        for index, (args, expected) in enumerate(cases):
+            with self.subTest(case=index):
+                self.assertEqual(_input_tensor_aliases(args), expected)
+
+    def test_set_config_rejects_post_bind_realignment(self) -> None:
+        source = LocalSource("value", is_input=True)
+        specialization = RuntimeInputSpecialization(
+            sources=(source,),
+            classifier_identity="alignment_test",
+            classifier=_persistent_vec_alignment_matrix_signature,
+            reusable_tensor_properties=frozenset(("data_ptr",)),
+        )
+        env = cast("CompileEnvironment", object.__new__(CompileEnvironment))
+        env.runtime_input_specializations = {
+            _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY: specialization
+        }
+        env.bound_runtime_input_specialization_results = {}
+        env._runtime_arg_values_by_name = contextvars.ContextVar(
+            "test_runtime_arg_values", default=None
+        )
+        env.tensor_input_source = lambda _tensor: source  # type: ignore[method-assign]
+
+        backing = torch.empty(17, dtype=torch.bfloat16)
+        value = backing[1:17]
+        aligned = backing[:16]
+        self.assertEqual(value.data_ptr() % 4, 2)
+        env.snapshot_runtime_input_specialization_results({"value": value})
+        value.data = aligned.data
+        self.assertEqual(value.data_ptr() % 4, 0)
+
+        bound = cast("Any", object.__new__(BoundKernel))
+        bound._env = env
+        bound._runtime_tensor_refs_by_name = {"value": weakref.ref(value)}
+        bound._normalize_config = lambda config: config
+        bound.format_kernel_decorator = lambda _config, _settings: "test"
+        bound.kernel = SimpleNamespace(settings=SimpleNamespace())
+        observed: list[bool] = []
+
+        def compile_config(_config: object) -> object:
+            with bound._runtime_arg_values_for_codegen():
+                observed.append(
+                    runtime_tensor_has_specialized_alignment(
+                        env, cast("Any", object()), 4
+                    )
+                )
+            return lambda: None
+
+        bound.compile_config = compile_config
+        BoundKernel.set_config(bound, cast("Any", object()))
+
+        self.assertEqual(observed, [False])
+
+    def test_bound_runtime_specialization_snapshot_is_immutable(self) -> None:
+        source = LocalSource("value", is_input=True)
+        content_calls = 0
+
+        def content_classifier(values: Sequence[object]) -> int:
+            nonlocal content_calls
+            content_calls += 1
+            return int(cast("torch.Tensor", values[0])[0])
+
+        specialization = RuntimeInputSpecialization(
+            sources=(source,),
+            classifier_identity="pointer_test",
+            classifier=lambda values: cast("torch.Tensor", values[0]).data_ptr(),
+            reusable_tensor_properties=frozenset(("data_ptr",)),
+        )
+        env = cast("CompileEnvironment", object.__new__(CompileEnvironment))
+        env.runtime_input_specializations = {
+            "content": RuntimeInputSpecialization(
+                sources=(source,),
+                classifier_identity="content_test",
+                classifier=content_classifier,
+            ),
+            "pointer": specialization,
+        }
+        env.bound_runtime_input_specialization_results = {}
+        original = torch.empty(8)
+        original_pointer = original.data_ptr()
+
+        env.snapshot_runtime_input_specialization_results({"value": original})
+        self.assertEqual(content_calls, 0)
+        self.assertNotIn("content", env.bound_runtime_input_specialization_results)
+        self.assertFalse(env.runtime_input_specialization_matches_bound("late", None))
+        original.data = torch.empty_like(original).data
+        self.assertNotEqual(original.data_ptr(), original_pointer)
+
+        self.assertTrue(
+            env.runtime_input_specialization_matches_bound("pointer", original_pointer)
+        )
+        self.assertFalse(
+            env.runtime_input_specialization_matches_bound(
+                "pointer", original.data_ptr()
+            )
+        )
+
+    def test_late_rekey_retires_bound_when_runtime_snapshot_changes(self) -> None:
+        source = LocalSource("value", is_input=True)
+        key = _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
+        specialization = RuntimeInputSpecialization(
+            sources=(source,),
+            classifier_identity="alignment_test",
+            classifier=_persistent_vec_alignment_matrix_signature,
+            reusable_tensor_properties=frozenset(("data_ptr",)),
+        )
+        env = cast("CompileEnvironment", object.__new__(CompileEnvironment))
+        env.runtime_input_specializations = {key: specialization}
+        env.bound_runtime_input_specialization_results = {}
+        env._runtime_arg_values_by_name = contextvars.ContextVar(
+            "test_late_rekey_runtime_args", default=None
+        )
+        env.tensor_input_source = lambda _tensor: source  # type: ignore[method-assign]
+
+        backing = torch.empty(17, dtype=torch.bfloat16)
+        aligned = backing[:16]
+        unaligned = backing[1:17]
+        value = backing[:16]
+        self.assertEqual(aligned.data_ptr() % 4, 0)
+
+        extractor = _RuntimeInputSpecializationExtractor(
+            (operator.itemgetter(0),),
+            specialization.classifier,
+            frozenset(("data_ptr",)),
+            key,
+        )
+        facts_a = extractor((value,))
+        env.bound_runtime_input_specialization_results = {key: facts_a}
+
+        signature = ("signature",)
+        bound = cast("Any", object.__new__(BoundKernel))
+        bound._reset_generation = 0
+        bound._base_spec_key = signature
+        bound._env = env
+        bound._cache_managed = True
+        stale_calls = 0
+
+        def compiled_a(_value: torch.Tensor) -> str:
+            nonlocal stale_calls
+            stale_calls += 1
+            return "stale-a"
+
+        # Model a config compiled and selected while the bound still had facts A.
+        config_a = object()
+        bound._run = compiled_a
+        bound._config = config_a
+        bound._compile_cache = {config_a: compiled_a}
+        bound._cache_path_map = {config_a: "compiled-a.py"}
+        bound._direct_prepared_call = object()
+        kernel = cast("Any", object.__new__(Kernel))
+        kernel._bind_lock = threading.RLock()
+        kernel._specialize_extra_lock = threading.Lock()
+        kernel._reset_generation = 0
+        kernel._specialization_generation = 0
+        kernel._specialization_aliases = {}
+        kernel._dispatch_cache = {}
+        kernel._prepared_call = None
+        kernel._specialize_extra = {signature: [extractor]}
+        kernel._compiler_seed_specialize_extra = {signature: ()}
+        kernel._has_specialization_extras = True
+        kernel._bound_kernels = {
+            BoundKernelInMemoryCacheKey(signature, (facts_a,)): bound
+        }
+        bound.kernel = kernel
+
+        self.assertTrue(
+            Kernel._extend_bound_kernel_specializations(
+                kernel,
+                bound,
+                signature,
+                [lambda _args: "tail-a"],
+                (value,),
+            )
+        )
+        (matching_cache_key,) = kernel._bound_kernels
+        self.assertEqual(matching_cache_key.extra_results, (facts_a, "tail-a"))
+        self.assertEqual(env.bound_runtime_input_specialization_results[key], facts_a)
+        self.assertIs(bound._run, compiled_a)
+        self.assertEqual(bound._compile_cache, {config_a: compiled_a})
+
+        value.data = unaligned.data
+        facts_b = extractor((value,))
+        self.assertNotEqual(facts_a, facts_b)
+        self.assertTrue(
+            Kernel._extend_bound_kernel_specializations(
+                kernel,
+                bound,
+                signature,
+                [lambda _args: "tail-b"],
+                (value,),
+            )
+        )
+        self.assertFalse(kernel._bound_kernels)
+        self.assertEqual(env.bound_runtime_input_specialization_results[key], facts_a)
+        self.assertNotEqual(bound._reset_generation, kernel._reset_generation)
+        self.assertIsNone(bound._run)
+        self.assertIsNone(bound._config)
+        self.assertFalse(bound._compile_cache)
+        self.assertFalse(bound._cache_path_map)
+        self.assertIsNone(bound._direct_prepared_call)
+
+        value.data = aligned.data
+        with env.use_runtime_arg_values({"value": value}):
+            self.assertTrue(
+                runtime_tensor_has_specialized_alignment(
+                    env,
+                    cast("Any", object()),
+                    4,
+                )
+            )
+
+        # Even if stale compiled state is assigned again, the retired bound
+        # redirects before it can execute that program.
+        bound._run = compiled_a
+        replacement_calls = 0
+
+        def replacement(_value: torch.Tensor) -> str:
+            nonlocal replacement_calls
+            replacement_calls += 1
+            return "replacement-b"
+
+        kernel.bind = lambda _args: replacement
+        value.data = unaligned.data
+        self.assertEqual(bound(value), "replacement-b")
+        self.assertEqual(replacement_calls, 1)
+        self.assertEqual(stale_calls, 0)
+
+    def test_disjoint_fact_rejects_post_bind_alias_change(self) -> None:
+        state_source = LocalSource("state", is_input=True)
+        other_source = LocalSource("other", is_input=True)
+        sources = (state_source, other_source)
+        specialization = RuntimeInputSpecialization(
+            sources=sources,
+            classifier_identity="state_ring_alias_test",
+            classifier=_tensor_storage_disjoint_matrix_signature,
+            reusable_tensor_properties=frozenset(("storage_span",)),
+        )
+        backing = torch.empty(64)
+        bound_values = (backing[:32], backing[16:48])
+        current_values = (torch.empty(32), torch.empty(32))
+        bound_result = specialization.classifier(bound_values)
+        fake_state = object()
+        fake_other = object()
+        env = SimpleNamespace(
+            input_sources={},
+            runtime_arg_values_by_name={
+                "state": current_values[0],
+                "other": current_values[1],
+            },
+            runtime_input_specializations={
+                _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY: specialization
+            },
+            tensor_input_source=lambda tensor: (
+                state_source if tensor is fake_state else other_source
+            ),
+            runtime_input_specialization_matches_bound=(
+                lambda key, result: (
+                    key == _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+                    and result == bound_result
+                )
+            ),
+        )
+
+        with patch(
+            "helion._compiler.cute.memory_ops._tensor_alias_sources",
+            return_value=sources,
+        ):
+            self.assertFalse(
+                runtime_tensors_are_proven_disjoint(
+                    cast("Any", env), cast("Any", fake_state), cast("Any", fake_other)
+                )
+            )
+            current_result = specialization.classifier(current_values)
+            env.runtime_input_specialization_matches_bound = lambda key, result: (
+                key == _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+                and result == current_result
+            )
+            self.assertTrue(
+                runtime_tensors_are_proven_disjoint(
+                    cast("Any", env), cast("Any", fake_state), cast("Any", fake_other)
+                )
+            )
+
+    def test_state_ring_alias_specialization_distinguishes_storage_views(self) -> None:
+        state_source = LocalSource("state", is_input=True)
+        other_source = LocalSource("other", is_input=True)
+        specialization = RuntimeInputSpecialization(
+            sources=(state_source, other_source),
+            classifier_identity="state_ring_alias_test",
+            classifier=_tensor_storage_disjoint_matrix_signature,
+            reusable_tensor_properties=frozenset(("storage_span",)),
+        )
+        env = SimpleNamespace(
+            specialized_vars=set(),
+            specialized_strides=set(),
+            tensor_descriptor_layout_guards={},
+            runtime_input_specializations={"state_ring_alias": specialization},
+        )
+        kernel = SimpleNamespace(signature=inspect.signature(lambda state, other: None))
+        bound = SimpleNamespace(
+            _env=env,
+            env=env,
+            kernel=kernel,
+            _fixed_config_for_td_layout_guards=lambda: None,
+        )
+        extractor = BoundKernel._specialize_extra(cast("BoundKernel[object]", bound))[0]
+
+        state = torch.empty((4, 8))
+        other = torch.empty((4, 8))
+        backing = torch.empty(64)
+        state_view = backing[:32].view(4, 8)
+        other_view = backing[16:48].view(4, 8)
+
+        self.assertEqual(state.shape, state_view.shape)
+        self.assertEqual(state.stride(), state_view.stride())
+        self.assertEqual(extractor((state, other)), (True,))
+        self.assertEqual(extractor((state_view, other_view)), (False,))
+
+    def test_direct_stale_bound_rebinds_after_kernel_reset(self) -> None:
+        calls = 0
+
+        def replacement(value: object) -> object:
+            nonlocal calls
+            calls += 1
+            return value
+
+        kernel = SimpleNamespace(
+            _reset_generation=2,
+            bind=lambda _args: replacement,
+        )
+        bound = cast("Any", object.__new__(BoundKernel))
+        bound.kernel = kernel
+        bound._cache_managed = True
+        bound._reset_generation = 1
+
+        value = object()
+        self.assertIs(bound(value), value)
+        self.assertEqual(calls, 1)
+
+    def test_direct_bound_call_uses_prepared_fast_path(self) -> None:
+        tensor = torch.empty(8)
+        kernel = SimpleNamespace(
+            _annotations=[torch.Tensor],
+            _compute_is_distributed=lambda _args, **_kwargs: False,
+            _reset_generation=0,
+            _specialization_generation=0,
+        )
+        bound = cast("Any", object.__new__(BoundKernel))
+        bound.kernel = kernel
+        bound._cache_managed = True
+        bound._reset_generation = 0
+        bound._run = lambda value: value
+        bound._direct_prepared_call = _PreparedCall(
+            cast("Any", bound),
+            (tensor,),
+            dist_initialized=torch.distributed.is_initialized(),
+            extra_guards=(),
+            is_distributed=False,
+        )
+
+        self.assertIs(bound(tensor), tensor)
+
+    def test_prepared_call_skips_reusable_classifier_until_storage_changes(
+        self,
+    ) -> None:
+        tensor = torch.empty(8)
+        calls = 0
+
+        def classifier(values: Sequence[object]) -> Hashable:
+            nonlocal calls
+            calls += 1
+            return cast("torch.Tensor", values[0]).data_ptr()
+
+        extractor = _RuntimeInputSpecializationExtractor(
+            (lambda args: cast("Hashable", args[0]),),
+            classifier,
+            frozenset(("data_ptr",)),
+        )
+        expected = extractor((tensor,))
+        kernel = SimpleNamespace(
+            _annotations=[torch.Tensor],
+            _compute_is_distributed=lambda _args, **_kwargs: False,
+            _reset_generation=0,
+            _specialization_generation=0,
+        )
+        bound = SimpleNamespace(kernel=kernel)
+        prepared = _PreparedCall(
+            cast("Any", bound),
+            (tensor,),
+            dist_initialized=torch.distributed.is_initialized(),
+            extra_guards=((extractor, expected),),
+            is_distributed=False,
+        )
+
+        calls = 0
+        self.assertTrue(prepared.matches(cast("Any", kernel), (tensor,)))
+        self.assertEqual(calls, 0)
+
+        replacement = torch.empty_like(tensor)
+        tensor.data = replacement.data
+        self.assertFalse(prepared.matches(cast("Any", kernel), (tensor,)))
+        self.assertEqual(calls, 1)
+
+        kernel._specialization_generation += 1
+        calls = 0
+        self.assertFalse(prepared.matches(cast("Any", kernel), (tensor,)))
+        self.assertEqual(calls, 0)
+
+    def test_prepared_storage_guard_reuses_only_unchanged_exact_tensors(self) -> None:
+        first = torch.empty(8)
+        second = torch.empty(8)
+        calls = 0
+
+        def classifier(values: Sequence[object]) -> Hashable:
+            nonlocal calls
+            calls += 1
+            return tuple(cast("torch.Tensor", value).data_ptr() for value in values)
+
+        extractor = _RuntimeInputSpecializationExtractor(
+            (
+                lambda args: cast("Hashable", args[0]),
+                lambda args: cast("Hashable", args[1]),
+            ),
+            classifier,
+            frozenset(("data_ptr", "storage_span")),
+        )
+        expected = extractor((first, second))
+        storage_guard, always_check, reusable = _partition_prepared_extra_guards(
+            (first, second),
+            ((extractor, expected),),
+        )
+        self.assertIsNotNone(storage_guard)
+        assert storage_guard is not None
+        self.assertFalse(always_check)
+        self.assertEqual(reusable, ((extractor, expected),))
+        self.assertTrue(storage_guard((first, second)))
+
+        replacement = torch.empty_like(first)
+        original_version = first._version
+        first.data = replacement.data
+        self.assertEqual(first._version, original_version)
+        self.assertFalse(storage_guard((first, second)))
+        self.assertEqual(calls, 1)
+
+    def test_prepared_guard_keeps_content_classifiers_and_skips_metadata(self) -> None:
+        tensor = torch.arange(4)
+        content_calls = 0
+
+        def content_classifier(values: Sequence[object]) -> int:
+            nonlocal content_calls
+            content_calls += 1
+            return int(cast("torch.Tensor", values[0])[0])
+
+        def content_extractor(args: Sequence[object]) -> int:
+            return content_classifier((args[0],))
+
+        metadata_extractor = _PreparedMetadataSpecializationExtractor(
+            lambda args: cast("torch.Tensor", args[0]).size(0)
+        )
+        unknown_property_extractor = _RuntimeInputSpecializationExtractor(
+            (lambda args: cast("Hashable", args[0]),),
+            lambda values: cast("torch.Tensor", values[0]).data_ptr(),
+            frozenset(("unknown",)),
+        )
+        storage_guard, always_check, reusable = _partition_prepared_extra_guards(
+            (tensor,),
+            (
+                (content_extractor, content_extractor((tensor,))),
+                (metadata_extractor, metadata_extractor((tensor,))),
+                (
+                    unknown_property_extractor,
+                    unknown_property_extractor((tensor,)),
+                ),
+            ),
+        )
+        self.assertIsNone(storage_guard)
+        self.assertEqual(
+            always_check,
+            (
+                (content_extractor, 0),
+                (unknown_property_extractor, tensor.data_ptr()),
+            ),
+        )
+        self.assertFalse(reusable)
+
+        tensor[0] = 3
+        self.assertEqual(always_check[0][0]((tensor,)), 3)
+        self.assertEqual(content_calls, 2)
+
     def test_tensor_alias_key_is_dynamo_safe_for_temporary_views(self) -> None:
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             assert _input_tensor_aliases((x.T, y.T)) is None
@@ -374,6 +912,243 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
                 ),
             ):
                 env.register_runtime_input_specialization("key", conflict)
+
+
+class _StrideHarness:
+    def __init__(self) -> None:
+        self.runtime_stride = object()
+
+    def _tensor_property(self, *args: object) -> object:
+        return self.runtime_stride
+
+
+class TestLayoutProvenance(unittest.TestCase):
+    @staticmethod
+    def _specialize_all_input_strides(
+        env: CompileEnvironment,
+        tensor: torch.Tensor,
+    ) -> None:
+        source = env.input_sources[tensor]
+        env.specialized_strides.update(
+            TensorPropertySource(source, TensorProperty.STRIDE, dim)
+            for dim in range(tensor.ndim)
+        )
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("compiled HostFunction metadata is unavailable in ref eager mode")
+    def test_kernel_trace_does_not_mark_torch_empty_out_as_fresh(self) -> None:
+        @helion.kernel(
+            autotune_effort="none",
+            backend="triton",
+            static_shapes=True,
+        )
+        def empty_out(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.size(), out=x)
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[1, 4]):
+                out[tile_m, tile_n] = x[tile_m, tile_n]
+            return out
+
+        x = torch.empty_strided((2, 4), (1, 2))
+        bound = empty_out.bind((x,))
+        self.assertFalse(
+            bound.env.tensor_layout_is_symbolically_exact(bound.fake_args[0])
+        )
+
+    def test_exact_factory_layout_provenance_is_positive_and_storage_scoped(
+        self,
+    ) -> None:
+        env = CompileEnvironment(
+            torch.device("cpu"),
+            helion.Settings(backend="triton", static_shapes=False),
+        )
+        real_input = torch.empty_strided((2, 3), (1, 2))
+        origin = NameOrigin("allocation")
+
+        with env:
+            fake_input = env.to_fake(real_input, ArgumentOrigin("x"))
+            assert isinstance(fake_input, torch.Tensor)
+            input_type = TensorType(ArgumentOrigin("x"), fake_input)
+
+            shape = TypeInfo.from_example((fake_input.size(0), 32), origin)
+            device = TypeInfo.from_example(torch.device("cpu"), origin)
+            allocation = CallableType(origin, torch.empty).propagate_call(
+                (shape,), {"device": device}, origin
+            )
+            assert isinstance(allocation, TensorType)
+
+            input_like = CallableType(origin, torch.empty_like).propagate_call(
+                (input_type,), {}, origin
+            )
+            out_target = torch.empty_strided((2, 3), (1, 2))
+            out_target_type = TensorType(ArgumentOrigin("out"), out_target)
+            input_shape = TypeInfo.from_example((2, 3), origin)
+            out_alias = CallableType(origin, torch.empty).propagate_call(
+                (input_shape,), {"out": out_target_type}, origin
+            )
+            exact_like = CallableType(origin, torch.empty_like).propagate_call(
+                (allocation,), {}, origin
+            )
+            assert isinstance(input_like, TensorType)
+            assert isinstance(out_alias, TensorType)
+            assert isinstance(exact_like, TensorType)
+
+            self.assertFalse(env.tensor_layout_is_symbolically_exact(fake_input))
+            self.assertFalse(
+                env.tensor_layout_is_symbolically_exact(fake_input.transpose(0, 1))
+            )
+            self.assertFalse(
+                env.tensor_layout_is_symbolically_exact(input_like.fake_value)
+            )
+            self.assertIs(out_alias.fake_value, out_target)
+            self.assertFalse(
+                env.tensor_layout_is_symbolically_exact(out_alias.fake_value)
+            )
+            self.assertTrue(
+                env.tensor_layout_is_symbolically_exact(allocation.fake_value)
+            )
+            self.assertTrue(
+                env.tensor_layout_is_symbolically_exact(
+                    allocation.fake_value.transpose(0, 1)
+                )
+            )
+            self.assertTrue(
+                env.tensor_layout_is_symbolically_exact(exact_like.fake_value)
+            )
+
+    def test_fully_specialized_input_layout_propagates_to_views(self) -> None:
+        env = CompileEnvironment(
+            torch.device("cpu"),
+            helion.Settings(backend="triton", static_shapes=False),
+        )
+        real_input = torch.empty_strided((2, 3, 4), (12, 4, 1))
+
+        with env:
+            fake_input = env.to_fake(real_input, ArgumentOrigin("x"))
+            assert isinstance(fake_input, torch.Tensor)
+            flattened = fake_input.view(6, 4)
+
+            self.assertFalse(env.tensor_layout_is_symbolically_exact(flattened))
+            source = env.input_sources[fake_input]
+            env.specialized_strides.add(
+                TensorPropertySource(source, TensorProperty.STRIDE, 0)
+            )
+            self.assertFalse(env.tensor_layout_is_symbolically_exact(flattened))
+
+            self._specialize_all_input_strides(env, fake_input)
+            self.assertTrue(env.tensor_layout_is_symbolically_exact(fake_input))
+            self.assertTrue(env.tensor_layout_is_symbolically_exact(flattened))
+            literal_view = fake_input.as_strided((6, 4), (4, 1))
+            literal_view_stride = DeviceFunction.tensor_stride(
+                cast("DeviceFunction", _StrideHarness()),
+                literal_view,
+                0,
+            )
+            self.assertIsInstance(literal_view_stride, StaticShape)
+            self.assertEqual(literal_view_stride.name, "4")
+
+            input_type = TensorType(ArgumentOrigin("x"), fake_input)
+            specialized_like = CallableType(
+                NameOrigin("allocation"), torch.empty_like
+            ).propagate_call((input_type,), {}, NameOrigin("allocation"))
+            assert isinstance(specialized_like, TensorType)
+            self.assertTrue(
+                env.tensor_layout_is_symbolically_exact(specialized_like.fake_value)
+            )
+
+    def test_specialized_input_layout_does_not_cross_input_aliases(self) -> None:
+        env = CompileEnvironment(
+            torch.device("cpu"),
+            helion.Settings(backend="triton", static_shapes=False),
+        )
+        real_input = torch.empty_strided((2, 3, 4), (12, 4, 1))
+        real_alias = real_input.transpose(0, 1)
+
+        with env:
+            fake_input = env.to_fake(real_input, ArgumentOrigin("x"))
+            fake_alias = env.to_fake(real_alias, ArgumentOrigin("alias"))
+            assert isinstance(fake_input, torch.Tensor)
+            assert isinstance(fake_alias, torch.Tensor)
+            self.assertEqual(fake_input.untyped_storage(), fake_alias.untyped_storage())
+
+            self._specialize_all_input_strides(env, fake_input)
+            self.assertFalse(env.tensor_layout_is_symbolically_exact(fake_input))
+            self.assertFalse(env.tensor_layout_is_symbolically_exact(fake_alias))
+
+    def test_factory_layout_registration_requires_fresh_storage(self) -> None:
+        env = CompileEnvironment(
+            torch.device("cpu"),
+            helion.Settings(backend="triton", static_shapes=False),
+        )
+
+        with env:
+            aliased = torch.empty((2, 3))
+            env.register_tensor_factory_layout(
+                torch.empty,
+                ([{"tensor": aliased}],),
+                {},
+                aliased,
+            )
+            self.assertFalse(env.tensor_layout_is_symbolically_exact(aliased))
+
+            out_target = torch.empty((2, 3))
+            fresh_result = torch.empty((2, 3))
+            env.register_tensor_factory_layout(
+                torch.empty,
+                ((2, 3),),
+                {"out": out_target},
+                fresh_result,
+            )
+            self.assertFalse(env.tensor_layout_is_symbolically_exact(fresh_result))
+
+    def test_dynamic_stride_literal_requires_positive_layout_provenance(self) -> None:
+        env = CompileEnvironment(
+            torch.device("cpu"),
+            helion.Settings(backend="triton", static_shapes=False),
+        )
+        real_input = torch.empty_strided((2, 3), (1, 2))
+        origin = NameOrigin("allocation")
+
+        with env:
+            fake_input = env.to_fake(real_input, ArgumentOrigin("x"))
+            assert isinstance(fake_input, torch.Tensor)
+            input_type = TensorType(ArgumentOrigin("x"), fake_input)
+            shape = TypeInfo.from_example((fake_input.size(0), 32), origin)
+            device = TypeInfo.from_example(torch.device("cpu"), origin)
+            allocation = CallableType(origin, torch.empty).propagate_call(
+                (shape,), {"device": device}, origin
+            )
+            input_like = CallableType(origin, torch.empty_like).propagate_call(
+                (input_type,), {}, origin
+            )
+            assert isinstance(allocation, TensorType)
+            assert isinstance(input_like, TensorType)
+
+            harness = _StrideHarness()
+            device_function = cast("DeviceFunction", harness)
+            literal = DeviceFunction.tensor_stride(
+                device_function,
+                allocation.fake_value,
+                1,
+            )
+            self.assertIsInstance(literal, StaticShape)
+            self.assertEqual(literal.name, "1")
+
+            host = SimpleNamespace(params=SimpleNamespace(arguments={"x": fake_input}))
+            with patch(
+                "helion._compiler.host_function.HostFunction.current",
+                return_value=host,
+            ):
+                for tensor in (
+                    fake_input,
+                    fake_input.transpose(0, 1),
+                    input_like.fake_value,
+                ):
+                    stride = DeviceFunction.tensor_stride(
+                        device_function,
+                        tensor,
+                        0,
+                    )
+                    self.assertIs(stride, harness.runtime_stride)
 
 
 if __name__ == "__main__":

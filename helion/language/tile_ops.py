@@ -58,6 +58,10 @@ def tile_index(tile: TileInterface) -> torch.Tensor:
 @_decorators.register_fake(tile_index)
 def _(tile: torch.SymInt) -> torch.Tensor:
     assert isinstance(tile, torch.SymInt)
+    # Disable at TRACE time like the other tile ops: the codegen-time
+    # disable alone runs after device-IR analysis, which is too late for
+    # the cute pointwise flatten re-registration to see it.
+    _disable_flatten_get_tile(tile)
     env = CompileEnvironment.current()
     base = torch.empty([tile], dtype=env.index_dtype, device=env.device)
     return env.new_index_result(base, [tile])
@@ -127,6 +131,13 @@ def _disable_flatten_get_tile(tile: object, state: CodegenState | None = None) -
     assert index is not None
     # The functions in this file can't be used in flattened loops.
     env.config_spec.flatten_loops.disable_block_id(index)
+    # Also drop any cute pointwise re-registration candidate for this loop:
+    # a spec disabled HERE must never be resurrected (unlike the
+    # vector-model partial-access gate, this restriction applies to the
+    # cute scalar model too).
+    env.config_spec.cute_reflatten_candidates = [
+        c for c in env.config_spec.cute_reflatten_candidates if index not in c.block_ids
+    ]
     return index
 
 
@@ -165,7 +176,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 @_decorators.codegen(tile_end, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0), state)
-    offset_var = state.codegen.offset_var(index)
+    offset_var = state.codegen.tile_begin_var(index)
     block_size_var = state.device_function.block_size_var(index)
     if block_size_var is None:
         block_size_var = "1"
@@ -284,7 +295,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 @_decorators.codegen(tile_id, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0), state)
-    offset = state.codegen.offset_var(index)
+    offset = state.codegen.tile_begin_var(index)
     block_size = state.device_function.block_size_var(index)
     if block_size is None:
         expr_str = offset

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import logging
+import math
 from operator import itemgetter
 from typing import TYPE_CHECKING
 from typing import Any
@@ -41,13 +41,10 @@ if TYPE_CHECKING:
     from ...autotuner.config_spec import MatmulFact
     from ...autotuner.config_spec import PointwiseElementwiseFact
     from ...autotuner.config_spec import ReductionDescriptor
-    from ...autotuner.config_spec import ReductionKernelFact
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
     from .common import HardwareTarget
 
-
-log = logging.getLogger(__name__)
 
 # Stand-in ceiling for an arch with no TMEM (sm90): makes a TMEM fit-check vacuously true.
 _INF = float("inf")
@@ -57,7 +54,7 @@ class CandidateDotWork(NamedTuple):
     """Tensor-core work executed by one candidate CTA."""
 
     total: int
-    tcgen05_eligible: int
+    warpgroup_eligible: int
     uncertain: bool = False
 
 
@@ -282,12 +279,12 @@ def _materialize_config(
         and allowed_pid_types
         and supported["pid_type"] not in allowed_pid_types
     ):
-        # Replace an illegal pid_type with the highest-preference legal one rather
-        # than popping it: a plain pop lets ``normalize`` refill the field with
-        # ``VALID_PID_TYPES[0]`` (== 'flat'), which re-introduces the disallowed value
-        # (e.g. under ``hl.barrier()`` / a data-dependent grid bound / force-persistent,
-        # where 'flat' is disallowed). ``allowed_pid_types`` is guaranteed non-empty and
-        # order-preserving, so ``[0]`` is a valid persistent choice when 'flat' is stripped.
+        # Replace an illegal pid_type with the highest-preference legal one.
+        # ``allowed_pid_types`` is guaranteed non-empty and order-preserving, so
+        # ``[0]`` is a valid persistent choice when 'flat' is disallowed (e.g.
+        # under ``hl.barrier()`` / a data-dependent grid bound / force-persistent);
+        # it is also the value ``normalize`` fills in for a missing key, so the
+        # explicit replacement only keeps the intent visible here.
         supported["pid_type"] = allowed_pid_types[0]
     config_spec.normalize(supported, _fix_invalid=True)
     config = Config(**cast("dict[str, Any]", supported))
@@ -353,6 +350,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     ACC_BUDGET = 32768  # fp32 [bm,bn] accumulator elems, register-file capacity
     SMEM_BUDGET = 228 * 1024  # per-CTA shared memory ceiling (bytes)
     DOT_MIN = 16  # tl.dot min M/N
+    REUSE_FREE_OUTPUT_N_FLOOR = DOT_MIN
     BASE_BM_CAP = 128  # base clamp on bm (wide-N aspect: bn = 2*bm, N is the coalesced store axis)
     BASE_BN_CAP = 256  # base clamp on bn
     WARPS_HI_ELEMS = 16384  # tile elems at/above which num_warps ramps 4 -> 8
@@ -362,10 +360,10 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     SAT_TILE_BM = 64  # saturated batched-dot occupancy tile cap (bm)
     SAT_TILE_BN = 128  # saturated batched-dot occupancy tile cap (bn)
     # Optional tighter ceiling when the dot's K loop covers one partition of an
-    # enclosing grid tile. Inactive on the frozen sm90 path.
+    # enclosing grid tile. Inactive until a measured hardware carrier enables it.
     SAT_PARTITIONED_K_BM: int | None = None
     SAT_PARTITIONED_K_BN: int | None = None
-    SAT_NUM_WARPS = (
+    SAT_NUM_WARPS: int | None = (
         None  # sm100 forces min-warps on a saturated tiny tile (None = use the ramp)
     )
     SAT_MAX_STAGES = (
@@ -390,22 +388,27 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     # different epilogue.
     EPILOGUE_ACC_ITEMSIZE = 4
     # Whether to ENFORCE the SMEM budget by shrinking the tile (steps 4'/5' and the alt-1 gate).
-    # Separate from the term above, and deliberately OFF on sm90: there `_smem_bytes` reduces to the
-    # operand ring charged at full num_stages, which OVER-estimates -- its worst case [16,2048,16] fp32
-    # computes 264192 but the hardware measures 132096 and fits. Enforcing would shrink tiles for a
-    # phantom overflow and break the sm90 byte-identical freeze.
+    # The legacy base leaves this off because its operand ring charges full num_stages and can
+    # overestimate badly. Hardware carriers enable it only with calibrated hard-allocation
+    # accounting.
     ENFORCE_SMEM_BUDGET = False
     # Slack for allocations too small to model individually (mbarriers are 8B each). Measured: an
     # otherwise-exact bound is violated by exactly 16 B, so a formula must not be tight to the byte.
     SMEM_SLACK = 0
+    # Some pipelines that publish a store reserve one fewer operand buffer
+    # than the global stage count. None disables this architecture model.
+    HARD_SMEM_16BIT_STORE_STAGE_OFFSET: int | None = None
     # Per-CTA tensor-memory ceiling in BYTES. None = no tensor memory on this arch.
-    TMEM_BUDGET = None
+    TMEM_BUDGET: int | None = None
     # Smallest block_m that lowers to tcgen05 (below it the dot uses a non-TMEM path, so TMEM is free).
     TCGEN05_MIN_BM = 64
+    # Smallest block_m that can use this architecture's warpgroup MMA path.
+    # tcgen05 and WGMMA share the same measured boundary today.
+    WARPGROUP_MIN_BM = TCGEN05_MIN_BM
     # --- whole-kernel resource accounting (see _tmem_columns / _warps_for_live_set) ---
     # tcgen05 tensor memory is allocated as TMEM_LANES lanes x TMEM_COLUMN_BUDGET columns of 32
     # bits, and a request is denominated in COLUMNS. None = the arch has no tensor memory, so the
-    # column check is inert (which is what keeps sm90 byte-identical).
+    # column check is inert.
     TMEM_LANES = 128
     TMEM_COLUMN_BUDGET: int | None = None
     TMEM_ALLOC_COLUMNS = 0
@@ -418,25 +421,18 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     # Warps in a tcgen05 warpgroup. Below this the MMA path is unavailable and the fp32
     # accumulator falls back into the register file.
     TCGEN05_WARPGROUP_WARPS = 4
+    WARPGROUP_WARPS = TCGEN05_WARPGROUP_WARPS
+    # Whether a warpgroup MMA moves eligible accumulators out of registers.
+    # WGMMA does not; the B200 policy carrier enables this for tcgen05.
+    ACCUMULATORS_IN_TMEM = False
     MAX_NUM_WARPS = 8
     MAX_THREADS_PER_SM = 2048
     MAX_CTAS_PER_SM = 32
     REGISTER_FILE_BYTES_PER_SM = 65536 * 4
     TMEM_COLUMNS_PER_SM: int | None = None
-    # Where the register-driven warp ladder STOPS climbing -- see _warps_for_live_set for why an
-    # arch with tensor memory wants to stop at a warpgroup rather than at MAX_NUM_WARPS. Held as a
-    # per-arch class attribute (like ENFORCE_SMEM_BUDGET and TMEM_COLUMN_BUDGET) rather than
-    # branched on inside the ladder: hardware selection lives in is_eligible via HARDWARE_TARGETS,
-    # so a method body that re-derives the arch duplicates a dispatch that already happened.
-    #
-    # MAX_NUM_WARPS here leaves the sm90 ladder exactly as it was. That is a decision to hold the
-    # frozen sm90 emit still, NOT a claim about H100 physics -- the cap was measured on B200 only,
-    # and sm90 has no measurement either way. Note also that _register_live_bytes drops the
-    # accumulators at TCGEN05_WARPGROUP_WARPS UNCONDITIONALLY, without consulting
-    # TMEM_COLUMN_BUDGET, so on an arch with no tensor memory the two are already inconsistent
-    # about the same physical fact. That is pre-existing and is not repaired here, because
-    # repairing it would move the frozen sm90 emit; it is recorded so the next reader of this
-    # constant does not mistake MAX_NUM_WARPS for a measured sm90 answer.
+    # Where the register-driven warp ladder stops climbing. An architecture
+    # whose warpgroup path moves accumulators out of registers may stop at one
+    # warpgroup; register-resident WGMMA may continue to the maximum.
     REG_CLIMB_MAX_WARPS = MAX_NUM_WARPS
     # Ceiling for the GRADED (sequential-pipeline) stage model. Measured over all 34 scored
     # curriculum bodies, the optimum coincides with MAX_STAGES: 4, 6 and 12 land within 0.002
@@ -485,8 +481,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     # but not that pipeline/barrier overhead is free. Allow that proof to recover
     # triple buffering while preserving any depth the grid-only model already chose.
     OCCUPANCY_RELAXED_MAX_STAGES = 3
-    # Master switches for the generalized/graded machinery, so an arch that has not been measured
-    # keeps its exact incumbent behavior (sm90 is a byte-identical freeze).
+    # Master switches for the generalized/graded machinery. A measured hardware carrier enables
+    # them together; the legacy base retains its narrower behavior.
     GENERALIZED_AXES = False
     GRADED_STAGES = False
     WORK_AWARE_WARPS = False
@@ -496,15 +492,15 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     # Candidate-work regime boundaries. Inactive unless REGIME_AWARE_WARPS is
     # enabled by a measured architecture subclass.
     SUBSTANTIAL_DOT_WORK = 1 << 20
-    TCGEN05_DOT_WORK = 1 << 20
+    WARPGROUP_DOT_WORK = 1 << 20
     # Every work-driven warp transition pays for any effective CTA residency it
     # gives up, but never for queued launch waves after residency is saturated.
     WARP_TRANSITION_OCCUPANCY_PENALTY_MAX = 4.0
     EIGHT_WARP_DOT_WORK = 1 << 26
-    NON_TCGEN_WIDE_N = 128
+    NON_WARPGROUP_WIDE_N = 128
     WARP1_SOFT_PRESSURE = 1.2
     FORCED_MMA_SOFT_PRESSURE = 1.2
-    TCGEN_CATASTROPHIC_PRESSURE = 1.75
+    WARPGROUP_CATASTROPHIC_PRESSURE = 1.75
     # With one enclosing trip, a second top-level stage can still overlap a
     # dot's operand movement. Prefer it only while the one-stage tile retains
     # register headroom; at higher pressure the measured compiler schedule
@@ -703,9 +699,9 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         in this body: hardware selection already happened in ``is_eligible`` via
         ``HARDWARE_TARGETS``, so re-deriving the arch here -- whether by reading it directly or by
         proxying it through ``TMEM_COLUMN_BUDGET is not None`` -- duplicates a dispatch the class
-        hierarchy performs and adds a second place for the two to disagree. The sm90 carrier leaves
-        it at ``MAX_NUM_WARPS``, which holds that frozen emit still rather than asserting anything
-        about H100, where the cap is unmeasured.
+        hierarchy performs and adds a second place for the two to disagree. The H100 carrier leaves
+        it at ``MAX_NUM_WARPS`` because WGMMA accumulators remain register-resident, so unresolved
+        pressure can still justify climbing beyond one warpgroup.
 
         Both halves are measured, by sweeping ``num_warps`` over 1/2/4/8 at the emitted tile for
         75 curriculum cells and scoring against each cell's own measured optimum over the 53
@@ -788,7 +784,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         p1 = pressure(1)
         p2 = pressure(2)
         wide_register_accumulator = any(
-            rows < cls.TCGEN05_MIN_BM and cols >= cls.NON_TCGEN_WIDE_N
+            rows < cls.WARPGROUP_MIN_BM and cols >= cls.NON_WARPGROUP_WIDE_N
             for rows, cols, _inner, _itemsize in cls._all_dot_acc_tiles(
                 env, block_sizes
             )
@@ -800,14 +796,14 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                 resident_ctas(upper),
             )
 
-        if work.tcgen05_eligible >= (
+        if work.warpgroup_eligible >= (
             cls.EIGHT_WARP_DOT_WORK
-            * transition_penalty(cls.TCGEN05_WARPGROUP_WARPS, cls.MAX_NUM_WARPS)
+            * transition_penalty(cls.WARPGROUP_WARPS, cls.MAX_NUM_WARPS)
         ):
             warps = 8
-        elif work.tcgen05_eligible > (
-            cls.TCGEN05_DOT_WORK * transition_penalty(2, cls.TCGEN05_WARPGROUP_WARPS)
-        ) or (not work.tcgen05_eligible and wide_register_accumulator):
+        elif work.warpgroup_eligible > (
+            cls.WARPGROUP_DOT_WORK * transition_penalty(2, cls.WARPGROUP_WARPS)
+        ) or (not work.warpgroup_eligible and wide_register_accumulator):
             warps = 4
         elif work.total >= (cls.SUBSTANTIAL_DOT_WORK * transition_penalty(1, 2)):
             warps = 2
@@ -815,29 +811,31 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             warps = 1 if p1 <= cls.WARP1_SOFT_PRESSURE else 2
 
         # Spill pressure is a guardrail, not the objective. With every dot forced
-        # onto register MMA, adding warps cannot accidentally cross into tcgen05,
-        # so relieve even a modest overshoot. A tcgen05-eligible tile has a much
-        # more expensive 2 -> 4 transition and crosses it only for enough work or
-        # genuinely catastrophic pressure.
-        if not work.tcgen05_eligible:
+        # onto register MMA, adding warps cannot accidentally cross into a
+        # warpgroup path, so relieve even a modest overshoot. A warpgroup-eligible
+        # tile has a much more expensive 2 -> 4 transition and crosses it only for
+        # enough work or genuinely catastrophic pressure.
+        if not work.warpgroup_eligible:
             while (
                 warps < cls.MAX_NUM_WARPS
                 and pressure(warps) > cls.FORCED_MMA_SOFT_PRESSURE
             ):
                 next_warps = warps * 2
-                if pressure(warps) <= cls.TCGEN_CATASTROPHIC_PRESSURE and resident_ctas(
+                if pressure(
+                    warps
+                ) <= cls.WARPGROUP_CATASTROPHIC_PRESSURE and resident_ctas(
                     next_warps
                 ) < resident_ctas(warps):
                     break
                 warps = next_warps
         else:
-            if warps < cls.TCGEN05_WARPGROUP_WARPS and (
-                p2 > cls.TCGEN_CATASTROPHIC_PRESSURE
+            if warps < cls.WARPGROUP_WARPS and (
+                p2 > cls.WARPGROUP_CATASTROPHIC_PRESSURE
             ):
-                warps = cls.TCGEN05_WARPGROUP_WARPS
+                warps = cls.WARPGROUP_WARPS
             if (
-                warps == cls.TCGEN05_WARPGROUP_WARPS
-                and pressure(warps) > cls.TCGEN_CATASTROPHIC_PRESSURE
+                warps == cls.WARPGROUP_WARPS
+                and pressure(warps) > cls.WARPGROUP_CATASTROPHIC_PRESSURE
                 and resident_ctas(warps * 2) >= resident_ctas(warps)
             ):
                 warps *= 2
@@ -865,7 +863,10 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
 
     @classmethod
     def _full_block_map(
-        cls, env: CompileEnvironment, block_sizes: list[int]
+        cls,
+        env: CompileEnvironment,
+        block_sizes: list[int],
+        overrides: Mapping[int, int] | None = None,
     ) -> dict[int, int]:
         """``{block_id: per-program extent}`` for EVERY block id, under the config whose
         ``block_sizes`` list is ``block_sizes``.
@@ -878,6 +879,9 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         * an ``hl.grid`` axis is a fixed source of 1 -- one row per program -- even though
           the axis's *extent* is the whole grid;
         * a specialized axis is fixed at its full extent.
+
+        ``overrides`` supplies candidate-owned widths, such as compiler-rolled reductions,
+        that must take precedence over their fixed source.
 
         Inferring these from "does it have a ``block_sizes`` entry" gets the middle case
         backwards, and the error is not small: reading a pinned outer grid axis at its full
@@ -902,6 +906,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         for slot in range(len(spec.block_sizes)):
             bs = cast("BlockSizeSpec", spec.block_sizes[slot])
             out[bs.block_id] = block_sizes[slot]
+        if overrides is not None:
+            out.update(overrides)
         # Everything else is fixed by its source: an ``hl.grid`` axis is one row per program
         # even though its extent is the whole grid, and a specialized / persistent-reduction
         # axis is its full extent.
@@ -1010,13 +1016,22 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             # the ring, so those bytes ADD. A region with no store is a plain K-loop whose
             # ring is dead by the time the epilogue converts, which is the liveness-packed
             # case the incumbent ``max(ring, epilogue)`` already models.
+            has_store = any(tile.kind == "store" for tile in tiles)
+
+            def tile_stages(tile: LiveTile) -> int:
+                if tile.kind != "load" or tile.stageable is False:
+                    return 1
+                depth = max(1, stages)
+                if hard_allocation and tile.itemsize <= 2:
+                    if has_store and cls.HARD_SMEM_16BIT_STORE_STAGE_OFFSET is not None:
+                        depth = max(
+                            1,
+                            depth - cls.HARD_SMEM_16BIT_STORE_STAGE_OFFSET,
+                        )
+                return depth
+
             return sum(
-                cls._resolve_tile_bytes(tile, block_of)
-                * (
-                    max(1, stages)
-                    if tile.kind == "load" and tile.stageable is not False
-                    else 1
-                )
+                cls._resolve_tile_bytes(tile, block_of) * tile_stages(tile)
                 for tile in tiles
                 if tile.kind in ("load", "store")
             )
@@ -1240,7 +1255,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         assert mm is not None
         block_of = cls._full_block_map(env, block_sizes)
         total = 0
-        tcgen05_eligible = 0
+        warpgroup_eligible = 0
         uncertain = False
         selected = range(len(mm.matmuls)) if indices is None else indices
         for index in selected:
@@ -1256,15 +1271,15 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                     block_sizes,
                     site.loop_axes,
                 )
-                # Unknown work is not evidence that tcgen05 setup can be
+                # Unknown work is not evidence that warpgroup setup can be
                 # amortized. Retain one proven invocation as a lower bound.
                 trips = resolved_trips if resolved_trips is not None else 1
                 uncertain = uncertain or resolved_trips is None
             work = m * n * k * trips
             total += work
-            if m >= cls.TCGEN05_MIN_BM:
-                tcgen05_eligible += work
-        return CandidateDotWork(total, tcgen05_eligible, uncertain)
+            if m >= cls.WARPGROUP_MIN_BM:
+                warpgroup_eligible += work
+        return CandidateDotWork(total, warpgroup_eligible, uncertain)
 
     @classmethod
     def _register_live_bytes(
@@ -1306,7 +1321,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             return 0
         block_of = cls._full_block_map(env, block_sizes)
         ceiling = cls.MAX_NUM_WARPS * 32 * cls.REG_BYTES_PER_THREAD
-        tmem_absorbs = num_warps >= cls.TCGEN05_WARPGROUP_WARPS
+        tmem_absorbs = cls.ACCUMULATORS_IN_TMEM and num_warps >= cls.WARPGROUP_WARPS
         peak = 0
         for step in mm.live_tile_steps:
             total = 0
@@ -1318,7 +1333,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                     continue
                 if tile.kind == "dot_out" and tmem_absorbs:
                     shape = cls._single_matrix_shape(tile, block_of)
-                    if shape is not None and shape[0] >= cls.TCGEN05_MIN_BM:
+                    if shape is not None and shape[0] >= cls.WARPGROUP_MIN_BM:
                         continue
                 total += nbytes
             peak = max(peak, total)
@@ -1405,6 +1420,18 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         num_sm: int,
     ) -> None:
         """Architecture hook for role-aware block-size corrections."""
+
+    @classmethod
+    def _pipeline_stage_cap(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        block_sizes: list[int],
+        *,
+        num_warps: int,
+    ) -> int | None:
+        """Architecture hook for structural pipeline limits."""
+        return None
 
     @classmethod
     def _graded_stage_depth(
@@ -1582,7 +1609,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         if (
             include_tmem
             and cls.TMEM_COLUMNS_PER_SM is not None
-            and warps >= cls.TCGEN05_WARPGROUP_WARPS
+            and warps >= cls.WARPGROUP_WARPS
         ):
             columns = cls._candidate_tmem_columns(
                 env,
@@ -1635,7 +1662,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             grid=cls._launch_grid(env, block_sizes),
             num_sm=num_sm,
         )
-        return cls._graded_stage_depth(
+        stages = cls._graded_stage_depth(
             smem_of,
             loop_trips=loop_trips,
             grid=stage_grid,
@@ -1643,6 +1670,18 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             resident_ctas=resident_ctas,
             allow_one_trip_stage2=allow_one_trip_stage2,
         )
+        mm = env.config_spec.kernel_matmul_fact
+        assert mm is not None
+        if (
+            cap := cls._pipeline_stage_cap(
+                env,
+                mm,
+                block_sizes,
+                num_warps=num_warps,
+            )
+        ) is not None:
+            stages = min(stages, cap)
+        return stages
 
     @classmethod
     def _solve_candidate_warps(
@@ -1709,7 +1748,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                             include_lhs_scratch=True,
                             resource_policy=resource_policy,
                         )
-                        if num_warps >= cls.TCGEN05_WARPGROUP_WARPS
+                        if num_warps >= cls.WARPGROUP_WARPS
                         else 0
                     ),
                     cls.TMEM_COLUMN_BUDGET,
@@ -1835,7 +1874,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                 and block_sizes[slot_of[bid]] // 2 >= max(floors[bid], cls.DOT_MIN)
             ]
             # Keep per-dot work fixed while scoring trials: only crossing the
-            # tcgen05 eligibility boundary should change this preference.
+            # warpgroup eligibility boundary should change this preference.
             dot_weights = tuple(
                 cls._candidate_dot_work(
                     env,
@@ -1867,10 +1906,10 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                 if impact is None:
                     continue
                 legal = all(demand <= budget for demand, budget in trial_resources)
-                tcgen05_work = 0
-                if trial_warps >= cls.TCGEN05_WARPGROUP_WARPS:
+                warpgroup_work = 0
+                if trial_warps >= cls.WARPGROUP_WARPS:
                     trial_blocks = cls._full_block_map(env, trial)
-                    tcgen05_work = sum(
+                    warpgroup_work = sum(
                         weight
                         for resolved, weight in zip(
                             mm.matmuls, dot_weights, strict=True
@@ -1880,7 +1919,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                             resolved.axes,
                             trial_blocks,
                         )[0]
-                        >= cls.TCGEN05_MIN_BM
+                        >= cls.WARPGROUP_MIN_BM
                     )
                 legacy_tiebreak = (
                     block_sizes[slot_of[bid]] if largest_first else -position
@@ -1891,7 +1930,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                         (
                             int(legal),
                             cleared,
-                            tcgen05_work,
+                            warpgroup_work,
                             0.0 if legal else normalized_relief,
                             legacy_tiebreak,
                         ),
@@ -1938,8 +1977,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         (4')/(5') are the final enforcement -- give up tile area when no cheaper knob can make the
         config legal. Both budgets reserve for their worst case UNCONDITIONALLY, with no attempt to
         predict Triton's operand-promotion or epilogue-conversion choices, so the accounting can only
-        err toward being too strict. Both are inert on sm90 (no tensor memory, no epilogue staging
-        buffer), which is what keeps that path byte-identical.
+        err toward being too strict. Hardware carriers choose which budgets to enforce and may refine
+        hard-allocation depth where compiled metadata supports it.
         """
         from ..._utils import prev_power_of_2
 
@@ -2000,8 +2039,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             waves = (g + num_sm - 1) // num_sm
             return g / (waves * num_sm)
 
-        # (2.7) TMEM-budget tile growth (sm100 only; TMEM_BUDGET is None on sm90, so H100 is
-        # unchanged). On Blackwell the fp32 accumulator lives in tcgen05 tensor memory rather than the
+        # (2.7) TMEM-budget tile growth (TMEM-capable carriers only). On Blackwell the fp32
+        # accumulator lives in tcgen05 tensor memory rather than the
         # register file, so the tile is limited by TMEM_BUDGET, not ACC_BUDGET. Keep doubling an axis
         # while the reservation still fits: N first, since it is the coalesced store / B-reuse axis and
         # a narrow-N tile is a large regression. Each step must also still fill a wave.
@@ -2030,8 +2069,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
 
         # Shrink the larger tile axis while the grid is under one full wave and shrinking helps;
         # already-saturated tiles are left untouched. WAVE_FILL_STRICT requires a STRICT wave-eff
-        # gain to shrink (a shrink that leaves occupancy flat only destroys operand reuse) — a
-        # universal fix, but sm90 keeps the old `>=` to stay byte-identical (frozen).
+        # gain to shrink (a shrink that leaves occupancy flat only destroys operand reuse).
         def _better(a: float, b: float) -> bool:
             return a > b if cls.WAVE_FILL_STRICT else a >= b
 
@@ -2100,8 +2138,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         #   (5') TENSOR memory -- the accumulator plus the A operand. Applies to EVERY case, including
         #        batched dots, which skip the (2.7) growth loop but still use tensor memory (measured:
         #        a pinned-batch dot at [256,256,32] reports tmem_size=512).
-        # Both are inert on sm90, which has neither an epilogue staging buffer nor tensor memory; that
-        # is what keeps the sm90 path byte-identical.
+        # Each check is controlled by the hardware carrier. H100 has no tensor memory but does
+        # enforce its calibrated shared-memory model.
         def _shrink_larger_axis() -> bool:
             """Halve the larger tile axis. False when both are already at the dot minimum."""
             nonlocal bm, bn, bk, num_stages
@@ -2114,11 +2152,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             bk, num_stages = _bk_and_stages(bm, bn)
             return True
 
-        # (4') is sm100-only: on sm90 `_smem_bytes` degenerates to the plain operand ring, and that
-        # model OVER-estimates -- its worst case [16,2048,16] fp32 computes 264192 but the hardware
-        # measures 132096 and fits fine. Shrinking there would cost real perf for a phantom overflow
-        # and break the sm90 byte-identical freeze, so the enforcement is gated on the conservative
-        # accounting being active.
+        # The legacy base leaves (4') off because a plain full-depth operand ring can overestimate
+        # badly. Measured hardware carriers enable it only when their allocation model is calibrated.
         if cls.ENFORCE_SMEM_BUDGET:
             while cls._smem_bytes(bm, bn, bk, itemsize, num_stages) > smem_budget:
                 if not _shrink_larger_axis():
@@ -2271,7 +2306,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         recompute_stages: bool,
         min_warps: int | None = None,
         max_warps: int | None = None,
-        keep_tcgen05: bool = False,
+        keep_warpgroup: bool = False,
         apply_role_correction: bool = True,
         protected_block_ids: Collection[int] = (),
         min_stages: int | None = None,
@@ -2287,7 +2322,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             cls._apply_knob_roles(env, mm, draft.block_sizes, num_sm)
 
         m_ids, n_ids, k_ids = axis_ids
-        if keep_tcgen05:
+        if keep_warpgroup:
             for block_id in m_ids:
                 try:
                     slot = env.config_spec.block_sizes.block_id_to_index(block_id)
@@ -2297,7 +2332,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                     env,
                     draft.block_sizes,
                     block_id,
-                    max(draft.block_sizes[slot], cls.TCGEN05_MIN_BM),
+                    max(draft.block_sizes[slot], cls.WARPGROUP_MIN_BM),
                 )
 
         keep_stage_blocks = recompute_stages and getattr(cls, "ROLE_KEEP_STAGES", False)
@@ -2305,7 +2340,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         shrinkable = list(dict.fromkeys((*n_ids, *k_ids, *m_ids)))
         protected = set(protected_block_ids)
         shrinkable = [block_id for block_id in shrinkable if block_id not in protected]
-        if keep_tcgen05:
+        if keep_warpgroup:
             shrinkable = [block_id for block_id in shrinkable if block_id not in m_ids]
 
         seen: set[tuple[tuple[int, ...], int, int]] = set()
@@ -2368,8 +2403,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         else:
             return None
 
-        if keep_tcgen05 and not any(
-            bm >= cls.TCGEN05_MIN_BM
+        if keep_warpgroup and not any(
+            bm >= cls.WARPGROUP_MIN_BM
             for bm, _bn, _bk, _itemsize in cls._all_dot_acc_tiles(
                 env,
                 draft.block_sizes,
@@ -2392,8 +2427,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         for warps in (1, 2):
             draft = base.copy()
             targets = (
-                cls.TCGEN05_MIN_BM,
-                warps * cls.TMEM_ALLOC_COLUMNS,
+                cls.WARPGROUP_MIN_BM,
+                warps * max(cls.DOT_MIN, cls.TMEM_ALLOC_COLUMNS),
                 warps * cls.DOT_MIN,
             )
             for block_ids, target in zip(axis_ids, targets, strict=True):
@@ -2466,7 +2501,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             log2_deltas: tuple[int, int, int],
             stage_delta: int,
             *,
-            keep_tcgen05: bool = False,
+            keep_warpgroup: bool = False,
         ) -> MatmulSeedDraft:
             draft = base.copy()
             changed = cls._scale_seed_axes(
@@ -2489,8 +2524,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                     num_sm=num_sm,
                     axis_ids=axis_ids,
                     recompute_stages=False,
-                    min_warps=(cls.TCGEN05_WARPGROUP_WARPS if keep_tcgen05 else None),
-                    keep_tcgen05=keep_tcgen05,
+                    min_warps=(cls.WARPGROUP_WARPS if keep_warpgroup else None),
+                    keep_warpgroup=keep_warpgroup,
                 )
                 or base.copy()
             )
@@ -2498,7 +2533,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         return [
             build((0, 0, -1), 1),
             build((0, 0, 1), -1),
-            build((-1, -1, -1), -1, keep_tcgen05=True),
+            build((-1, -1, -1), -1, keep_warpgroup=True),
         ]
 
     @classmethod
@@ -2876,11 +2911,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         # bm, so re-check the resource accounting: the alternate is a real search seed and an
         # over-budget one would just fail to compile (or, on the TMEM path, fail at launch).
         #
-        # Gated on the conservative accounting being active (i.e. sm100), for the same reason step
-        # (4')/(5') are: on sm90 ``_smem_bytes`` degenerates to the ring formula, which is a NEW
-        # constraint on alt-1 (it never had a SMEM check) and which that arch's own primary path
-        # deliberately does not enforce because the model over-estimates there. Applying it on sm90
-        # would drop ~15% of alt-1 seeds and break the byte-identical freeze.
+        # Gated on calibrated conservative accounting, for the same reason step (4')/(5') are:
+        # the legacy ring formula overestimates and was never a constraint on alt-1.
         cap_m = max(16, prev_power_of_2(max(1, fact.static_m)))
         bm2, bn2 = min(cap_m, bm * 2), max(16, bn // 2)
         conservative = cls.ENFORCE_SMEM_BUDGET
@@ -3018,15 +3050,14 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
     # smaller ceiling across both B200 front ends.
     SAT_PARTITIONED_K_BM = 32
     SAT_PARTITIONED_K_BN = 64
-    SAT_NUM_WARPS = 1
-    # Strict wave-fill shrink (see the shrink loop). A universal fix; gated to sm100 only to keep the
-    # sm90 freeze byte-identical — the principled end-state is to flip the base default once H100 can
-    # be re-benched (it would shift a few N=11008 shapes).
+    SAT_NUM_WARPS: int | None = 1
+    # Strict wave-fill shrink (see the shrink loop). The H100 port inherits this after separate
+    # validation; the legacy base retains its original non-strict default.
     WAVE_FILL_STRICT = True
     # --- conservative resource accounting (sm100 only; see _tmem_bytes / _smem_bytes) ---
     # Full tcgen05 tensor memory: 128 lanes x 512 columns x 32 bit = 262144 bytes. The [256,256] fp32
     # accumulator EXACTLY fills it, which is why a promoted A operand cannot coexist with that square.
-    TMEM_BUDGET = 128 * 512 * 4
+    TMEM_BUDGET: int | None = 128 * 512 * 4
     # The SAME tensor memory counted the way the hardware allocates it: 512 columns of 128 lanes.
     # Kept alongside the byte budget rather than replacing it, because the column count is the
     # faithful unit (a bm<128 accumulator costs full columns) and can therefore only ever REJECT a
@@ -3042,7 +3073,8 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
     # absorption boundary it is derived from cannot drift apart. Measured: 0.9591 against a
     # per-cell optimum over 53 cells where num_warps moves time, where climbing on to
     # MAX_NUM_WARPS scores 0.8959. See _warps_for_live_set.
-    REG_CLIMB_MAX_WARPS = TritonH100MatmulHeuristic.TCGEN05_WARPGROUP_WARPS
+    REG_CLIMB_MAX_WARPS = TritonH100MatmulHeuristic.WARPGROUP_WARPS
+    ACCUMULATORS_IN_TMEM = True
     # EPILOGUE_ACC_ITEMSIZE is inherited (the term is arch-independent). What is sm100-specific is
     # ENFORCING it: only here can the tile reach bm*bn=65536, where the term actually exceeds the cap.
     ENFORCE_SMEM_BUDGET = True
@@ -3074,6 +3106,7 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
     # same tensor memory while issuing less MMA work. M uses the tcgen05 row
     # threshold, and launch-grid knobs use their legal block minimum.
     TMEM_ALLOC_COLUMNS = 32
+    REUSE_FREE_OUTPUT_N_FLOOR = TMEM_ALLOC_COLUMNS
 
     @classmethod
     def _knob_amortizes(cls, mm: KernelMatmulFact, block_id: int) -> bool:
@@ -3134,11 +3167,10 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
           while the launch is below one wave and the shrink strictly improves wave
           utilization.
 
-        Reuse-free N axes stop at the tensor-memory column granularity. M axes
-        stop at ``TCGEN05_MIN_BM`` so this correction does not remove tcgen05
-        from the later regime-aware warp solve. Grid axes stop at their legal
-        block minimum; tensor-memory allocation granularity is not a launch-grid
-        constraint.
+        Reuse-free N axes stop at the architecture's configured output floor.
+        M axes stop at ``WARPGROUP_MIN_BM`` so this correction does not remove
+        the warpgroup path from the later regime-aware warp solve. Grid axes
+        stop at their legal block minimum.
         """
         spec = env.config_spec
         grid_ids = set(spec.grid_block_ids)
@@ -3152,9 +3184,9 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
         def output_floor(users: tuple[tuple[int, str], ...]) -> int | None:
             roles = {axis for _index, axis in users}
             if "m" in roles:
-                return cls.TCGEN05_MIN_BM
+                return cls.WARPGROUP_MIN_BM
             if "n" in roles:
-                return cls.TMEM_ALLOC_COLUMNS
+                return cls.REUSE_FREE_OUTPUT_N_FLOOR
             return None
 
         # (1) reuse-free output knobs -> the allocation floor.
@@ -3201,6 +3233,57 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
             guard += 1
             victim = max(candidates, key=lambda b: block_sizes[slot_of[b]])
             block_sizes[slot_of[victim]] //= 2
+
+
+class TritonH100FormulaMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
+    """SM90 formula front end using the B200 policy with H100 resources."""
+
+    name = "triton_h100_formula_matmul"
+    HARDWARE_TARGETS = (("cuda", "sm90"),)
+
+    # WGMMA accumulators remain register-resident. TMEM capacity, allocation,
+    # residency, and epilogue-driven hard correction therefore do not apply.
+    SMEM_BUDGET = 232448
+    TMEM_BUDGET = None
+    TMEM_COLUMN_BUDGET = None
+    TMEM_COLUMNS_PER_SM = None
+    TMEM_ALLOC_COLUMNS = 0
+    REUSE_FREE_OUTPUT_N_FLOOR = 32
+    ACCUMULATORS_IN_TMEM = False
+    REG_CLIMB_MAX_WARPS = TritonH100MatmulHeuristic.MAX_NUM_WARPS
+    ENFORCE_SMEM_BUDGET = True
+    SMEM_SLACK = 0
+    HARD_SMEM_16BIT_STORE_STAGE_OFFSET = 1
+    SAT_NUM_WARPS = None
+    WARPGROUP_DOT_WORK = 1 << 19
+
+    @classmethod
+    def _pipeline_stage_cap(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        block_sizes: list[int],
+        *,
+        num_warps: int,
+    ) -> int | None:
+        block_of = cls._full_block_map(env, block_sizes)
+        tiles = cls._all_dot_acc_tiles(env, block_sizes)
+        for resolved, (rows, _cols, _inner, _itemsize) in zip(
+            mm.matmuls, tiles, strict=True
+        ):
+            batch_id = resolved.site.rank_reduction_scaled_accumulator_batch_block_id
+            if (
+                batch_id is not None
+                and rows >= cls.WARPGROUP_MIN_BM
+                and num_warps >= cls.WARPGROUP_WARPS
+                and block_of[batch_id] == 1
+            ):
+                # HACK: Triton's SM90 layout solver crashes when a dot-derived
+                # rank reduction rescales a WGMMA acc= pipeline at stages > 1.
+                # This is not a hardware limit; replace this workaround with a
+                # Triton lowering/compiler fix once that path is repaired.
+                return 1
+        return None
 
 
 class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
@@ -3641,7 +3724,7 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
 
             high_launch = large_k.copy()
             high_launch.num_warps = max(
-                cls.TCGEN05_WARPGROUP_WARPS,
+                cls.WARPGROUP_WARPS,
                 high_launch.num_warps,
             )
             high_launch.num_stages = min(
@@ -3655,7 +3738,7 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
                 num_sm=num_sm,
                 axis_ids=axis_ids,
                 recompute_stages=False,
-                min_warps=cls.TCGEN05_WARPGROUP_WARPS,
+                min_warps=cls.WARPGROUP_WARPS,
                 apply_role_correction=False,
                 protected_block_ids=k_ids,
                 min_stages=high_launch.num_stages,
@@ -3666,7 +3749,7 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
 
         if register_mma:
             small_high_launch = register_mma[0].copy()
-            small_high_launch.num_warps = cls.TCGEN05_WARPGROUP_WARPS
+            small_high_launch.num_warps = cls.WARPGROUP_WARPS
             small_high_launch.num_stages = min(
                 cls.HW_MAX_STAGES,
                 max(3, small_high_launch.num_stages),
@@ -3678,8 +3761,8 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
                 num_sm=num_sm,
                 axis_ids=axis_ids,
                 recompute_stages=False,
-                min_warps=cls.TCGEN05_WARPGROUP_WARPS,
-                max_warps=cls.TCGEN05_WARPGROUP_WARPS,
+                min_warps=cls.WARPGROUP_WARPS,
+                max_warps=cls.WARPGROUP_WARPS,
                 apply_role_correction=False,
                 protected_block_ids=tuple(
                     dict.fromkeys(block_id for ids in axis_ids for block_id in ids)
@@ -3925,17 +4008,27 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
         return cls._multi_ranked(env) or None
 
 
+class TritonH100MultiMatmulHeuristic(
+    TritonB200MultiMatmulHeuristic,
+    TritonH100FormulaMatmulHeuristic,
+):
+    """SM90 multi-matmul front end using the shared B200 composition policy."""
+
+    name = "triton_h100_multi_matmul"
+    HARDWARE_TARGETS = (("cuda", "sm90"),)
+
+
 # Module-level shims delegating to the class (tests + lab harness call these by name).
 def _h100_matmul_tile(
     m: int, n: int, k: int, itemsize: int, num_sm: int, pinned_grid: int = 1
 ) -> tuple[int, int, int, int, int, int]:
-    return TritonH100MatmulHeuristic._matmul_tile(
+    return TritonH100FormulaMatmulHeuristic._matmul_tile(
         m, n, k, itemsize, num_sm, pinned_grid
     )
 
 
 def _h100_ranked_configs(env: CompileEnvironment, fact: MatmulFact) -> list[Config]:
-    return TritonH100MatmulHeuristic._ranked_configs(env, fact)
+    return TritonH100FormulaMatmulHeuristic._ranked_configs(env, fact)
 
 
 class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
@@ -4295,241 +4388,141 @@ def _primary_descriptor_selected(env: CompileEnvironment) -> ReductionDescriptor
 def _is_standard_reduction(pd: ReductionDescriptor) -> bool:
     """Standard vs user-tiled discriminator, keyed on the primary reduction's category: standard
     iff FULL_SLICE (a rolled rdim or a materialized full-width rdim the roller declined) or
-    FULL_GRID; user-tiled is the USER_TILE case (the rdim is a ``block_sizes`` entry).
+    FULL_GRID. USER_TILE and FIXED_TILE are sequential user-written tiles; the former emits a
+    ``block_sizes`` value while the latter has no reduction-size knob to emit.
     """
     return pd.category in FULL_EXTENT_CATEGORIES
 
 
-class _TileAllocation(NamedTuple):
-    """The result of :meth:`_TritonReductionSeedBase.size_reduction_tiles` — the single
-    per-co-residency-group budget allocation that produces every tile size the seed emits.
+@dataclass(frozen=True)
+class _ReductionCandidate:
+    """One complete temporary reduction seed state."""
 
-    Per co-residency group the allocator forms a register/byte capacity, then seats axes in
-    priority order (full-extent reductions → user-tile reductions → grid-tile reductions → the
-    grid-M rows), each taking first crack then floored by the budget remaining after everything
-    already seated. Earlier groups' assignments are held fixed as inputs to later groups; the
-    non-reduction loops are sized last against the remaining headroom. Floor-vs-resident and
-    collapse-vs-widen are budget outcomes, not separate branches.
+    block_sizes: tuple[int, ...]
+    reduction_widths: tuple[tuple[int, int], ...]
 
-    - ``block_sizes``: the full ``Config.block_sizes`` vector — every tunable axis sized.
-    - ``block_sizes_red_values``: ``{block_id -> r_block}`` for every tunable sized reduction that
-      rides a ``block_sizes`` slot (the user-tiled track's reductions, including its primary). The
-      standard track's rolled primary rides ``reduction_loops`` instead, surfaced via
-      ``primary_r_block``/``persistent`` — so the name is about the emission target (block_sizes
-      slot), not "secondary". Emission routing is the only standard-vs-user difference; every
-      reduction gets a size from the same budget.
-    - ``primary_r_block`` / ``persistent``: the primary reduction's chunk + persistence verdict
-      (the byte budget admits the full extent AND the row is re-read).
-    - ``rolled_loop_sizes``: ``{block_id -> (r_block, persistent)}`` for every rolled reduction axis
-      OTHER than the primary (a kernel that rolls >1 reduction into separate ``reduction_loops``
-      subgraphs). Empty unless a kernel rolls more than one reduction.
-    """
+    def reduction_width(self, block_id: int) -> int:
+        for candidate_block_id, width in self.reduction_widths:
+            if candidate_block_id == block_id:
+                return width
+        raise KeyError(block_id)
+
+
+class _ReductionResources(NamedTuple):
+    """Independent inputs for candidate-resolved resource calculations."""
+
+    peak_live_bytes: int
+    num_warps: int
+    launch_waves: tuple[float | None, ...]
+
+
+class _LivenessTileAllocation(NamedTuple):
+    """Final liveness-based allocation and its kernel-wide warp count."""
 
     block_sizes: list[int]
-    block_sizes_red_values: dict[int, int]
     primary_r_block: int
-    persistent: bool
-    rolled_loop_sizes: dict[int, tuple[int, bool]]
+    rolled_loop_sizes: dict[int, int]
+    num_warps: int
 
 
-class _TritonReductionSeedBase(AutotunerHeuristic):
-    """Shared base for the two Triton inner-reduction seed heuristics. Both consume the Stage-1
-    ``ReductionKernelFact`` through ONE budget allocator (:meth:`size_reduction_tiles`); the
-    subclasses differ ONLY in how they map the allocation onto knobs (EMISSION routing):
+class TritonReductionHeuristic(AutotunerHeuristic):
+    """Candidate-resolved Triton reduction seed for H100 and B200.
 
-    - **standard** (:class:`TritonStandardReductionHeuristicSM90`): Helion rolls the rdim into a
-      ``reduction_loops`` loop, so the primary reduction's size lands on that knob.
-    - **user-tiled** (:class:`TritonUserTiledReductionHeuristicSM90`): the user hand-writes the
-      ``hl.tile`` loop, so each reduction axis is a ``block_sizes`` entry.
+    One allocator resolves every sized reduction and ordinary block axis against the kernel's
+    live-step timeline. The primary reduction category affects only final config routing:
+    compiler-rolled reductions emit through ``reduction_loops``, while user-written mutable
+    ``hl.tile`` reductions emit through ``block_sizes`` and fixed tiles emit no size knob.
 
-    Each track has a sm90/H100 class (``*SM90``) and a sm100/B200 subclass (``*SM100``); the
-    conservative upstream fallback for unclaimed hardware lives in the standalone
-    :class:`TritonNarrowReductionHeuristic`. Every concrete class gates its own hardware in
-    ``is_eligible`` (via ``cls.HARDWARE_TARGETS``), so ``get_seed_config`` never declines for the
-    wrong GPU. Not registered; only the concrete subclasses are.
+    The conservative fallback for other hardware remains the standalone
+    :class:`TritonNarrowReductionHeuristic`.
     """
 
+    name = "triton_reduction"
     backend = "triton"
     CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
-    # Widen the declared type so the sm100 subclass can retarget it (the base is sm90-only).
-    HARDWARE_TARGETS: ClassVar[tuple[HardwareTarget, ...]] = (("cuda", "sm90"),)
-    # Promote the reduction seed to the compiler default (autotune off) for every tuned track
-    # that derives from this base -- sm90/H100 AND sm100/B200. The narrow fallback
-    # (TritonNarrowReductionHeuristic) does NOT derive from this base, so it stays unpromoted.
+    HARDWARE_TARGETS: ClassVar[tuple[HardwareTarget, ...]] = (
+        ("cuda", "sm90"),
+        ("cuda", "sm100"),
+    )
+    # Promote the tuned reduction seed to the compiler default (autotune off) on H100 and B200.
+    # The narrow fallback is a separate class and stays unpromoted.
     # This is safe because the seed only emits valid configs: it materializes through
     # ``_materialize_config`` (an illegal ``pid_type`` is repaired to a legal persistent type),
     # ``ReductionLoopSpec._normalize`` floors a degenerate looped chunk of 1, and the reduction
     # roller refuses to roll a scan-containing reduction (which would drop the scan's chunk carry).
     promote_seed_to_default = True
 
-    # ----- THE BUDGET (a register/byte capacity; everything else is a per-axis desire) -----
-    # Per-program persistent byte ceiling: the group's resident working set — the sum over its live
-    # tiles of ``itemsize × ∏(tile dims)`` — must fit this, else a tile floors. ~240 KiB, just over
-    # H100 SMEM.
-    ROW_PERSIST_MAX_BYTES = 245760
-    # The tighter byte ceiling for a CARRIED reduction (an accumulator whose last dim is the rdim,
-    # e.g. kl_div/jsd's ``[grid_M, R]``): that tile is held resident across the whole inner loop
-    # rather than streamed-and-released, a heavier steady-state pressure, so the chunk sharing SRAM
-    # with it wants a smaller extent. Half of ROW_PERSIST. This is the only place the
-    # carried-vs-streamed distinction lives.
-    CARRIED_PERSIST_MAX_BYTES = 245760 // 2
-    # The PERSISTENCE-HOLD ceiling — the byte watermark under which a re-read row may hold its FULL
-    # extent (vs the chunk budget, which sizes a streamed/looped tile). Only ``row_reread AND
-    # carried_2d_count == 0`` reductions reach the hold, so a carried tile never loosens. The true
-    # cutoff is not a single faithful byte budget (e.g. softmax flips at ~128-160 KiB, cross_entropy
-    # at ~256-384 KiB with the same footprint), so these are two calibrated buckets selected by
-    # ``_has_store_only_row_reread`` — a coarse proxy for whether persist's avoided HBM re-read lives
-    # in the small L2 working set (tighter ceiling) or the large register file (looser ceiling):
-    #  - no store-only re-read (cross_entropy/sum): reuse is register-resident, so holding a high
-    #    watermark wins far out. 3x ROW.
-    #  - a store-only re-reading pass exists (softmax/rms/layer_norm/welford): the row is re-swept
-    #    from L2, so past ~a few KiB/row streaming beats holding it. ~1.2x ROW.
-    PERSIST_HOLD_MAX_BYTES = 3 * 245760
-    USER_TILE_PERSIST_HOLD_MAX_BYTES = 294912
-    # Looped-fallback reduction chunk (pow2) for a row that does not fit the persistent budget.
-    LOOPED_CHUNK = 16384
-    # Occupancy floor for the grid-M widen: keep the post-tile grid >= num_sm * MIN_WAVES so
-    # collapsing a fan-out sibling never under-occupies (mirrors the pointwise seed's MIN_WAVES).
-    MIN_WAVES = 8
-    # Diminishing-returns ceiling on the grid-M widen (rows/program): a memory-bound reduction does
-    # not amortize past a handful of batched rows, and widening only trades away grid parallelism.
-    # Bounds the widen the byte/occupancy caps alone would permit on a small-row huge-M kernel. Does
-    # NOT bound the grad-param COLLAPSE branch (which intentionally batches rows to cut the
-    # cross-grid finalize) nor a raised autotuner_min floor (max(floor, ...) still wins).
-    WIDEN_MAX_ROWS = 8
+    # Candidate capacity, occupancy, and work-exchange policy.
+    NORMAL_LIVE_BUDGET = 240 * 1024
+    PERSISTENCE_BUDGET_MULTIPLIER = 1.5
+    COALESCING_SENSITIVE_FLOOR = 128
+    MIN_NUM_WARPS = 1
+    MAX_NUM_WARPS = 32
+    REGISTER_OVERHEAD_PER_THREAD = 10
+    REGISTER_ALLOCATION_GRANULARITY_PER_THREAD = 8
+    WARP_DESCENT_REGISTER_ESTIMATE_SCALE = 0.70
+    MAX_REGISTERS_PER_THREAD = 255
+    SPILL_PRESSURE_THRESHOLD = 1.0
+    WARP_DESCENT_MIN_LIVE_BYTES = 8 * 1024
+    WARP_DESCENT_CALIBRATION_MAX_SPILL = 0.50
+    REGISTER_FILE_REGISTERS_PER_SM = 65536
+    MAX_THREADS_PER_SM = 2048
+    MAX_CTAS_PER_SM = 32
+    GRID_RESIDENCY_GAIN_THRESHOLD = 1.5
+    FULL_GRID_SPLIT_GAIN_THRESHOLD = 2.0
+    SERIAL_LOOP_COST_ALPHA = 1.1
+    MAX_BLOCK_ADJUSTMENT_PASSES = 20
 
-    # num_warps ramp: keyed on the primary reduction extent (see ``_num_warps``).
-
-    # =============================== Stage-1 fact accessors ================================= #
+    # Structural fact accessors.
     @classmethod
-    def _non_reduction_loop_ids(cls, spec: ConfigSpec) -> tuple[int, ...]:
-        """The non-reduction user-tiled loops (welford's normalize pass) -- sized as a separate
-        apply pass, NOT reduction-sized. Read off ``ReductionKernelFact.non_reduction_loop_block_ids``.
-        """
+    def _has_floor_batched_nonresident_grid(
+        cls,
+        env: CompileEnvironment,
+    ) -> bool:
+        """Whether a nonresident grid axis is already batched at its legal floor."""
+        spec = env.config_spec
         kf = spec.reduction_kernel_fact
         assert kf is not None
-        return kf.non_reduction_loop_block_ids
-
-    @classmethod
-    def _resident_block_ids(cls, spec: ConfigSpec) -> set[int]:
-        """The union of block_ids that appear (as a resolved dim) in some co-residency group's
-        live-tile set — the "is this axis register-resident?" test. The single definition of
-        residency, shared by the grid-M widen (a resident grid axis widens into the byte budget; a
-        non-resident one is reduced away -> collapses) and ``_has_reduced_away_grid``. Empty if no
-        kernel fact (a bare-spec unit test)."""
-        kf = spec.reduction_kernel_fact
-        if kf is None:
-            return set()
-        resident: set[int] = set()
-        for g in kf.coresidency_groups:
-            for tile in g.live_tiles:
-                resident.update(d for d in tile if d is not None)
-        return resident
-
-    @classmethod
-    def _has_reduced_away_grid(cls, spec: ConfigSpec) -> bool:
-        """True iff some grid axis is REDUCED AWAY — in no live tile, and batching more than one
-        row per program — i.e. a sequential cross-grid reduction finalized by a later ``.sum(0)``
-        (the grad-parameter M-collapse idiom). False if no kernel fact.
-
-        Both clauses are needed: non-residency alone also covers a ``block_size=1`` axis used as a
-        scalar index, which batches nothing, so consumers get neither cross-warp work to spread nor
-        a row that reloads from L2. A kernel property, not a target one, so both arches share it
-        and tune the RESPONSE instead.
-        """
-        kf = spec.reduction_kernel_fact
-        if kf is None:
-            return False
-        resident = cls._resident_block_ids(spec)
-        return any(
-            g not in resident and cls._m_axis_block_size(spec, g) > 1
-            for g in kf.grid_axis_block_ids
-        )
-
-    @staticmethod
-    def _max_group_footprint(
-        kf: ReductionKernelFact,
-        axis: int,
-        footprint_terms: Callable[
-            [tuple[tuple[int | None, ...], ...], int], tuple[int, int]
-        ],
-        default_tiles: tuple[tuple[int | None, ...], ...],
-    ) -> tuple[int, int]:
-        """The ``(scale, flat)`` footprint for sizing ``axis``, taken from the heaviest co-residency
-        group that spans it (largest ``scale``). A reduction axis is tiled the same width
-        everywhere, so it must fit the worst group that uses it. ``flat`` comes from that same max
-        group (mixing scale/flat across groups breaks the chunk solve). If the axis spans no group's
-        tiles (a bare-spec / degenerate case), fall back to ``default_tiles`` (this descriptor's own
-        group)."""
-        best = None
-        for g in kf.coresidency_groups:
-            if not any(axis in t for t in g.live_tiles):
-                continue
-            scale, flat = footprint_terms(g.live_tiles, axis)
-            if best is None or scale > best[0]:
-                best = (scale, flat)
-        return best if best is not None else footprint_terms(default_tiles, axis)
-
-    @classmethod
-    def _has_store_only_row_reread(
-        cls, spec: ConfigSpec, pd: ReductionDescriptor
-    ) -> bool:
-        """True iff the primary reduction's row tensor is ALSO loaded by a store-only pass — a load
-        of that tensor that feeds a store and no reduction (``stores_fed and not reductions_fed``).
-
-        This selects the persist-hold ceiling. The physical question it stands in for is whether
-        persistence's benefit (avoiding the row's HBM re-read) is served from the small L2 working
-        set (tighter ceiling) or the large register file (looser ceiling). That quantity is not
-        cleanly recoverable from any seed-time signal — kernels with the same byte footprint, load
-        count, and output width can flip persist->chunk at ~2x-different points — so this is an
-        ADMITTED PROXY: it classifies the tested kernels correctly but is not a faithful measure of
-        the underlying cache-tier question and can be fooled (e.g. a 2-pass kernel whose 2nd pass
-        reduces instead of storing re-reads the row identically but reads as False). If a kernel
-        regresses on the persist ceiling, this proxy is the first suspect.
-
-        Detected from the walker ``MemoryOpFact`` list (no re-walk). Not the same as
-        ``non_reduction_loop_block_ids`` (a 2nd pass that reduces over the same axis leaves that set
-        empty). Empty facts / no kernel fact -> False."""
-        facts = spec.memory_op_facts
-        if not facts:
-            return False
-        red_tensors = {
-            f.tensor_name
-            for f in facts
-            if f.kind == "load"
-            and f.tensor_name is not None
-            and any(ax == pd.block_id for ax, _ in f.reductions_fed)
+        resident = {
+            block_id
+            for step in kf.live_tile_steps
+            for tile in step
+            if tile.kind != "global"
+            for block_id in tile.dim_block_ids
+            if block_id is not None
         }
-        if not red_tensors:
-            return False
-        return any(
-            f.kind == "load"
-            and f.tensor_name in red_tensors
-            and f.stores_fed
-            and not f.reductions_fed
-            for f in facts
-        )
+        tunable = spec.block_sizes.valid_block_ids()
+        default = spec._base_default_config()
+        for block_id in kf.grid_axis_block_ids:
+            if block_id in resident:
+                continue
+            if block_id in tunable:
+                block = cast(
+                    "BlockSizeSpec",
+                    spec.block_sizes[spec.block_sizes.block_id_to_index(block_id)],
+                )
+                if cls._block_floor(block) > 1:
+                    return True
+                continue
+            info = env.block_sizes[block_id]
+            value = info.block_size_source.from_config(default, info)
+            if isinstance(value, torch.SymInt):
+                expression = env.config_value_expressions.get(_symint_sympy_expr(value))
+                if expression is not None:
+                    value = expression.evaluate(default)
+            if isinstance(value, (int, torch.SymInt)) and env.size_hint(value) > 1:
+                return True
+        return False
 
-    @classmethod
-    def non_reduction_loop_block_cap(
-        cls, spec: ConfigSpec, pd: ReductionDescriptor
-    ) -> int | None:
-        """Optional element cap for a non-reduction apply loop. ``None`` = no extra cap beyond the
-        shared ``loop_budget`` (sm90/H100 unchanged); a subclass may return a smaller budget."""
-        return None
-
-    # =============================== scalar levers (outside the budget) ===================== #
-    @classmethod
-    def _num_warps(cls, pd: ReductionDescriptor) -> int:
-        """Scale num_warps with the reduction extent (pow2): rnumel <= 1024 -> 4, <= 4096 -> 8,
-        <= 16384 -> 16, > 16384 -> 32."""
-        rnumel = pd.size_hint
-        warps32_min_elems = 16384
-        if rnumel > warps32_min_elems:
+    # Scalar levers.
+    @staticmethod
+    def _num_warps_for_reduction_width(width: int) -> int:
+        """Draft warps for useful lane-parallel reduction work."""
+        if width > 16384:
             return 32
-        if rnumel <= 1024:
+        if width <= 1024:
             return 4
-        if rnumel <= 4096:
+        if width <= 4096:
             return 8
         return 16
 
@@ -4539,463 +4532,618 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
         large-M shapes rather than emitting an invalid ``block_size=1``)."""
         return max(1, bs_spec.min_size, bs_spec.autotuner_min)
 
-    @classmethod
-    def _m_axis_block_size(cls, spec: ConfigSpec, mbid: int) -> int:
-        """Seed block size (rows/program) for one M-axis (grid) block_id, whether or not it is a
-        tunable ``block_sizes`` entry. A grid-PINNED axis (``hl.tile(M, block_size=1)``) has no
-        tunable slot and lives solely on the program grid -- read its FIXED value off
-        ``env.block_sizes`` (the grid-pinned-M idiom every vLLM quant kernel uses)."""
-        if mbid in spec.block_sizes.valid_block_ids():
-            m_idx = spec.block_sizes.block_id_to_index(mbid)
-            return cls._block_floor(cast("BlockSizeSpec", spec.block_sizes[m_idx]))
-        from ...runtime.config import Config as _Config
-        from ..compile_environment import CompileEnvironment
+    @staticmethod
+    def _reread_eviction_policies(
+        env: CompileEnvironment,
+        reread_slot: int | None,
+    ) -> list[str] | None:
+        """Keep one re-read input in L2 and evict the other load slots first."""
+        n = env.config_spec.load_eviction_policies.length
+        if reread_slot is None or not 0 <= reread_slot < n:
+            return None
+        policy = ["first"] * n
+        policy[reread_slot] = "last"
+        return policy
 
-        env = CompileEnvironment.current()
-        value = env.block_sizes[mbid].from_config(_Config(block_sizes=[]))
-        if isinstance(value, (int, torch.SymInt)):
-            return max(1, int(value))
-        log.warning(
-            "reduction seed: M-axis block_id=%s resolved to a non-static block size %r; "
-            "falling back to block_size=1 (this should not happen for a pinned grid axis)",
-            mbid,
-            value,
-        )
-        return 1
-
+    # ======================= candidate-resolved liveness allocator ====================== #
     @classmethod
-    def _eviction_policies(
+    def _reduction_candidate_block_map(
         cls,
         env: CompileEnvironment,
-        kind: str,
-        reread_slot: int | None = None,
-    ) -> list[str] | None:
-        """``load_eviction_policies`` list (spec length); None leaves the autotuner default.
-        - ``"stream"`` — single streamed input (read once): every load -> ``'first'`` (frees L2).
-        - ``"reread"`` — the row is re-read across passes: its first load -> ``'last'``
-          (L2-resident), rest -> ``'first'``. ``reread_slot`` from ``reread_eviction_index``."""
-        n = env.config_spec.load_eviction_policies.length
-        if n <= 0:
-            return None
-        if kind == "stream":
-            return ["first"] * n
-        if kind == "reread":
-            if reread_slot is None or not 0 <= reread_slot < n:
-                return None
-            policy = ["first"] * n
-            policy[reread_slot] = "last"
-            return policy
-        return None
+        candidate: _ReductionCandidate,
+    ) -> dict[int, int]:
+        """Resolve every block axis under one complete reduction candidate."""
+        return TritonH100MatmulHeuristic._full_block_map(
+            env,
+            list(candidate.block_sizes),
+            dict(candidate.reduction_widths),
+        )
 
-    # ================================ THE BUDGET ALLOCATOR ============================== #
     @classmethod
-    def size_reduction_tiles(
+    def _reduction_peak_live_bytes(
+        cls,
+        env: CompileEnvironment,
+        candidate: _ReductionCandidate,
+    ) -> int:
+        """Return peak register-live bytes across the complete timeline."""
+        kf = env.config_spec.reduction_kernel_fact
+        assert kf is not None
+        block_of = cls._reduction_candidate_block_map(env, candidate)
+        peak_bytes = 0
+        for step in kf.live_tile_steps:
+            step_bytes = 0
+            for tile in step:
+                if tile.kind == "global":
+                    continue
+                tile_bytes = TritonH100MatmulHeuristic._resolve_tile_bytes(
+                    tile,
+                    block_of,
+                )
+                step_bytes += tile_bytes
+            peak_bytes = max(peak_bytes, step_bytes)
+        return peak_bytes
+
+    @classmethod
+    def _reduction_launch_waves(
+        cls,
+        env: CompileEnvironment,
+        candidate: _ReductionCandidate,
+        num_sm: int,
+    ) -> tuple[float | None, ...]:
+        """Fractional launch supply for each independently executing root."""
+        spec = env.config_spec
+        grid_fact = spec.kernel_grid_fact
+        roots = grid_fact.grid_groups if grid_fact is not None else ()
+        if not roots:
+            roots = (tuple(spec.grid_block_ids),)
+        block_of = cls._reduction_candidate_block_map(env, candidate)
+        waves: list[float | None] = []
+        for root in roots:
+            ctas = 1
+            known = True
+            for block_id in root:
+                extent = TritonH100MatmulHeuristic._axis_extent(env, block_id)
+                if extent is None:
+                    known = False
+                    break
+                ctas *= max(1, -(-extent // max(1, block_of[block_id])))
+            waves.append(ctas / max(1, num_sm) if known else None)
+        return tuple(waves) or (None,)
+
+    @classmethod
+    def _reduction_resources(
+        cls,
+        env: CompileEnvironment,
+        candidate: _ReductionCandidate,
+        num_warps: int,
+        num_sm: int,
+    ) -> _ReductionResources:
+        """Resolve the independent resource inputs for one candidate."""
+        peak_bytes = cls._reduction_peak_live_bytes(env, candidate)
+        warps = max(cls.MIN_NUM_WARPS, min(cls.MAX_NUM_WARPS, num_warps))
+        return _ReductionResources(
+            peak_live_bytes=peak_bytes,
+            num_warps=warps,
+            launch_waves=cls._reduction_launch_waves(env, candidate, num_sm),
+        )
+
+    @classmethod
+    def _reduction_estimated_registers_per_thread(
+        cls,
+        resources: _ReductionResources,
+    ) -> int:
+        """Estimate logical registers/thread from peak liveness and warps."""
+        threads = 32 * resources.num_warps
+        bytes_per_register_file_lane = max(1, threads * 4)
+        logical_registers_per_thread = (
+            resources.peak_live_bytes + bytes_per_register_file_lane - 1
+        ) // bytes_per_register_file_lane
+        return logical_registers_per_thread + cls.REGISTER_OVERHEAD_PER_THREAD
+
+    @classmethod
+    def _reduction_spill_pressure(
+        cls,
+        resources: _ReductionResources,
+    ) -> float:
+        """Return the uncapped register estimate relative to the hardware limit."""
+        return (
+            cls._reduction_estimated_registers_per_thread(resources)
+            / cls.MAX_REGISTERS_PER_THREAD
+        )
+
+    @classmethod
+    def _reduction_resource_resident_ctas_per_sm(
+        cls,
+        resources: _ReductionResources,
+        *,
+        register_estimate_scale: float = 1.0,
+    ) -> int:
+        """Return CTA residency from registers, threads, and architecture limits."""
+        threads = 32 * resources.num_warps
+        estimated_registers = math.ceil(
+            cls._reduction_estimated_registers_per_thread(resources)
+            * register_estimate_scale
+        )
+        granularity = cls.REGISTER_ALLOCATION_GRANULARITY_PER_THREAD
+        allocated_registers = min(
+            cls.MAX_REGISTERS_PER_THREAD,
+            max(
+                granularity,
+                -(-estimated_registers // granularity) * granularity,
+            ),
+        )
+        allocated_register_bytes = allocated_registers * threads * 4
+        register_limit = max(
+            1,
+            (cls.REGISTER_FILE_REGISTERS_PER_SM * 4)
+            // max(1, allocated_register_bytes),
+        )
+        return max(
+            1,
+            min(
+                cls.MAX_CTAS_PER_SM,
+                cls.MAX_THREADS_PER_SM // threads,
+                register_limit,
+            ),
+        )
+
+    @classmethod
+    def _reduction_effective_resident_ctas_per_sm(
+        cls,
+        resources: _ReductionResources,
+        *,
+        register_estimate_scale: float = 1.0,
+    ) -> tuple[float, ...]:
+        """Cap resource residency by each root's available launch work."""
+        resource_residency = cls._reduction_resource_resident_ctas_per_sm(
+            resources,
+            register_estimate_scale=register_estimate_scale,
+        )
+        return tuple(
+            float(resource_residency)
+            if waves is None
+            else min(float(resource_residency), waves)
+            for waves in resources.launch_waves
+        )
+
+    @classmethod
+    def _choose_reduction_num_warps(
+        cls,
+        env: CompileEnvironment,
+        candidate: _ReductionCandidate,
+        pd: ReductionDescriptor,
+        num_sm: int,
+        *,
+        allow_descent: bool = True,
+    ) -> int:
+        """Draft warps from reduction width, relieve spills, then retain only useful warps."""
+        parallel_width = max(width for _, width in candidate.reduction_widths)
+        requested_warps = cls._num_warps_for_reduction_width(parallel_width)
+        if pd.size_hint > 16384 and parallel_width >= 8192:
+            requested_warps = cls.MAX_NUM_WARPS
+        ladder = (1, 2, 4, 8, 16, 32)
+        warps = next(
+            (
+                value
+                for value in ladder
+                if value >= requested_warps and value >= cls.MIN_NUM_WARPS
+            ),
+            cls.MAX_NUM_WARPS,
+        )
+        warps = min(warps, cls.MAX_NUM_WARPS)
+        while warps < cls.MAX_NUM_WARPS:
+            resources = cls._reduction_resources(env, candidate, warps, num_sm)
+            if cls._reduction_spill_pressure(resources) <= cls.SPILL_PRESSURE_THRESHOLD:
+                break
+            warps = min(cls.MAX_NUM_WARPS, warps * 2)
+        if not allow_descent:
+            return warps
+
+        draft_resources = cls._reduction_resources(env, candidate, warps, num_sm)
+        draft_warp_score = cls._reduction_effective_warp_score(draft_resources)
+        target_warps = (
+            min(32.0, draft_warp_score)
+            if draft_resources.peak_live_bytes >= cls.WARP_DESCENT_MIN_LIVE_BYTES
+            else draft_warp_score
+        )
+        descent_register_scale = (
+            cls.WARP_DESCENT_REGISTER_ESTIMATE_SCALE
+            if warps >= 16 and parallel_width <= 8192
+            else 1.0
+        )
+        for trial_warps in ladder:
+            if trial_warps >= warps:
+                break
+            trial_resources = cls._reduction_resources(
+                env, candidate, trial_warps, num_sm
+            )
+            trial_spill = cls._reduction_spill_pressure(trial_resources)
+            if trial_spill > cls.SPILL_PRESSURE_THRESHOLD:
+                continue
+            trial_register_scale = (
+                descent_register_scale
+                if trial_spill <= cls.WARP_DESCENT_CALIBRATION_MAX_SPILL
+                else 1.0
+            )
+            if (
+                cls._reduction_effective_warp_score(
+                    trial_resources,
+                    register_estimate_scale=trial_register_scale,
+                )
+                + 1e-9
+                >= target_warps
+            ):
+                return trial_warps
+        return warps
+
+    @classmethod
+    def _reduction_effective_cta_score(
+        cls,
+        resources: _ReductionResources,
+    ) -> float:
+        """Conservative useful-concurrency score across independent roots."""
+        return min(cls._reduction_effective_resident_ctas_per_sm(resources))
+
+    @classmethod
+    def _reduction_effective_warp_score(
+        cls,
+        resources: _ReductionResources,
+        *,
+        register_estimate_scale: float = 1.0,
+    ) -> float:
+        """Conservative resident-warp score across independently executing roots."""
+        hardware_warp_slots = cls.MAX_THREADS_PER_SM // 32
+        return min(
+            min(float(hardware_warp_slots), value * resources.num_warps)
+            for value in cls._reduction_effective_resident_ctas_per_sm(
+                resources,
+                register_estimate_scale=register_estimate_scale,
+            )
+        )
+
+    @classmethod
+    def size_reduction_tiles_liveness(
         cls,
         env: CompileEnvironment,
         spec: ConfigSpec,
-        device_ir: DeviceIR,
         pd: ReductionDescriptor,
-    ) -> _TileAllocation:
-        """THE allocator: a per-co-residency-group BUDGET over the group's ACTUAL resident live
-        tiles (``CoResidencyGroup.live_tiles``) assigns every tile size, in TWO passes.
-
-        The footprint is faithful: ``resident_bytes = itemsize × Σ over the group's live tiles of
-        ∏(tile dim widths)``. Sizing an axis A splits that sum into ``(scale, flat)`` — tiles
-        CONTAINING A scale with ``block(A)``, tiles WITHOUT A are constant — and the budget test is
-        ``itemsize × (scale × block(A) + flat) <= budget`` (the constant term SUBTRACTED, never
-        divided). No ``num_live`` multiplier, no separate accumulator sum, no feature-extent
-        reconstruction: the live tiles ARE the resident set (accumulators captured inline at real
-        shape, scalar carries as rank-1 constant tiles).
-
-        For each co-residency group:
-
-          PASS 1 — seat the reductions with the grid axes pinned at their FLOOR (full-extent ->
-            user-tile -> grid-tile). A re-read full-slice raises its floor to the full extent
-            (PERSISTENCE) iff its resident tile fits the budget; else it chunks to
-            ``min(LOOPED_CHUNK, byte budget, extent)``. A carried reduction (kl_div/norm-bwd) sizes
-            against the tighter ``CARRIED_PERSIST`` budget.
-
-          PASS 2 — the grid-M rows take the REMAINDER. A grid axis that is RESIDENT (appears in some
-            live tile -> its row co-occupies the working set) WIDENS into the byte remainder (capped
-            by occupancy + WIDEN_MAX_ROWS + extent) and FLOORS when the budget is spent. A grid axis
-            in NO live tile is REDUCED AWAY (a sequential cross-grid ``.sum(0)`` finalize, holds no
-            bytes) -> its floor raises to ``grid_rows / num_sm`` (collapse the finalize to ~1 SM
-            wave). Both are pure per-axis MEMBERSHIP outcomes — no ``cdiv`` branch, no recognizer.
-
-        Then the non-reduction loops LAST (welford's normalize, rms_norm_per_block's groups_per_row)
-        — a separate pass co-resident with nothing in the group, sized against its own headroom.
-
-        EMISSION is the ONLY standard-vs-user difference: a reduction's computed size is WRITTEN to
-        ``reduction_loops`` (rolled/standard) or a ``block_sizes`` slot (user-tiled). Every
-        reduction gets a size from the SAME budget; the split is codegen routing, not a different
-        way to compute.
-        """
+    ) -> _LivenessTileAllocation:
+        """Size every reduction-kernel axis from complete candidate liveness."""
         from ..._utils import next_power_of_2 as _np2
-        from ..._utils import prev_power_of_2 as _pp2
         from ...runtime import get_num_sm
 
-        num_sm = max(1, get_num_sm(env.device))
-        occ_floor = num_sm * cls.MIN_WAVES
-        itemsize = max(1, pd.itemsize)
-        valid = set(spec.block_sizes.valid_block_ids())
         kf = spec.reduction_kernel_fact
         assert kf is not None
-        grid_ids = set(kf.grid_axis_block_ids)
-        non_reduction_loop_ids = set(cls._non_reduction_loop_ids(spec))
-        reduction_ids = {d.block_id for d in kf.reductions}
+        assert kf.live_tile_steps, "reduction sizing requires a complete live timeline"
 
-        # Extent (pow2-padded) per block_id, read from STORED hints. The reason these maps exist at
-        # all is TESTING: the reduction unit tests call ``get_seed_config`` on a bare spec OUTSIDE an
-        # active CompileEnvironment, where ``env.block_sizes[bid]`` is unavailable — so extents must
-        # come from data already persisted on the spec/fact. A reduction's extent is its descriptor
-        # ``size_hint``; a tunable axis's is its ``BlockSizeSpec.size_hint``. The third fallback
-        # (``env.block_sizes`` — a non-tunable pinned grid / materialized feature) is LIVE-PATH ONLY:
-        # in the no-env test path every axis is in ``_spec_extent`` or ``_desc_extent`` by
-        # construction, so that branch never executes (and would raise NoCurrentEnvironment if it did).
-        _desc_extent = {d.block_id: d.size_hint for d in kf.reductions}
-        _spec_extent = {
-            cast("BlockSizeSpec", spec.block_sizes[i]).block_id: cast(
-                "BlockSizeSpec", spec.block_sizes[i]
-            ).size_hint
-            for i in range(len(spec.block_sizes))
+        num_sm = max(1, get_num_sm(env.device))
+        specs = [
+            cast("BlockSizeSpec", spec.block_sizes[index])
+            for index in range(len(spec.block_sizes))
+        ]
+        slot_of = {block.block_id: index for index, block in enumerate(specs)}
+        floors = {block.block_id: cls._block_floor(block) for block in specs}
+        maximums = {block.block_id: _np2(max(1, block.size_hint)) for block in specs}
+        blocks = [floors[block.block_id] for block in specs]
+
+        descriptors_by_block: dict[int, list[ReductionDescriptor]] = {}
+        for descriptor in kf.reductions:
+            if descriptor.category in SIZED_REDUCTION_CATEGORIES:
+                descriptors_by_block.setdefault(descriptor.block_id, []).append(
+                    descriptor
+                )
+        rolled_ids = {
+            reduction_loop.block_ids[0] for reduction_loop in spec.reduction_loops
         }
+        raw_reduction_extents = {
+            block_id: max(descriptor.size_hint for descriptor in descriptors)
+            for block_id, descriptors in descriptors_by_block.items()
+        }
+        reduction_widths: dict[int, int] = {}
+        reduction_floors: dict[int, int] = {}
+        reduction_maximums: dict[int, int] = {}
+        fixed_reduction_ids: set[int] = set()
 
-        def extent_of(bid: int) -> int:
-            if bid in _spec_extent:
-                return _np2(_spec_extent[bid])
-            if bid in _desc_extent:
-                return _np2(_desc_extent[bid])
-            return _np2(env.block_sizes[bid].size_hint())
-
-        # The persistence/chunk budget a reduction sizes against — the only place the regime enters
-        # (the footprint formula is identical everywhere; only this number changes). Two budgets,
-        # keyed PER-REDUCTION on whether THIS reduction carries a >=2-D tile:
-        #  - CARRIED (``carried_2d_count > 0``): the reduction's own ``[grid_M, R]`` accumulator is
-        #    held resident across the whole inner loop, a heavier steady-state pressure than a
-        #    streamed row -> the tighter budget -> smaller chunk.
-        #  - STREAMED (``carried_2d_count == 0``): the ROW budget. Per-reduction, not kernel-wide: a
-        #    grad-parameter norm-bwd carries its N accumulator on the materialized N axis, but the
-        #    co-resident inner tile it sizes is itself non-carried and wants the looser ROW budget.
-        #    A per-row scalar carry (e.g. welford mean/M2 ``[grid_M]``) has c2d=0, so it stays STREAMED.
-        def persist_budget_for(d: ReductionDescriptor) -> int:
-            return (
-                cls.CARRIED_PERSIST_MAX_BYTES
-                if d.carried_2d_count > 0
-                else cls.ROW_PERSIST_MAX_BYTES
-            )
-
-        # The static grid-row count (program count before any widen), the occupancy numerator.
-        from ..compile_environment import NoCurrentEnvironment
-
-        grid_rows = 1
-        # The try/except is NECESSARY (not defensive noise): this block dereferences the live
-        # ``env`` (``env.block_sizes[gbid].size``, ``env.size_hint``), which the no-env unit-test
-        # path (see ``extent_of`` above) cannot provide -> ``NoCurrentEnvironment``; a dynamic/None
-        # grid size raises ``AttributeError``/``TypeError``. All three collapse to the SAME defined
-        # fallback ``grid_rows = 0`` = "no compile-time occupancy", which the pass-2 occupancy widen
-        # already handles (it simply does not fire). Scoped tightly to the env-touching loop so it
-        # cannot mask an unrelated bug.
-        try:
-            for gbid in grid_ids:
-                size = env.block_sizes[gbid].size
-                if isinstance(size, (int, torch.SymInt)):
-                    grid_rows *= env.size_hint(size)
-                else:
-                    grid_rows = 0  # dynamic grid -> no compile-time occupancy
-                    break
-        except (NoCurrentEnvironment, AttributeError, TypeError):
-            grid_rows = 0
-
-        # ``seated`` holds every tile assigned so far (held fixed for later sizing); ``sizes`` is
-        # the subset that lands in tunable ``block_sizes`` slots. PASS 1 seats every grid axis at
-        # its FLOOR; the reductions are sized against that floored grid, then PASS 2 widens the grid
-        # into whatever budget the seated reductions left (the two-pass structure — reductions
-        # first with the grid pinned low, then the grid).
-        seated: dict[int, int] = {}
-        for gbid in sorted(grid_ids):
-            seated[gbid] = cls._m_axis_block_size(spec, gbid)
-        sizes: dict[int, int] = {}
-        block_sizes_red_values: dict[int, int] = {}
-        rolled_loop_sizes: dict[int, tuple[int, bool]] = {}
-        primary_r_block = 1
-        persistent = False
-
-        # Which axes are register-resident (see ``_resident_block_ids``). A grid axis in a live tile
-        # widens into the byte budget; a grid axis in no live tile is reduced away by a later
-        # ``.sum(0)``, holds no bytes, and collapses to ~1 SM wave instead.
-        resident_block_ids = cls._resident_block_ids(spec)
-
-        # A kernel with a loop-carried >=2-D accumulator (``carried_2d_count >= 1`` on any reduction)
-        # pins that ``[grid_M, R]`` state in registers across the whole inner loop, so widening the
-        # resident grid is risky (it multiplies the pinned register footprint and trips the
-        # CTA-per-SM occupancy cliff). Such a kernel keeps its resident grid at FLOOR (no widen).
-        carried_kernel = any(d.carried_2d_count > 0 for d in kf.reductions)
-
-        def footprint_terms(
-            tiles: tuple[tuple[int | None, ...], ...],
-            axis: int,
-        ) -> tuple[int, int]:
-            """The group footprint as ``(scale, flat)``: resident bytes while sizing ``axis`` =
-            ``itemsize × (scale × block(axis) + flat)`` — an axis-scaling term plus a constant term,
-            kept separate (they ADD; folding the constant into a per-element coefficient over-counts
-            it and wrongly denies persistence). Sum ``∏(dim widths)`` over the group's live tiles: a
-            tile containing ``axis`` scales with it (its ``∏(other dims)`` adds to ``scale``), a tile
-            without ``axis`` is constant (adds to ``flat``). A ``None`` dim is a size-1 broadcast.
-            The tiles already ARE the resident set (loop-carried accumulators captured inline at
-            real shape), so no separate accumulator sum is needed."""
-            scale = 0
-            flat = 0
-            for tile in tiles:
-                contains_axis = axis in tile
-                prod = 1
-                for d in tile:
-                    if d is None or d == axis:
-                        continue
-                    prod *= conservatively_large_tile_width(d)
-                if contains_axis:
-                    scale += prod
-                else:
-                    flat += prod
-            return max(1, scale), flat
-
-        def conservatively_large_tile_width(bid: int) -> int:
-            """One resident dim's width for the footprint bound: its SEATED width if already chosen,
-            else its full extent. The full-extent fallback is safe BY SEATING ORDER, not a blind
-            assumption — grid axes are seated first (the pass-1 preamble above), and a not-yet-seated
-            *reduction* dim is later in the sizing ``order`` below, so over-approximating it at full
-            extent only makes the footprint LARGER, keeping the axis currently being sized
-            conservative (it can only end up smaller/safer, never over-sized into a spill). NB: the
-            footprint is therefore ORDER-DEPENDENT (a later-sized reduction sees an earlier one at its
-            seated width, but not vice-versa) — the ``order`` sort below is load-bearing for
-            correctness, not cosmetic."""
-            return max(1, seated.get(bid, extent_of(bid)))
-
-        # The persistence-hold ceiling (used once, at ``expand_to_persist`` in the loop below; kept
-        # here as it is loop-invariant — keyed on the primary ``pd``). Selects the SMALL vs BIG
-        # bucket via ``_has_store_only_row_reread`` (an admitted proxy — see that method and
-        # PERSIST_HOLD_MAX_BYTES).
-        hold_ceiling = (
-            cls.USER_TILE_PERSIST_HOLD_MAX_BYTES
-            if cls._has_store_only_row_reread(spec, pd)
-            else cls.PERSIST_HOLD_MAX_BYTES
-        )
-
-        for g in kf.coresidency_groups:
-            descs = [kf.reductions[i] for i in g.descriptor_indices]
-            sized = [d for d in descs if d.category in SIZED_REDUCTION_CATEGORIES]
-            if not sized:
-                continue
-            tiles = g.live_tiles
-
-            # ---- PASS 1: seat the reductions (full-extent -> user-tile -> grid-tile) against the
-            # group's live-tile footprint with the grid axes at their floor. ----
-            order = sorted(
-                sized,
-                key=lambda d: (
-                    0
-                    if d.category in FULL_EXTENT_CATEGORIES
-                    else (1 if d.category is ReductionCategory.USER_TILE else 2),
-                    -d.size_hint,
+        for block_id, descriptors in descriptors_by_block.items():
+            raw_extent = raw_reduction_extents[block_id]
+            fixed = next(
+                (
+                    descriptor
+                    for descriptor in descriptors
+                    if descriptor.category is ReductionCategory.FIXED_TILE
                 ),
+                None,
             )
-            # ``order`` is ``sized`` (SIZED_REDUCTION_CATEGORIES only): FULL_SLICE / FULL_GRID /
-            # USER_TILE. A GRID_TILE reduction (jsd's grid amax) is NOT sized here — it is a grid
-            # axis, seated at its floor in the grid loop above and widened in PASS 2 like any grid
-            # row. So this loop never sees a GRID_TILE.
-            for d in order:
-                raw_ext = d.size_hint  # the true reduction extent (NOT pow2-padded)
-                ext = extent_of(d.block_id)  # pow2-padded — the seated tile width
-                materialized_full_width = (
-                    d.category is ReductionCategory.FULL_SLICE
-                    and d.block_id not in valid
-                    and d.block_id not in spec.reduction_loops.valid_block_ids()
-                )
-                if d.category is ReductionCategory.FULL_GRID or materialized_full_width:
-                    # FULL_GRID (cdiv == 1) or a materialized full-width FULL_SLICE (the roller
-                    # declined to roll it and it has no tunable block_sizes slot — e.g. a
-                    # grad-parameter ``grad_weight[N]`` accumulator axis, or a specialized
-                    # ``group_size``): the whole axis is one program's tile, full-extent resident by
-                    # definition. Seat at the full extent, never chunk it through the byte budget — it
-                    # cannot be split across programs and has nowhere to emit a chunk. Seating it
-                    # full-width (not chunked to 1) is what lets the co-resident inner tile see the
-                    # real N (else the inner tile reads N as 1 and grows to full extent — a spill).
-                    seated[d.block_id] = ext
-                    if d.block_id == pd.block_id:
-                        primary_r_block = ext
-                        # Seated at its full extent (r == ext), so it is persistent under the same
-                        # ``persistent = (r >= ext)`` rule the normal sizing path uses.
-                        persistent = True
-                    if d.block_id in valid:
-                        block_sizes_red_values[d.block_id] = ext
-                    continue
-                # Resident bytes(R) = itemsize × (scale × R + flat) over the live tiles. A reduction
-                # axis is tiled the same width everywhere it appears, so it must fit the heaviest
-                # co-residency group that spans it — take the footprint from the max-``scale`` group
-                # over ``d.block_id``, not just this descriptor's own group. ``flat`` is taken from
-                # that same max group (mixing terms across groups breaks the chunk arithmetic).
-                scale, flat = cls._max_group_footprint(
-                    kf, d.block_id, footprint_terms, default_tiles=tiles
-                )
-                # Size a streamed/chunked R from the byte budget first: the largest pow2 R whose
-                # resident bytes fit, solving ``itemsize × (scale × R + flat) <= budget`` for R (the
-                # constant term is subtracted, not divided), capped by LOOPED_CHUNK and the extent. A
-                # carried reduction sizes against the tighter carried budget; a non-carried inner tile
-                # against ROW.
-                avail = persist_budget_for(d) // itemsize - flat
-                byte_budget = _pp2(max(1, avail // scale))
-                r = max(1, min(cls.LOOPED_CHUNK, byte_budget, ext))
-                # THEN EXPAND TO PERSISTENT: lift R to the full extent iff the row is re-read (a
-                # persistent pass fuses reduce+apply to one HBM load) AND there is no carried 2-D
-                # tile (a carried tile is held resident the whole loop — it chunks, never persists)
-                # AND the extent clears the per-program element limit AND the single resident tile
-                # fits the persist ``hold_ceiling`` (apply-reread-keyed, computed above). The byte
-                # test uses the RAW extent (true resident element count, not pow2-padded).
-                element_cap = env.backend.max_tensor_numel
-                expand_to_persist = (
-                    d.row_reread
-                    and d.carried_2d_count == 0
-                    and (element_cap is None or raw_ext <= element_cap)
-                    and itemsize * (scale * raw_ext + flat) <= hold_ceiling
-                )
-                if expand_to_persist:
-                    r = ext
-                seated[d.block_id] = r
-                # THREE independent routing checks (the block_sizes and reduction_loops namespaces
-                # are DISJOINT — an axis is a ``block_sizes`` tile XOR a rolled ``reduction_loops``
-                # axis, never both — so these are plain ``if``s, not an if/elif chain):
-                # (A) the PRIMARY's scalar levers (num_warps ramp + standard-track reduction_loops).
-                if d.block_id == pd.block_id:
-                    primary_r_block = r
-                    persistent = r >= ext and d.category in FULL_EXTENT_CATEGORIES
-                # (B) a tunable ``block_sizes`` reduction (user-tiled) -> its block_sizes slot.
-                if d.block_id in valid:
-                    block_sizes_red_values[d.block_id] = r
-                # (C) a ROLLED NON-primary reduction -> surface its size for the standard track's
-                # reduction_loops emission. ``!= pd.block_id`` excludes the ROLLED PRIMARY (whose
-                # size is emitted via ``primary_r_block`` in (A) instead — it would otherwise be
-                # double-routed here). Only reached by a kernel that rolls >1 reduction.
-                if (
-                    d.block_id != pd.block_id
-                    and d.block_id in spec.reduction_loops.valid_block_ids()
-                ):
-                    rolled_loop_sizes[d.block_id] = (
-                        r,
-                        r >= ext and d.category in FULL_EXTENT_CATEGORIES,
-                    )
-
-            # ---- PASS 2: the grid-M rows take the remainder (widen / floor / collapse). ----
-            for mbid in sorted(grid_ids):
-                if mbid not in valid:
-                    continue  # a grid-PINNED axis (FixedBlockSizeSource) -> fixed, not sized.
-                ext = extent_of(mbid)
-                floor = cls._block_floor(
-                    cast(
-                        "BlockSizeSpec",
-                        spec.block_sizes[spec.block_sizes.block_id_to_index(mbid)],
-                    )
-                )
-                if mbid not in resident_block_ids:
-                    # a sequential cross-grid reduction loop (grad-param .sum(0)): in NO live tile ->
-                    # NOT resident, holds no bytes. The byte budget cannot size it; raise the floor
-                    # to ~1 SM wave to collapse the cross-grid finalize.
-                    collapse = _np2(max(1, grid_rows // num_sm)) if grid_rows > 0 else 1
-                    blk = max(floor, min(collapse, ext))
-                elif carried_kernel:
-                    # Register-occupancy guard (see ``carried_kernel`` above): the pinned
-                    # ``[grid_M, R]`` accumulator makes widening the grid trip the CTA-per-SM
-                    # occupancy cliff, which the leftover-byte widen and program-count ``occ_widen``
-                    # cannot see. So a carried kernel keeps its resident grid at FLOOR.
-                    blk = floor
-                else:
-                    # resident parallel rows: widen into the byte remainder (same faithful
-                    # ``scale × block + flat`` footprint over the live tiles — a wider grid row
-                    # scales every tile CONTAINING the grid axis), capped by occupancy (keep the
-                    # post-widen grid >= num_sm·MIN_WAVES), a diminishing-returns ROWS ceiling, and
-                    # the extent; floors when the budget is full.
-                    scale_w, flat_w = footprint_terms(tiles, mbid)
-                    avail_w = persist_budget_for(pd) // itemsize - flat_w
-                    byte_widen = _pp2(max(1, avail_w // scale_w))
-                    if grid_rows > 0:
-                        occ_widen = _pp2(max(1, grid_rows // occ_floor))
-                    else:
-                        occ_widen = (
-                            1  # dynamic grid -> no compile-time occupancy -> no widen
-                        )
-                    # ROWS ceiling: batching more than WIDEN_MAX_ROWS reduction ROWS/program only
-                    # trades away grid parallelism for a resident-row reduction (softmax/rms_norm:
-                    # memory-bound, does not amortize past ~8 rows). Does NOT apply when the primary
-                    # is FULL_GRID (the grid axis batches tiny grid-resident per-group reductions —
-                    # per_token_group's groups_per_row — which wants the wide occupancy-bound widen).
-                    rows_ceiling = (
-                        ext
-                        if pd.category is ReductionCategory.FULL_GRID
-                        else cls.WIDEN_MAX_ROWS
-                    )
-                    blk = max(floor, min(byte_widen, occ_widen, rows_ceiling, ext))
-                seated[mbid] = blk
-                sizes[mbid] = blk
-
-        # ---- the non-reduction / independent loops LAST (own budget vs the headroom) ----
-        # welford's normalize loop / rms_norm_per_block's groups_per_row. Co-resident with nothing
-        # in a group's reduction tile (a separate sequential pass), so each gets a FRESH budget
-        # against its own extent capped by the streamed ROW budget.
-        loop_budget = _pp2(max(1, cls.ROW_PERSIST_MAX_BYTES // itemsize))
-        # Optional tighter cap for a non-reduction apply loop (None on the base; set by sm100).
-        loop_cap = cls.non_reduction_loop_block_cap(spec, pd)
-        for i in range(len(spec.block_sizes)):
-            bs_spec = cast("BlockSizeSpec", spec.block_sizes[i])
-            bid = bs_spec.block_id
-            if bid in block_sizes_red_values or bid in grid_ids or bid in reduction_ids:
-                continue
-            if bid in non_reduction_loop_ids or bid not in seated:
-                # a non-reduction apply loop OR an independent standalone tiled loop: size it to
-                # its own extent capped by the headroom (flooring it to 1 would serialize the pass).
-                budget = loop_budget
-                if loop_cap is not None and bid in non_reduction_loop_ids:
-                    budget = min(budget, loop_cap)
-                sizes[bid] = max(1, min(extent_of(bid), budget))
-
-        # ---- assemble the full block_sizes vector ----
-        block_sizes: list[int] = []
-        for i in range(len(spec.block_sizes)):
-            bs_spec = cast("BlockSizeSpec", spec.block_sizes[i])
-            bid = bs_spec.block_id
-            if bid in sizes:
-                block_sizes.append(sizes[bid])
-            elif bid in block_sizes_red_values:
-                block_sizes.append(block_sizes_red_values[bid])
+            if fixed is not None:
+                assert fixed.fixed_tile_size_hint is not None
+                width = _np2(max(1, fixed.fixed_tile_size_hint))
+                reduction_widths[block_id] = width
+                reduction_floors[block_id] = width
+                reduction_maximums[block_id] = width
+                fixed_reduction_ids.add(block_id)
+            elif block_id in slot_of:
+                width = blocks[slot_of[block_id]]
+                reduction_widths[block_id] = width
+                reduction_floors[block_id] = floors[block_id]
+                reduction_maximums[block_id] = maximums[block_id]
+            elif block_id in rolled_ids:
+                full_width = _np2(max(1, raw_extent))
+                width = min(8, full_width)
+                reduction_widths[block_id] = width
+                reduction_floors[block_id] = width
+                reduction_maximums[block_id] = full_width
             else:
-                block_sizes.append(cls._block_floor(bs_spec))
+                width = _np2(max(1, raw_extent))
+                reduction_widths[block_id] = width
+                reduction_floors[block_id] = width
+                reduction_maximums[block_id] = width
+                fixed_reduction_ids.add(block_id)
 
-        return _TileAllocation(
-            block_sizes=block_sizes,
-            block_sizes_red_values=block_sizes_red_values,
-            primary_r_block=primary_r_block,
-            persistent=persistent,
-            rolled_loop_sizes=rolled_loop_sizes,
+        def make_candidate(
+            candidate_blocks: list[int],
+            widths: dict[int, int],
+        ) -> _ReductionCandidate:
+            return _ReductionCandidate(
+                tuple(candidate_blocks),
+                tuple(sorted(widths.items())),
+            )
+
+        candidate = make_candidate(blocks, reduction_widths)
+
+        def with_axis(
+            current: _ReductionCandidate,
+            block_id: int,
+            value: int,
+        ) -> _ReductionCandidate:
+            candidate_blocks = list(current.block_sizes)
+            widths = dict(current.reduction_widths)
+            slot = slot_of.get(block_id)
+            if slot is not None:
+                candidate_blocks[slot] = value
+            if block_id in widths:
+                widths[block_id] = value
+            return make_candidate(candidate_blocks, widths)
+
+        def grow(
+            block_id: int,
+            maximum: int,
+        ) -> None:
+            nonlocal candidate
+            current = (
+                candidate.reduction_width(block_id)
+                if block_id in reduction_widths
+                else candidate.block_sizes[slot_of[block_id]]
+            )
+            while current < maximum:
+                value = min(maximum, current * 2)
+                trial = with_axis(candidate, block_id, value)
+                current_peak = cls._reduction_peak_live_bytes(env, candidate)
+                trial_peak = cls._reduction_peak_live_bytes(env, trial)
+                if not (
+                    trial_peak <= cls.NORMAL_LIVE_BUDGET
+                    or (
+                        current_peak > cls.NORMAL_LIVE_BUDGET
+                        and trial_peak <= current_peak
+                    )
+                ):
+                    break
+                candidate = trial
+                current = value
+
+        def reduction_order_key(block_id: int) -> tuple[int, int, int]:
+            descriptors = descriptors_by_block[block_id]
+            categories = {descriptor.category for descriptor in descriptors}
+            if ReductionCategory.FIXED_TILE in categories:
+                tier = 0
+            elif categories & FULL_EXTENT_CATEGORIES:
+                tier = 1
+            else:
+                tier = 2
+            return tier, -raw_reduction_extents[block_id], block_id
+
+        for block_id in sorted(descriptors_by_block, key=reduction_order_key):
+            if block_id not in fixed_reduction_ids:
+                grow(block_id, reduction_maximums[block_id])
+
+        grid_ids = tuple(
+            block_id
+            for block_id in sorted(kf.grid_axis_block_ids)
+            if block_id in slot_of and block_id not in descriptors_by_block
+        )
+        for block_id in grid_ids:
+            grow(block_id, maximums[block_id])
+
+        non_reduction_ids = tuple(
+            block_id
+            for block_id in sorted(kf.non_reduction_loop_block_ids)
+            if block_id in slot_of and block_id not in descriptors_by_block
+        )
+        for block_id in non_reduction_ids:
+            grow(block_id, maximums[block_id])
+
+        classified = set(descriptors_by_block) | set(grid_ids) | set(non_reduction_ids)
+        for block_id in sorted(set(slot_of) - classified):
+            grow(block_id, maximums[block_id])
+
+        axis_floors = dict(floors)
+        axis_floors.update(reduction_floors)
+        axis_maximums = dict(maximums)
+        axis_maximums.update(reduction_maximums)
+        full_reduction_ids = {
+            block_id
+            for block_id in descriptors_by_block
+            if candidate.reduction_width(block_id) == reduction_maximums[block_id]
+        }
+        adjustable_ids = {
+            *(
+                block_id
+                for block_id in descriptors_by_block
+                if block_id not in fixed_reduction_ids
+                and block_id not in full_reduction_ids
+            ),
+            *grid_ids,
+            *non_reduction_ids,
+            *(set(slot_of) - classified),
+        }
+        coalescing = set(kf.coalescing_sensitive_block_ids)
+        non_grid_noncoalescing = sorted(adjustable_ids - set(grid_ids) - coalescing)
+        coalescing_ids = sorted(adjustable_ids & coalescing)
+        adjustment_order = (
+            *grid_ids,
+            *non_grid_noncoalescing,
+            *coalescing_ids,
         )
 
+        def axis_value(current: _ReductionCandidate, block_id: int) -> int:
+            if block_id in reduction_widths:
+                return current.reduction_width(block_id)
+            return current.block_sizes[slot_of[block_id]]
 
-class TritonStandardReductionHeuristicSM90(_TritonReductionSeedBase):
-    """standard (Helion-rolled rdim) inner-reduction seed for sm90/H100: Helion rolls the
-    reduction axis into a ``reduction_loops`` loop from a single ``.sum(-1)``-style op — sum,
-    long_sum, rms_norm, layer_norm, softmax-row, cross_entropy. Triton analog of
-    ``CuteReductionTileHeuristic`` (keeps its registry name), deepening the original
-    one-row/persistent/``['last']`` seed with the num_warps ramp, persistent-vs-looped,
-    and per-slot eviction.
+        def adjustment_floor(block_id: int) -> int:
+            floor = axis_floors[block_id]
+            if block_id in coalescing and block_id not in grid_ids:
+                floor = max(
+                    floor,
+                    min(axis_maximums[block_id], cls.COALESCING_SENSITIVE_FLOOR),
+                )
+            return floor
 
-    Gated by ``_triton_reduction_eligible`` (standard track) — broader than upstream
-    ``is_canonical_row_reduction`` (also multi-axis rollable rows and raised-``autotuner_min``
-    large-M shapes) — AND the sm90 hardware target. sm100 routes to
-    :class:`TritonStandardReductionHeuristicSM100`; unclaimed hardware routes to
-    :class:`TritonNarrowReductionHeuristic`.
-    """
+        def resources_for(
+            current: _ReductionCandidate,
+        ) -> tuple[int, _ReductionResources]:
+            warps = cls._choose_reduction_num_warps(
+                env,
+                current,
+                pd,
+                num_sm,
+                allow_descent=False,
+            )
+            return warps, cls._reduction_resources(env, current, warps, num_sm)
 
-    name = "triton_reduction_tile"
+        for _ in range(cls.MAX_BLOCK_ADJUSTMENT_PASSES):
+            changed = False
+            warps, resources = resources_for(candidate)
+            for block_id in adjustment_order:
+                current_value = axis_value(candidate, block_id)
+                floor = adjustment_floor(block_id)
+                if current_value <= floor:
+                    continue
+                raw_extent = (
+                    raw_reduction_extents[block_id]
+                    if block_id in raw_reduction_extents
+                    else specs[slot_of[block_id]].size_hint
+                )
+                current_steps = max(1, -(-raw_extent // current_value))
+                current_padded_work = current_steps * current_value
+                trial_value = max(floor, current_value // 2)
+                if block_id not in grid_ids and current_value > raw_extent:
+                    while (
+                        trial_value > floor
+                        and -(-raw_extent // trial_value) * trial_value
+                        >= current_padded_work
+                    ):
+                        trial_value = max(floor, trial_value // 2)
+                trial = with_axis(candidate, block_id, trial_value)
+                trial_warps, trial_resources = resources_for(trial)
+                current_ctas = cls._reduction_effective_cta_score(resources)
+                trial_ctas = cls._reduction_effective_cta_score(trial_resources)
+                current_warps_score = cls._reduction_effective_warp_score(resources)
+                trial_warps_score = cls._reduction_effective_warp_score(trial_resources)
+                current_spill = cls._reduction_spill_pressure(resources)
+                trial_spill = cls._reduction_spill_pressure(trial_resources)
+                relieves_spill = (
+                    current_spill > cls.SPILL_PRESSURE_THRESHOLD
+                    and trial_spill <= cls.SPILL_PRESSURE_THRESHOLD
+                    and trial_warps_score + 1e-9 >= current_warps_score
+                )
+                if block_id in grid_ids:
+                    required_gain = (
+                        cls.FULL_GRID_SPLIT_GAIN_THRESHOLD
+                        if current_value == axis_maximums[block_id]
+                        else cls.GRID_RESIDENCY_GAIN_THRESHOLD
+                    )
+                    worthwhile = (
+                        trial_ctas / max(current_ctas, 1e-9) + 1e-9 >= required_gain
+                    )
+                else:
+                    trial_steps = max(
+                        1,
+                        -(-raw_extent // max(1, trial_value)),
+                    )
+                    serial_cost = 1.0 + cls.SERIAL_LOOP_COST_ALPHA * (
+                        trial_steps / current_steps - 1.0
+                    )
+                    relieves_padding = (
+                        current_value > raw_extent
+                        and trial_steps * trial_value < current_padded_work
+                        and trial_warps_score + 1e-9 >= current_warps_score
+                    )
+                    worthwhile = relieves_padding or (
+                        trial_warps_score > current_warps_score
+                        and trial_warps_score / max(current_warps_score, 1e-9) + 1e-9
+                        >= serial_cost
+                    )
+                if relieves_spill or worthwhile:
+                    candidate = trial
+                    resources = trial_resources
+                    changed = True
+            if not changed:
+                break
 
-    # Warp floor when a grid axis is reduced away: the batched rows give cross-warp work to
-    # spread. Per-arch, since it trades occupancy against that parallelism.
-    M_COLLAPSE_MIN_NUM_WARPS = 8
+        # Probe full-row persistence only after the normal candidate is stable.
+        primary_block_id = pd.block_id
+        primary_full_width = _np2(max(1, pd.size_hint))
+        persistence_tunable = primary_block_id in rolled_ids or (
+            primary_block_id in slot_of and pd.category is ReductionCategory.USER_TILE
+        )
+        if (
+            pd.row_reread
+            and persistence_tunable
+            and candidate.reduction_width(primary_block_id) < primary_full_width
+        ):
+            persistent_trial = with_axis(
+                candidate,
+                primary_block_id,
+                primary_full_width,
+            )
+            _, normal_resources = resources_for(candidate)
+            _, persistent_resources = resources_for(persistent_trial)
+            normal_effective_ctas = cls._reduction_effective_resident_ctas_per_sm(
+                normal_resources
+            )
+            persistent_effective_ctas = cls._reduction_effective_resident_ctas_per_sm(
+                persistent_resources
+            )
+            occupancy_not_hurt = all(
+                persistent + 1e-9 >= normal
+                for persistent, normal in zip(
+                    persistent_effective_ctas,
+                    normal_effective_ctas,
+                    strict=True,
+                )
+            )
+            if (
+                persistent_resources.peak_live_bytes
+                <= cls.NORMAL_LIVE_BUDGET * cls.PERSISTENCE_BUDGET_MULTIPLIER
+                and cls._reduction_spill_pressure(persistent_resources)
+                <= cls.SPILL_PRESSURE_THRESHOLD
+                and occupancy_not_hurt
+            ):
+                candidate = persistent_trial
+
+        final_warps = cls._choose_reduction_num_warps(env, candidate, pd, num_sm)
+        final_widths = dict(candidate.reduction_widths)
+        rolled_loop_sizes = {
+            block_id: final_widths[block_id]
+            for block_id in rolled_ids
+            if block_id != primary_block_id
+        }
+        return _LivenessTileAllocation(
+            block_sizes=list(candidate.block_sizes),
+            primary_r_block=final_widths[primary_block_id],
+            rolled_loop_sizes=rolled_loop_sizes,
+            num_warps=final_warps,
+        )
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -5003,8 +5151,7 @@ class TritonStandardReductionHeuristicSM90(_TritonReductionSeedBase):
             return False
         if not _triton_reduction_eligible(env, device_ir):
             return False
-        pd = _primary_descriptor_selected(env)
-        return pd is not None and _is_standard_reduction(pd)
+        return _primary_descriptor_selected(env) is not None
 
     @classmethod
     def get_seed_config(
@@ -5014,269 +5161,55 @@ class TritonStandardReductionHeuristicSM90(_TritonReductionSeedBase):
         pd = _primary_descriptor_selected(env)
         if pd is None:
             return None
-        # The allocator sizes every axis from the per-co-residency-group budget: the reduction
-        # chunk(s), the grid M (the remainder — widen / floor / collapse), and the apply/independent
-        # loops, in one pass. The standard track maps that sizing onto the rolled ``reduction_loops``
-        # knob + the num_warps ramp + eviction below (emission routing only).
-        alloc = cls.size_reduction_tiles(env, spec, device_ir, pd)
-        block_sizes = alloc.block_sizes
-        r_block, persistent = alloc.primary_r_block, alloc.persistent
-        num_warps = cls._num_warps(pd)
-        # Grad-parameter M-collapse warp floor: a kernel that reduces its grid-M axis away (finalized
-        # by a later ``.sum(0)`` — a grid block_id in no live tile) batches many M-rows per program
-        # and accumulates a wide ``[inner, N]`` gradient. That cross-warp-parallelizable work wants
-        # >=8 warps even when the primary reduction's extent is small. A floor, so it never lowers a
-        # large-rdim ramp. Independent of co-residency, so not gated on a co-resident sibling.
-        if cls._has_reduced_away_grid(spec):
-            num_warps = max(cls.M_COLLAPSE_MIN_NUM_WARPS, num_warps)
+        kf = spec.reduction_kernel_fact
+        assert kf is not None
+        alloc = cls.size_reduction_tiles_liveness(env, spec, pd)
 
-        # standard rides persistent-vs-looped on the rolled ``reduction_loops`` knob (the primary
-        # rdim is NOT a block_sizes entry). MATERIALIZED rdim (rms/ln/instance bwd, the roller
-        # declined to roll it): emit an EMPTY reduction_loops -- already full-width persistent, and
-        # a length-1 list would fail normalize against the 0-length spec.
-        is_materialized = pd.block_id not in spec.reduction_loops.valid_block_ids()
-        reduction_loops: list[int | None]
-        if is_materialized:
-            reduction_loops = []
-        elif len(spec.reduction_loops) <= 1:
-            # Single rolled reduction (the common case).
-            reduction_loops = [None] if persistent else [r_block]
-        else:
-            # Multiple rolled reductions (e.g. two sequential rolled reductions in separate graphs).
-            # One ``reduction_loops`` entry per spec in spec order: the primary spec uses
-            # (r_block, persistent); the other rolled specs use ``alloc.rolled_loop_sizes`` (each
-            # sized against its own extent — a rolled axis has no block_sizes slot, so the allocator
-            # surfaces it here rather than in block_sizes_red_values).
-            reduction_loops = []
-            for rl_spec in spec.reduction_loops:
-                bid = rl_spec.block_ids[0]
-                if bid == pd.block_id:
-                    reduction_loops.append(None if persistent else r_block)
-                else:
-                    rb, pers = alloc.rolled_loop_sizes[bid]
-                    reduction_loops.append(None if pers else rb)
         seed: dict[str, Any] = {
-            "block_sizes": block_sizes,
-            "reduction_loops": reduction_loops,
-            "num_warps": num_warps,
+            "block_sizes": alloc.block_sizes,
+            "num_warps": alloc.num_warps,
             "num_stages": 1,
-            # 'flat': these reductions are grid-saturated at the M-grid.
             "pid_type": "flat",
         }
-        # Eviction: a streamed input -> 'first' everywhere; a re-read row reloaded across a
-        # grid-COLLAPSE loop -> pin it 'last' (first load), rest 'first'. Gated on
-        # ``_has_reduced_away_grid`` (the grad-parameter ``.sum(0)`` M-collapse idiom: the program
-        # batches many M-rows and re-fetches the row from L2 each row, so pinning it pays), not on
-        # ``not persistent`` — a single fused persistent row does not reload from L2, so pinning
-        # there only oversubscribes L2 and evicts store lines. Whether the row reloads is a
-        # structural property, not a byte threshold, so ``_has_reduced_away_grid`` is the
-        # discriminator. (A ``num_load == 1`` kernel hits the stream branch first.)
-        evict = None
-        if pd.num_load == 1:
-            evict = cls._eviction_policies(env, "stream")
-        elif pd.row_reread and cls._has_reduced_away_grid(spec):
-            # Re-read row's eviction slot read directly from the descriptor (its load's
-            # MemoryOpFact.eviction_index), not a per-config codegen re-walk.
-            evict = cls._eviction_policies(env, "reread", pd.reread_eviction_index)
-        if evict is not None:
-            seed["load_eviction_policies"] = evict
-        # Materialize through the shared guard so an emitted config value that is
-        # illegal for this kernel is repaired rather than shipped raw: a hardcoded
-        # ``pid_type='flat'`` is replaced with a legal persistent type when 'flat' is
-        # disallowed (barrier / data-dependent grid bound), matching the matmul seed path.
+        if _is_standard_reduction(pd):
+            # Compiler-rolled reductions have no block_sizes slot. Full width is encoded as
+            # ``None``; a materialized full reduction has no reduction_loops knob at all.
+            if pd.block_id not in spec.reduction_loops.valid_block_ids():
+                reduction_loops: list[int | None] = []
+            elif len(spec.reduction_loops) <= 1:
+                reduction_loops = [
+                    None
+                    if alloc.primary_r_block >= pd.size_hint
+                    else alloc.primary_r_block
+                ]
+            else:
+                reduction_loops = []
+                for rl_spec in spec.reduction_loops:
+                    block_id = rl_spec.block_ids[0]
+                    width = (
+                        alloc.primary_r_block
+                        if block_id == pd.block_id
+                        else alloc.rolled_loop_sizes[block_id]
+                    )
+                    reduction_loops.append(
+                        None if width >= rl_spec.size_hint else width
+                    )
+            seed["reduction_loops"] = reduction_loops
+            if pd.row_reread and cls._has_floor_batched_nonresident_grid(env):
+                evict = cls._reread_eviction_policies(env, pd.reread_eviction_index)
+                if evict is not None:
+                    seed["load_eviction_policies"] = evict
+        elif kf.non_reduction_loop_block_ids or pd.row_reread:
+            # A user-written reduction already emits its mutable width through block_sizes.
+            evict = cls._reread_eviction_policies(env, pd.reread_eviction_index)
+            if evict is not None:
+                seed["load_eviction_policies"] = evict
+
         return _materialize_config(seed, config_spec=spec)
-
-
-class TritonUserTiledReductionHeuristicSM90(_TritonReductionSeedBase):
-    """user-tiled inner-reduction seed for sm90/H100: fires when the user hand-writes the
-    ``hl.tile`` loop over the reduction axis (so the rdim is an ordinary ``block_sizes`` entry,
-    e.g. ``hl.tile(n, block_size=R_BLOCK)``), which the upstream gate rejects entirely.
-
-    Every axis (the reduction r_block(s), the grid rows, the apply loops) is sized by the shared
-    :meth:`size_reduction_tiles` ONE budget allocator — there are NO per-band branches. The kernel
-    families this track covers (plain user-tiled softmax, carried-2-D kl_div/jsd, reduce-then-apply
-    welford, grad-parameter bias_grad/dyt) differ only in their Stage-1 facts (carried accumulators,
-    non-reduction loops, materialized features), which the budget consumes uniformly; the
-    floor-vs-resident and chunk-vs-persistent decisions are budget OUTCOMES. This track maps the
-    allocation onto its knobs (every reduction axis is a ``block_sizes`` entry; no
-    ``reduction_loops``) + num_warps + reread eviction below.
-    """
-
-    name = "triton_reduction_user_tile"
-
-    @classmethod
-    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        if not matches_hardware(env, cls.HARDWARE_TARGETS):
-            return False
-        if not _triton_reduction_eligible(env, device_ir):
-            return False
-        pd = _primary_descriptor_selected(env)
-        return pd is not None and not _is_standard_reduction(pd)
-
-    @classmethod
-    def get_seed_config(
-        cls, env: CompileEnvironment, device_ir: DeviceIR
-    ) -> Config | None:
-        spec = env.config_spec
-        pd = _primary_descriptor_selected(env)
-        if pd is None:
-            return None
-        # The allocator sizes every axis from the per-co-residency-group budget: the user-tiled
-        # reduction chunk(s) on their block_sizes slots, the grid M (the remainder), and the apply
-        # loops, in one pass. The user-tiled track maps that sizing onto num_warps + eviction below
-        # (no reduction_loops knob; the rdim rides a block_sizes entry).
-        alloc = cls.size_reduction_tiles(env, spec, device_ir, pd)
-        block_sizes = alloc.block_sizes
-        num_warps = cls._num_warps(pd)
-        non_reduction_loop_ids = set(cls._non_reduction_loop_ids(spec))
-        seed: dict[str, Any] = {
-            "block_sizes": block_sizes,
-            "num_warps": num_warps,
-            "num_stages": 1,
-            "pid_type": "flat",  # see the standard branch.
-        }
-        # Reread eviction: keep the re-read row L2-resident ('last' on its load slot) whenever
-        # it is re-read — welford (reduce-then-apply across combine + normalize) AND plain
-        # user-tiled (softmax_two_pass loads x twice). Applies even when PERSISTENT: the second
-        # pass still re-fetches x from HBM (profiler-confirmed), so 'last' cuts that re-read
-        # traffic. kl_div/jsd (row_reread=False) unaffected.
-        if non_reduction_loop_ids or pd.row_reread:
-            # Re-read row's eviction slot read directly from the descriptor (its load's
-            # MemoryOpFact.eviction_index), not a per-config codegen re-walk.
-            ev = cls._eviction_policies(env, "reread", pd.reread_eviction_index)
-            if ev is not None:
-                seed["load_eviction_policies"] = ev
-        # See the standard branch: materialize through the shared guard so an illegal
-        # ``pid_type='flat'`` (disallowed under a barrier / data-dependent bound) is
-        # repaired to a legal persistent type instead of shipping the raw seed.
-        return _materialize_config(seed, config_spec=spec)
-
-
-def _config_with_num_warps(cfg: Config, num_warps: int) -> Config:
-    """Return a copy of ``cfg`` with ``num_warps`` overridden (the reduction seeds always set
-    num_warps, so this replaces the existing value)."""
-    merged: dict[str, Any] = {**cfg.config, "num_warps": num_warps}
-    return Config(**merged)
-
-
-# ============================ sm100 (B200) dedicated subclasses ============================ #
-# Re-target the sm90 reduction seeds at sm100 via a subclass that overrides only the hardware target +
-# B200 constants; the sm90/H100 emit is a separate class + gate, so it stays frozen.
-class _TritonReductionSeedSM100(_TritonReductionSeedBase):
-    """sm100 (B200) constant/gate carrier for the two reduction seed tracks. Overrides the hardware
-    target and re-tunes constants (as class attributes) only where a B200 measurement demands it. The
-    concrete subclasses inherit ``is_eligible`` from their sm90 track class, which gates on
-    ``cls.HARDWARE_TARGETS`` (sm100 here) — so hardware selection lives in ``is_eligible``, not in
-    this ``get_seed_config``. Not registered; the two concrete subclasses below are.
-
-    ``promote_seed_to_default`` is inherited from :class:`_TritonReductionSeedBase` (``True`` for
-    every tuned track, sm90 and sm100 alike)."""
-
-    HARDWARE_TARGETS = (("cuda", "sm100"),)
-    # --- B200 constant overrides (re-tuned during the climb; unset = direct port of H100) ---
-    # Load-traffic ceiling (bytes) below which a light streamed row drops to nw8 (see _b200_num_warps).
-    NW8_MAX_ROW_TRAFFIC = 64 * 1024
-    # Element cap for a non-reduction apply loop (see non_reduction_loop_block_cap).
-    NON_REDUCTION_LOOP_MAX_ELEMS = 4096
-    # Row extent at or below which there is too little parallelism to fill 4 warps.
-    NARROW_ROW_MAX_ELEMS = 1024
-    NARROW_ROW_NUM_WARPS = 2
-    # Warp count for a light-traffic row above the narrow cap (was an always-8 split).
-    WIDE_ROW_NUM_WARPS = 4
-    # Heavy-traffic rows up to this extent cap here instead of taking the base ramp's 16/32.
-    HEAVY_ROW_MAX_ELEMS = 16384
-    HEAVY_ROW_NUM_WARPS = 8
-    # M-collapse floor (see TritonStandardReductionHeuristicSM90); 8 overshoots on B200.
-    M_COLLAPSE_MIN_NUM_WARPS = 4
-
-    @classmethod
-    def non_reduction_loop_block_cap(
-        cls, spec: ConfigSpec, pd: ReductionDescriptor
-    ) -> int | None:
-        # Cap EVERY non-reduction apply loop (relieves register pressure on B200).
-        return cls.NON_REDUCTION_LOOP_MAX_ELEMS
-
-    @classmethod
-    def get_seed_config(
-        cls, env: CompileEnvironment, device_ir: DeviceIR
-    ) -> Config | None:
-        # Build the inherited sm90-track seed (is_eligible already confirmed sm100), then re-tune.
-        cfg = super().get_seed_config(env, device_ir)
-        if cfg is None:
-            return None
-        # Re-tune num_warps by the load-traffic key (both tracks, one place); see _b200_num_warps.
-        pd = _primary_descriptor_selected(env)
-        if pd is not None:
-            nw = cls._b200_num_warps(env.config_spec, pd, cfg)
-            if nw is not None:
-                cfg = _config_with_num_warps(cfg, nw)
-        return cfg
-
-    @classmethod
-    def _b200_num_warps(
-        cls, spec: ConfigSpec, pd: ReductionDescriptor, cfg: Config
-    ) -> int | None:
-        """The B200 warp count for a light-traffic PERSISTENT streamed row (8, or 4 at small extent),
-        or None to leave the base ramp untouched. Purely additive: only lowers, never raises."""
-        # Skip M-collapse (grad-parameter .sum(0)): a cross-warp accumulate, not a streamed row.
-        if cls._has_reduced_away_grid(spec):
-            return None
-        # Skip reduce-then-apply (welford / rms_norm_per_block): its reread lives on the non-reduction
-        # loop, not in ``num_load``, so the traffic key can't see it.
-        if cls._non_reduction_loop_ids(spec):
-            return None
-        # Restrict to a single sized reduction: a second one adds cross-warp compute the traffic key
-        # can't see, with a non-monotonic warp optimum.
-        kf = spec.reduction_kernel_fact
-        if (
-            kf is None
-            or sum(1 for d in kf.reductions if d.category in SIZED_REDUCTION_CATEGORIES)
-            != 1
-        ):
-            return None
-        # Skip LOOPED reductions (positive ``reduction_loops`` chunk): they keep the base ramp.
-        loops = cfg.config.get("reduction_loops")
-        if isinstance(loops, (list, tuple)) and any(isinstance(x, int) for x in loops):
-            return None
-        # Load traffic per row = elems × load-width × #loads.
-        traffic = pd.size_hint * max(1, pd.input_load_itemsize) * max(1, pd.num_load)
-        if traffic <= cls.NW8_MAX_ROW_TRAFFIC:
-            # Warps past the useful ones idle while still holding registers and scheduler slots.
-            if pd.size_hint <= cls.NARROW_ROW_MAX_ELEMS:
-                return cls.NARROW_ROW_NUM_WARPS
-            return cls.WIDE_ROW_NUM_WARPS
-        # Heavy traffic: the base ramp's 16/32 is an H100 port that overshoots here up to
-        # HEAVY_ROW_MAX_ELEMS. Genuinely huge rows keep the base ramp.
-        if pd.size_hint <= cls.HEAVY_ROW_MAX_ELEMS:
-            return cls.HEAVY_ROW_NUM_WARPS
-        return None
-
-
-class TritonStandardReductionHeuristicSM100(
-    _TritonReductionSeedSM100, TritonStandardReductionHeuristicSM90
-):
-    """standard (Helion-rolled rdim) inner-reduction seed for sm100/B200: the rich
-    :class:`TritonStandardReductionHeuristicSM90` allocator with B200 constants from
-    :class:`_TritonReductionSeedSM100`."""
-
-    name = "triton_reduction_tile_sm100"
-
-
-class TritonUserTiledReductionHeuristicSM100(
-    _TritonReductionSeedSM100, TritonUserTiledReductionHeuristicSM90
-):
-    """user-tiled inner-reduction seed for sm100/B200: the rich
-    :class:`TritonUserTiledReductionHeuristicSM90` allocator with B200 constants from
-    :class:`_TritonReductionSeedSM100`."""
-
-    name = "triton_reduction_user_tile_sm100"
 
 
 # Hardware the tuned reduction seeds own; the narrow fallback yields to these targets.
-_TUNED_REDUCTION_TARGETS: tuple[HardwareTarget, ...] = (
-    ("cuda", "sm90"),
-    ("cuda", "sm100"),
-)
+_TUNED_REDUCTION_TARGETS = TritonReductionHeuristic.HARDWARE_TARGETS
 
 
 class TritonNarrowReductionHeuristic(AutotunerHeuristic):

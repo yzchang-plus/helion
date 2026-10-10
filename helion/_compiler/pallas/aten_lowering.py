@@ -19,6 +19,7 @@ import torch
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
+from ...language._tracing_ops import _mask_to
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..aten_lowering import AtenLowering
@@ -52,6 +53,32 @@ if TYPE_CHECKING:
 
 
 cat_lowering_pallas = AtenLowering(target=torch.ops.aten.cat.default)
+
+
+def _has_foldable_dot_lhs_cast(node: Node) -> bool:
+    """Whether ``node`` directly narrows an f32 left dot operand to rhs dtype."""
+    if node.target in (torch.ops.aten.mm.default, torch.ops.aten.bmm.default):
+        lhs_arg_index = 0
+    elif node.target in (
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.baddbmm.default,
+    ):
+        lhs_arg_index = 1
+    else:
+        return False
+    lhs = node.args[lhs_arg_index]
+    rhs = node.args[lhs_arg_index + 1]
+    if not isinstance(lhs, Node) or not isinstance(rhs, Node):
+        return False
+    if lhs.target is not torch.ops.prims.convert_element_type.default:
+        return False
+    source = lhs.args[0]
+    return (
+        isinstance(source, Node)
+        and source.meta["val"].dtype == torch.float32
+        and lhs.args[1] == rhs.meta["val"].dtype
+        and rhs.meta["val"].dtype in (torch.bfloat16, torch.float16)
+    )
 
 
 @cat_lowering_pallas.register_codegen("pallas")
@@ -98,6 +125,57 @@ def codegen_view_pallas(ctx: LoweringContext, node: Node) -> object:
 
     if _resident_plan(node) is not None:
         return _codegen_resident_view(ctx, node)
+
+    # ``torch.cat([x] * repeats, dim=-1)`` is commonly decomposed into
+    # ``x.unsqueeze(-2).expand(..., repeats, width).reshape(..., repeats * width)``.
+    # Preserve the repeat as one Pallas/JAX tile operation instead of first
+    # materializing the expanded intermediate.
+    expanded = node.args[0]
+    while (
+        isinstance(expanded, Node) and expanded.target is torch.ops.aten.clone.default
+    ):
+        expanded = expanded.args[0]
+    if isinstance(expanded, Node) and expanded.target is torch.ops.aten.expand.default:
+        unsqueezed = expanded.args[0]
+        if (
+            isinstance(unsqueezed, Node)
+            and unsqueezed.target is torch.ops.aten.unsqueeze.default
+        ):
+            source = unsqueezed.args[0]
+            source_val = source.meta.get("val") if isinstance(source, Node) else None
+            expanded_val = expanded.meta.get("val")
+            output_val = node.meta.get("val")
+            if all(
+                isinstance(value, torch.Tensor)
+                for value in (source_val, expanded_val, output_val)
+            ):
+                assert isinstance(source_val, torch.Tensor)
+                assert isinstance(expanded_val, torch.Tensor)
+                assert isinstance(output_val, torch.Tensor)
+                dim_arg = unsqueezed.args[1]
+                dim = dim_arg if isinstance(dim_arg, int) else None
+                if dim is not None and dim < 0:
+                    dim += source_val.ndim + 1
+                env = CompileEnvironment.current()
+                source_shape = tuple(env.size_hint(size) for size in source_val.shape)
+                expanded_shape = tuple(
+                    env.size_hint(size) for size in expanded_val.shape
+                )
+                output_shape = tuple(env.size_hint(size) for size in output_val.shape)
+                if (
+                    dim is not None
+                    and dim == source_val.ndim - 1
+                    and expanded_shape[:dim] == source_shape[:dim]
+                    and expanded_shape[dim + 1 :] == source_shape[dim:]
+                    and output_shape[:-1] == source_shape[:-1]
+                    and output_shape[-1] == expanded_shape[dim] * source_shape[-1]
+                ):
+                    source_ast = map_arg(source, lambda arg: _env_arg(ctx, arg))
+                    assert isinstance(source_ast, ast.AST)
+                    return expr_from_string(
+                        f"jnp.tile({{tensor}}, {expanded_shape[dim]})",
+                        tensor=source_ast,
+                    )
 
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
@@ -271,6 +349,29 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     lhs_dtype = lhs_node_arg.meta["val"].dtype
     rhs_dtype = rhs_node_arg.meta["val"].dtype
     lhs_ndim = lhs_node_arg.meta["val"].ndim
+
+    # Mosaic can apply TPU's default input precision when the dot consumes the
+    # f32 producer directly. This remains tunable because removing the explicit
+    # conversion is not faster for every TPU schedule.
+    if ctx.cg.device_function.config.get("pallas_fold_dot_lhs_cast", False):
+        cast_node = lhs_node_arg
+        if cast_node.target is _mask_to and isinstance(cast_node.args[0], Node):
+            candidate = cast_node.args[0]
+            candidate_ast = _env_arg(ctx, candidate)
+            if isinstance(candidate_ast, ast.AST) and ast.dump(lhs) == ast.dump(
+                candidate_ast
+            ):
+                cast_node = candidate
+        if (
+            cast_node.target is torch.ops.prims.convert_element_type.default
+            and cast_node.args[1] == rhs_dtype
+            and isinstance(cast_node.args[0], Node)
+            and cast_node.args[0].meta["val"].dtype == torch.float32
+            and rhs_dtype in (torch.bfloat16, torch.float16)
+        ):
+            lhs = _env_arg(ctx, cast_node.args[0])
+            assert isinstance(lhs, ast.AST)
+
     need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
 

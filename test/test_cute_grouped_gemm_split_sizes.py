@@ -21,6 +21,9 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -690,6 +693,7 @@ def test_grouped_device_split_automatic_seed_families_use_mailbox_scheduler() ->
     } == {
         TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
         TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+        TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
     }
     assert (
         seeds[0].config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
@@ -790,7 +794,6 @@ def test_grouped_device_offsets_root_axis_order_is_semantic(
     _device_offsets_axis_order_kernel.reset()
     with (
         patch_cute_mma_support(),
-        patch("torch.cuda.get_device_capability", return_value=(10, 0)),
         patch(
             "helion.runtime.kernel.target_device_capability",
             return_value=(10, 0),
@@ -799,6 +802,9 @@ def test_grouped_device_offsets_root_axis_order_is_semantic(
             "helion._compiler.compile_environment.target_device_capability",
             return_value=(10, 0),
         ),
+        patch("helion.language.loops.use_tileir_tunables", return_value=False),
+        patch("helion.language.loops._supports_warp_specialize", return_value=True),
+        patch("helion._compat._supports_tensor_descriptor", return_value=True),
         patch(
             "helion._hardware.get_hardware_info",
             return_value=HardwareInfo(
@@ -1122,6 +1128,7 @@ def test_grouped_device_split_sizes_rejects_near_misses(
             helion.exc.BackendUnsupported,
             match=(
                 "rank3 grouped semantic proof failed|MMA RHS was not grouped rank-3"
+                "|MMA operands did not expose group metadata"
             ),
         ),
     ):

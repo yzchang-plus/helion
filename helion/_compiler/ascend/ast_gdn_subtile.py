@@ -44,7 +44,11 @@ def _is_gdn_fwd_h(body: list[ast.stmt], args: list[str]) -> bool:
                         for kw in n.iter.keywords
                     ):
                         has_chunk_loop = True
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "dot":
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "dot"
+            ):
                 has_dot = True
             if (
                 isinstance(n, ast.Assign)

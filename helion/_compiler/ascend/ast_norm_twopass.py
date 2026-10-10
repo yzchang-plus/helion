@@ -43,7 +43,10 @@ def _for_mb_cta(body: list[ast.stmt]) -> ast.For | None:
         if not (isinstance(f, ast.Attribute) and f.attr == "tile"):
             continue
         if isinstance(f.value, ast.Name) and f.value.id == "hl":
-            if any(isinstance(k, ast.keyword) and k.arg == "block_size" for k in s.iter.keywords):
+            if any(
+                isinstance(k, ast.keyword) and k.arg == "block_size"
+                for k in s.iter.keywords
+            ):
                 return s
     return None
 
@@ -74,13 +77,18 @@ def _is_int(node: ast.AST, value: int) -> bool:
         isinstance(node, ast.UnaryOp)
         and isinstance(node.op, ast.USub)
         and isinstance(node.operand, ast.Constant)
+        and isinstance(node.operand.value, int)
         and -node.operand.value == value
     )
 
 
 def _has_call_with_dim(node: ast.AST, attr: str, dim: int) -> bool:
     for n in ast.walk(node):
-        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == attr):
+        if not (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == attr
+        ):
             continue
         for a in n.args:
             if _is_int(a, dim):
@@ -94,14 +102,22 @@ def _has_call_with_dim(node: ast.AST, attr: str, dim: int) -> bool:
 def _loads_2d_whole(node: ast.AST, tensor: str) -> bool:
     """``tensor[idx, :]`` (2D, last axis whole slice), in a Load context."""
     for n in ast.walk(node):
-        if not (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id == tensor):
+        if not (
+            isinstance(n, ast.Subscript)
+            and isinstance(n.value, ast.Name)
+            and n.value.id == tensor
+        ):
             continue
         if not isinstance(n.ctx, ast.Load):
             continue
         sl = n.slice
         if isinstance(sl, ast.Tuple) and len(sl.elts) == 2:
             last = sl.elts[-1]
-            if isinstance(last, ast.Slice) and last.lower is None and last.upper is None:
+            if (
+                isinstance(last, ast.Slice)
+                and last.lower is None
+                and last.upper is None
+            ):
                 return True
     return False
 
@@ -123,7 +139,12 @@ def _is_rms_norm_bwd(body: list[ast.stmt], args: list[str]) -> bool:
     if inner is None:
         return False
     # mb_cta iterates x.size(0)
-    it = mb_cta.iter.args[0] if mb_cta.iter.args else None
+    iter_expr = mb_cta.iter
+    it = (
+        iter_expr.args[0]
+        if isinstance(iter_expr, ast.Call) and iter_expr.args
+        else None
+    )
     if not (
         isinstance(it, ast.Call)
         and isinstance(it.func, ast.Attribute)
@@ -182,6 +203,8 @@ def _emit_rms_twopass(args: list[str]) -> list[str]:
         f"            x_m = {x}[mb, tile_n].to(torch.float32)",
         f"            do_m = {grad_out}[mb, tile_n].to(torch.float32)",
         f"            w_m = {weight}[tile_n].to(torch.float32)",
-        "            {gx}[mb, tile_n] = (w_m[None, :] * do_m * rsqrt_m - x_m * rsqrt_m ** 3 * mean_term[:, None]).to({x}.dtype)".format(gx="grad_x", x=x),
+        "            {gx}[mb, tile_n] = (w_m[None, :] * do_m * rsqrt_m - x_m * rsqrt_m ** 3 * mean_term[:, None]).to({x}.dtype)".format(
+            gx="grad_x", x=x
+        ),
         f"return (grad_x, grad_weight.sum(0).to({weight}.dtype))",
     ]

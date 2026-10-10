@@ -165,8 +165,9 @@ Then run your kernel as usual — the autotuner will use Claude to propose initi
 before handing off to the surrogate-based search:
 
 ```python
-out = matmul(torch.randn([2048, 2048], device="cuda"),
-             torch.randn([2048, 2048], device="cuda"))
+out = matmul(
+    torch.randn([2048, 2048], device="cuda"), torch.randn([2048, 2048], device="cuda")
+)
 ```
 
 ### DE Surrogate Hybrid

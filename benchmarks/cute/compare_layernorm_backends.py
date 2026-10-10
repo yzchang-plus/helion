@@ -227,9 +227,7 @@ def _quack_compiled_kernel(x, weight, bias, config=None):  # noqa: ANN001, ANN20
     import torch
 
     sys.path.insert(0, str(QUACK_PATH))
-    from quack.cute_dsl_utils import (  # pyrefly: ignore [missing-import]
-        torch2cute_dtype_map,
-    )
+    from quack.cute_dsl_utils import torch2cute_dtype_map  # pyrefly: ignore [missing-import]
     from quack.rmsnorm import _compile_rmsnorm_fwd  # pyrefly: ignore [missing-import]
 
     dt = torch2cute_dtype_map[x.dtype]
@@ -280,9 +278,7 @@ def _run_impl(args: argparse.Namespace) -> dict[str, Any]:
         fn()
     elif args.impl == "quack-tuned":
         sys.path.insert(0, str(QUACK_PATH))
-        from quack.rmsnorm_config import (  # pyrefly: ignore [missing-import]
-            get_all_fwd_configs,
-        )
+        from quack.rmsnorm_config import get_all_fwd_configs  # pyrefly: ignore [missing-import]
         from triton.testing import do_bench
 
         t0 = time.time()

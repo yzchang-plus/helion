@@ -10,10 +10,10 @@ imports it at the bottom so registration keeps the same eager timing as before.
 from __future__ import annotations
 
 import ast
-import contextlib
 from typing import TYPE_CHECKING
 from typing import cast
 
+import sympy
 import torch
 from torch._inductor.codegen.simd import constant_repr
 from torch.fx.node import Node
@@ -46,15 +46,18 @@ from ..aten_lowering import view_dtype_lowering
 from ..aten_lowering import view_lowering
 from ..aten_lowering import where_lowering
 from ..compile_environment import CompileEnvironment
+from ..dtype_utils import cast_ast
 from .argreduce import codegen_cute_tile_argreduce
 from .cute_mma import codegen_cute_mma
 from .cute_mma import codegen_cute_mma_direct_mm
 from .indexing import CutePackedAffineLoad
+from .indexing import CutePackedTerms
 from .indexing import CuteShapeChainView
 from .indexing import CuteSortableLoad
 from .indexing import is_cute_shape_chain_target
 from .indexing import match_cute_affine_range_iota
 from .iota_utils import cute_free_arange_indexed_dim_key
+from .iota_utils import cute_free_arange_memory_index_positions
 from .iota_utils import cute_iota_has_atomic_tensor_index_only_users
 from .iota_utils import cute_iota_is_free_memory_index
 from .matmul_fallback import _emit_cute_matmul
@@ -78,6 +81,11 @@ from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 
 if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
+
+_SYNTHETIC_LANE_FOLD_UNSUPPORTED = (
+    "CuTe synthetic-lane K matmul fold only supports direct-load "
+    "operands whose contraction axis is the load's trailing dim"
+)
 
 
 def _requested_pure_matmul_role_lifecycle(ctx: LoweringContext) -> bool:
@@ -359,6 +367,7 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         lhs_node.meta["val"].shape[-1],
         rhs_node.meta["val"].shape[-2],
         rhs_node.meta["val"].shape[-1],
+        lhs_m_size=lhs_node.meta["val"].shape[-2],
     )
     if k_block_id is None and packed_rhs is not None:
         packed_nodes, _ = packed_rhs
@@ -429,6 +438,11 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
                 "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
                 "active-K-loop tcgen05 matmul lowering, not direct-mm fallback",
             )
+        # The direct warp-MMA path always yields its fp32 accumulator; round it
+        # to the declared (non-fp32) output dtype so a later widening cast
+        # observes the same bf16/fp16 result as every other matmul lowering.
+        if effective_out_dtype is not None and effective_out_dtype != torch.float32:
+            direct_mma_result = cast_ast(direct_mma_result, effective_out_dtype)
         return direct_mma_result
     serial_result = emit_cute_serial_scalar_mm_from_loads(
         ctx,
@@ -462,10 +476,12 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         _reject_tcgen05_flat_role_coordinates_fallback()
     lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
     if lane_fold_k is not None:
+        assert k_block_id is not None
         fold_result = emit_cute_synthetic_lane_fold_mm(
             ctx,
             lhs_node,
             rhs_node,
+            k_block_id=k_block_id,
             k_extent=lane_fold_k,
             acc=None,
             out_dtype=effective_out_dtype,
@@ -475,17 +491,13 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         )
         if fold_result is not None:
             return fold_result
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe synthetic-lane K matmul fold only supports direct-load operands",
-        )
+        raise exc.BackendUnsupported("cute", _SYNTHETIC_LANE_FOLD_UNSUPPORTED)
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
         rhs,
         accumulate_in_lane_loop=not cute_outer_accumulates_result(
-            node,
-            is_acc_none=True,
+            node, is_acc_none=True
         ),
         k_block_id=k_block_id,
         static_k_extent=static_k_extent,
@@ -494,6 +506,7 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         rhs_dtype=rhs_node.meta["val"].dtype,
         lhs_node=lhs_node,
         rhs_node=rhs_node,
+        fx_node=node,
     )
 
 
@@ -515,20 +528,21 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         )
     acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(acc, ast.AST)
-    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))
+    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad, CutePackedTerms))
     acc_node = node.args[0]
     lhs_node = node.args[1]
     rhs_node = node.args[2]
     assert isinstance(acc_node, Node)
     assert isinstance(lhs_node, Node)
     assert isinstance(rhs_node, Node)
-    assert isinstance(rhs, ast.AST)
+    assert isinstance(rhs, (ast.AST, CutePackedTerms))
     rhs, packed_rhs = cute_lower_rhs_for_matmul(ctx.env, lhs, rhs_node, rhs)
     k_block_id = cute_resolve_active_matmul_k_block_id(
         ctx.cg,
         lhs_node.meta["val"].shape[-1],
         rhs_node.meta["val"].shape[-2],
         rhs_node.meta["val"].shape[-1],
+        lhs_m_size=lhs_node.meta["val"].shape[-2],
     )
     if k_block_id is None and packed_rhs is not None:
         packed_nodes, _ = packed_rhs
@@ -541,6 +555,13 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if k_block_id is not None
         else cute_static_k_invariant_extent(lhs_node, rhs_node)
     )
+    from .collective_matmul import mark_collective_matmul
+
+    collective = mark_collective_matmul(
+        ctx, node, k_block_id=k_block_id, lhs=lhs, rhs=rhs, acc=acc
+    )
+    if collective is not None:
+        return collective
     env = CompileEnvironment.current()
     size_hint = getattr(env, "size_hint", None)
 
@@ -562,10 +583,12 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         )
     lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
     if lane_fold_k is not None:
+        assert k_block_id is not None
         fold_result = emit_cute_synthetic_lane_fold_mm(
             ctx,
             lhs_node,
             rhs_node,
+            k_block_id=k_block_id,
             k_extent=lane_fold_k,
             acc=acc,
             out_dtype=node.meta["val"].dtype if "val" in node.meta else None,
@@ -575,10 +598,7 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         )
         if fold_result is not None:
             return fold_result
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe synthetic-lane K matmul fold only supports direct-load operands",
-        )
+        raise exc.BackendUnsupported("cute", _SYNTHETIC_LANE_FOLD_UNSUPPORTED)
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
@@ -592,6 +612,7 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         lhs_node=lhs_node,
         rhs_node=rhs_node,
         acc_node=acc_node,
+        fx_node=node,
     )
 
 
@@ -728,7 +749,7 @@ def _maybe_codegen_cute_baddbmm_n_collapse(
             )
         return rematerialized
 
-    return _emit_cute_matmul_n_collapse(
+    result = _emit_cute_matmul_n_collapse(
         ctx.cg,
         lhs,
         rhs_at_n=rhs_at_n,
@@ -742,6 +763,10 @@ def _maybe_codegen_cute_baddbmm_n_collapse(
         lhs_node=lhs_node,
         rhs_node=rhs_node,
     )
+    from .completed_matmul_sum import record_completed_matmul_sum
+
+    record_completed_matmul_sum(ctx.cg, node, n_block_id, n_extent, result)
+    return result
 
 
 @baddbmm_lowering.register_codegen("cute")
@@ -776,6 +801,7 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         lhs_node.meta["val"].shape[-1],
         rhs_node.meta["val"].shape[-2],
         rhs_node.meta["val"].shape[-1],
+        lhs_m_size=lhs_node.meta["val"].shape[-2],
     )
     if k_block_id is None and packed_rhs is not None:
         packed_nodes, _ = packed_rhs
@@ -788,6 +814,13 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if k_block_id is not None
         else cute_static_k_invariant_extent(lhs_node, rhs_node)
     )
+    from .collective_matmul import mark_collective_matmul
+
+    collective = mark_collective_matmul(
+        ctx, node, k_block_id=k_block_id, lhs=lhs, rhs=rhs, acc=acc
+    )
+    if collective is not None:
+        return collective
     env = CompileEnvironment.current()
     size_hint = getattr(env, "size_hint", None)
 
@@ -822,10 +855,12 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         return n_collapse_result
     lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
     if lane_fold_k is not None:
+        assert k_block_id is not None
         fold_result = emit_cute_synthetic_lane_fold_mm(
             ctx,
             lhs_node,
             rhs_node,
+            k_block_id=k_block_id,
             k_extent=lane_fold_k,
             acc=acc,
             out_dtype=node.meta["val"].dtype if "val" in node.meta else None,
@@ -835,10 +870,7 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         )
         if fold_result is not None:
             return fold_result
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe synthetic-lane K matmul fold only supports direct-load operands",
-        )
+        raise exc.BackendUnsupported("cute", _SYNTHETIC_LANE_FOLD_UNSUPPORTED)
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
@@ -852,6 +884,7 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         lhs_node=lhs_node,
         rhs_node=rhs_node,
         acc_node=acc_node,
+        fx_node=node,
     )
 
 
@@ -923,6 +956,27 @@ def _cute_free_arange_axis_expr(
         _arange_endpoint_key(start),
         _arange_endpoint_key(step),
     )
+    # The key is taken from the arange's *first* memory-op user, so two
+    # distinct hl.arange() dims can still land on one axis (``rows``/``cols`` both
+    # loaded from equal-sized dims).  Within a single load/store that would
+    # address only the diagonal: refuse it rather than silently drop lanes.
+    # One arange reaching two index dims of a single access is the same
+    # collapse: Helion indexes two tensor entries as a cartesian tile, so
+    # ``x[r.unsqueeze(1), r.unsqueeze(0)]`` and ``x[r + 1, r + 2]`` both need a
+    # second lane coordinate that this arange's one axis cannot provide.
+    positions = cg.cute_synthetic_arange_access_positions
+    claimed: set[Node] = set()
+    for access, position in cute_free_arange_memory_index_positions(source_node):
+        if (
+            access in claimed
+            or positions.setdefault((access, key), position) != position
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "two index dims of one load/store share a free hl.arange lane; "
+                "the SIMT lowering addresses one lane coordinate per thread axis",
+            )
+        claimed.add(access)
     return cg.allocate_cute_synthetic_arange_coord(key, length_hint)
 
 
@@ -974,6 +1028,7 @@ def _cute_iota_expr(
     from ..generate_ast import GenerateAST
     from .cute_reshape import _get_dim_local_coord
     from .cute_reshape import _grid_local_coord_expr
+    from .cute_reshape import _resolve_tile_extent
 
     assert isinstance(ctx.cg, GenerateAST)
     cg = ctx.cg
@@ -985,10 +1040,8 @@ def _cute_iota_expr(
 
     env = CompileEnvironment.current()
     length_hint: int | None = None
-    if isinstance(length_arg, int):
-        length_hint = length_arg
-    elif isinstance(length_arg, torch.SymInt):
-        length_hint = env.size_hint(length_arg)
+    if isinstance(length_arg, (int, torch.SymInt)):
+        length_hint = _resolve_tile_extent(length_arg, env, cg.device_function.config)
 
     def active_iota_expr() -> ast.AST | None:
         active_block_ids: list[int] = []
@@ -1136,8 +1189,9 @@ def _cute_iota_expr(
     if "val" in source_node.meta:
         fake_val = source_node.meta["val"]
         if isinstance(fake_val, torch.Tensor) and fake_val.ndim == 1:
-            with contextlib.suppress(Exception):
-                length_hint = int(fake_val.shape[0])
+            length_hint = _resolve_tile_extent(
+                fake_val.shape[0], env, cg.device_function.config
+            )
             local_coord = _get_dim_local_coord(cg, fake_val, 0)
             if local_coord != "cutlass.Int32(0)":
                 expr = local_coord
@@ -1154,6 +1208,18 @@ def _cute_iota_expr(
                 )
             if block_id is None:
                 block_id = env.resolve_block_id(fake_val.shape[0])
+            if block_id is None and isinstance(fake_val.shape[0], torch.SymInt):
+                extent_expr = fake_val.shape[0].node._expr
+                if isinstance(extent_expr, sympy.Expr) and any(
+                    env.get_block_id(symbol) is not None
+                    for symbol in extent_expr.free_symbols
+                ):
+                    # Matching an unrelated axis by its selected integer size
+                    # loses the symbolic owner of a derived tile dimension.
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "iota of a derived tile extent requires a proven active coordinate",
+                    )
             if block_id is None and cg.current_grid_state is not None:
                 grid_candidates = [
                     candidate

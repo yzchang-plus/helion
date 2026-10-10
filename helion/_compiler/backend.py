@@ -77,6 +77,9 @@ class FlashSearchSurface(NamedTuple):
     standard_causal_output: bool
     output_requires_tma: bool
     supports_tensor_4d_tma: bool
+    has_row_epilogue: bool
+    plain_row_body: bool
+    has_score_modifiers: bool
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -105,6 +108,21 @@ class LauncherInfo:
     # ``helion.runtime.<fn>`` runtime helpers the generated host wrapper calls
     # (besides the launcher); the shim re-exports these so the body runs verbatim.
     runtime_helper_names: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
+class AutotuneGridPolicy:
+    """How a backend limits grid-shaped autotune candidates.
+
+    ``raise_independent_axis_block_size_minimums`` applies the legacy
+    search-space heuristic that limits each grid axis separately.
+    ``max_programs_per_root_grid`` enables a coupled candidate check on the
+    product of all axes in each root grid. Backends may select either policy or
+    both explicitly.
+    """
+
+    raise_independent_axis_block_size_minimums: bool = True
+    max_programs_per_root_grid: int | None = None
 
 
 def read_launcher_source(module_name: str) -> str:
@@ -280,6 +298,14 @@ class Backend(abc.ABC):
         """
         return None
 
+    def collective_owns_tile(self, fn: DeviceFunction, block_id: int) -> bool:
+        """Whether a typed physical collective owns an axis's element coordinates."""
+        return False
+
+    def codegen_config(self, config: Config) -> Config:
+        """Resolve a backend-owned physical schedule without mutating search input."""
+        return config
+
     def config_value_priors(self, config_spec: ConfigSpec) -> dict[str, ValuePrior]:
         """Per-config-key priors that bias the autotuner's random exploration.
 
@@ -293,6 +319,20 @@ class Backend(abc.ABC):
         uniformly. The default is no bias.
         """
         return {}
+
+    def autotune_config_is_viable(
+        self, config_spec: ConfigSpec, config: Config
+    ) -> bool:
+        """Return whether an automatically generated config is worth compiling.
+
+        This hook only screens candidates produced during autotuning. An explicit
+        fixed config still reaches normal backend validation and compilation.
+        """
+        return True
+
+    def autotune_grid_policy(self, config_spec: ConfigSpec) -> AutotuneGridPolicy:
+        """Return how autotuning should limit grid-shaped candidates."""
+        return AutotuneGridPolicy()
 
     @abc.abstractmethod
     def dtype_str(self, dtype: torch.dtype) -> str:
@@ -410,6 +450,16 @@ class Backend(abc.ABC):
         """
         return requested
 
+    def reduction_block_size_is_inlined_constexpr(self) -> bool:
+        """Whether the reduction-loop block size is inlined as a module-level
+        literal instead of a constexpr kernel param.
+
+        FlyDSL's scf.for step must be a value produced inside the loop, not an
+        external constexpr param, so it inlines the block size as a literal.
+        Other backends return False and use a constexpr kernel param.
+        """
+        return False
+
     def create_synthetic_reduction_lanes(
         self,
         thread_count: int,
@@ -445,6 +495,14 @@ class Backend(abc.ABC):
         """Whether reduction strategies should occupy the first (lowest) thread axes."""
         return False
 
+    def supports_lane_loop_reductions(self) -> bool:
+        """Whether reductions may be carried by a tile strategy's lane loop."""
+        return False
+
+    def validate_reduction_input(self, block_index: int, value: torch.Tensor) -> None:
+        """Validate a value before lowering its reduction."""
+        return None
+
     def force_tile_mask(self) -> bool:
         """Whether tile strategies must emit explicit masks for all tiles."""
         return False
@@ -462,6 +520,16 @@ class Backend(abc.ABC):
         ``ptr + 0`` (discarded anyway).
         """
         return False
+
+    def reference_override(
+        self, function: object, args: tuple[object, ...]
+    ) -> tuple[bool, object]:
+        """Optional backend semantic policy for a public operation's reference."""
+        return False, None
+
+    def validate_implicit_rng_reference(self) -> None:
+        """Validate implicit RNG support under the selected semantic policy."""
+        return None
 
     def supports_config_key(self, key: str) -> bool:
         from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
@@ -545,6 +613,14 @@ class Backend(abc.ABC):
         this to return their own function.
         """
         return None
+
+    def probe_long_autotune_kernels(self, config_spec: ConfigSpec) -> bool:
+        """Whether candidate timing should first probe for a long-running kernel.
+
+        The probe avoids repeatedly executing a candidate whose first measured
+        call already exceeds the benchmark's warmup and measurement windows.
+        """
+        return False
 
     def get_interleaved_bench(
         self,
@@ -698,6 +774,67 @@ class Backend(abc.ABC):
     ) -> str:
         raise exc.BackendUnsupported(self.name, "full tensor creation")
 
+    def reduction_acc_init_expr(
+        self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
+    ) -> str:
+        """Initial value of a rolled reduction's per-thread accumulator.
+
+        Separate from :meth:`full_expr` because the accumulator must be as wide
+        as the backend's combine expression, which may promote (Metal reduces
+        ``int8``/``bool`` in an ``int``).  Declaring it at storage width would
+        truncate on every loop iteration.
+        """
+        return self.full_expr(shape_dims, value_expr, dtype)
+
+    def looped_reduction_thread_count(
+        self,
+        *,
+        requested: int,
+        block_size: int,
+        block_index: int,
+        config: Config,
+        config_spec: ConfigSpec,
+    ) -> int | None:
+        """Backend override for the per-block thread count of a looped whole-row
+        reduction.
+
+        Return None to keep the default (``requested``). Tile-level backends
+        return None.
+        """
+        return None
+
+    def register_reduction_loop_config_slots(
+        self,
+        env: CompileEnvironment,
+        block_id: int,
+        size_hint: int,
+    ) -> None:
+        """Register backend-specific config-spec slots for a rollable reduction dim.
+
+        Called once per rollable rdim during device_ir analysis, after the shared
+        ``ReductionLoopSpec`` has been appended. Default: no-op. Backends that need
+        additional tuning knobs per reduction block (e.g. flydsl's
+        ``cute_vector_widths``) override this instead of adding a name-check in
+        device_ir.
+        """
+        return
+
+    def wrap_reduction_accumulator(
+        self,
+        acc_full: str,
+        *,
+        thread_count: int,
+        loop_block_size: int,
+        acc_dtype: torch.dtype,
+    ) -> str:
+        """Wrap the looped-reduction accumulator init expression, if needed.
+
+        FlyDSL's runtime scf.for carries the accumulator as an iter_arg whose init
+        type must match the per-thread vector the loop body yields, so it wraps
+        the scalar seed in ``fx.Vector.filled(...)``. Identity by default.
+        """
+        return acc_full
+
     def reshape_expr(self, expr: str, shape: str) -> str:
         raise exc.BackendUnsupported(self.name, "reshape")
 
@@ -778,7 +915,15 @@ class Backend(abc.ABC):
         *,
         block_size_var: str | None = None,
         threads_in_group: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> str:
+        """Generate the cross-thread reduction expression.
+
+        ``dtype`` is the accumulation dtype
+        (``get_computation_dtype(input.dtype)``) when the caller knows it.
+        Backends that allocate typed scratch storage for the reduction (e.g.
+        Metal's ``threadgroup`` buffers) need it; the rest ignore it.
+        """
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
     def thread_linear_index_expr(self, axis_sizes: dict[int, int]) -> str | None:
@@ -812,7 +957,13 @@ class Backend(abc.ABC):
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
         threads_in_group: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> str:
+        """Generate the cross-thread argmin/argmax expression.
+
+        ``dtype`` is the accumulation dtype of the *value* operand; see
+        :meth:`reduction_expr`.
+        """
         raise exc.BackendUnsupported(self.name, "argmin/argmax reductions")
 
     def argreduce_loop_update_statements(
@@ -823,7 +974,13 @@ class Backend(abc.ABC):
         acc_index: str,
         value: str,
         index: str,
+        dtype: torch.dtype | None = None,
     ) -> list[str]:
+        """Per-iteration accumulator update for a rolled argmin/argmax.
+
+        ``dtype`` is the accumulation dtype of the value operand; see
+        :meth:`reduction_expr`.
+        """
         raise exc.BackendUnsupported(self.name, "argmin/argmax reductions")
 
     def inductor_op_overrides(self) -> InductorOpOverrides:
@@ -834,6 +991,26 @@ class Backend(abc.ABC):
             self.cast_expr("{x}", self.dtype_str(target_dtype)),
             x=x,
         )
+
+    def cast_scalar_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        """Cast a plain scalar (e.g. a bare number lifted from an index expr) to
+        ``target_dtype``.
+
+        Defaults to ``cast_ast``. Backends that write casts as ``value.to(dtype)``
+        must override this, because a bare number has no ``.to()`` method --
+        FlyDSL, for example, uses ``fx.Float16(5)`` instead.
+        """
+        return self.cast_ast(x, target_dtype)
+
+    def expands_broadcast_dims(self) -> bool:
+        """Whether the backend needs Triton-style ``[None, :]`` broadcast-expand
+        of sub-rank tensors.
+
+        Tile-level backends (Triton, etc.) broadcast-expand a sub-rank operand up
+        to the output rank. Backends whose per-thread vectors carry the tile/row
+        axis implicitly (e.g. FlyDSL) return False to skip the expansion.
+        """
+        return True
 
     @property
     @abc.abstractmethod
@@ -947,8 +1124,11 @@ class Backend(abc.ABC):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
 
-    def effective_num_warps(self, config: Config) -> int:
-        """Return the warp count the backend will actually launch."""
+    def effective_num_warps(self, config: Config) -> int | None:
+        """Return the warp count the backend will actually launch.
+
+        ``None`` defers the choice to the Triton driver (NPU auto-bind).
+        """
         return config.num_warps
 
     def customize_ast(self, hf: HostFunction) -> None:
@@ -1005,6 +1185,12 @@ class Backend(abc.ABC):
         """
         return host_str
 
+    def tensor_descriptor_host_base(
+        self, fake_value: torch.Tensor, host_str: str
+    ) -> str:
+        """Return the host tensor expression used to construct a descriptor."""
+        return host_str
+
     def scalar_arg_preamble(self, arg: Argument) -> list[ast.AST]:
         """Generate preamble statements for scalar arguments in the device function.
 
@@ -1052,11 +1238,19 @@ class Backend(abc.ABC):
         contraction = cute_matmul_contraction_block_ids()
         if not contraction:
             return set()
-        return {
-            info.block_id
-            for info in env.block_sizes
-            if info.reduction and canonical_block_id(info.block_id) in contraction
-        }
+        result: set[int] = set()
+        for info in env.block_sizes:
+            if not info.reduction:
+                continue
+            block_id = canonical_block_id(info.block_id)
+            # Reduction lowering may materialize an output-range block whose
+            # extent aliases an already-active *tile* block.  Such an alias
+            # reuses the tile strategy and must not reserve a second copy of
+            # the contraction threads.  Canonical reduction aliases, on the
+            # other hand, still need one (deduplicated) reserve.
+            if block_id in contraction and env.block_sizes[block_id].reduction:
+                result.add(block_id)
+        return result
 
     def _cute_matmul_contraction_thread_reserve(
         self, fn: DeviceFunction, tile_block_ids: list[int]
@@ -2899,6 +3093,23 @@ def _attention_softmax_pattern_head_dim(
     return AttentionSoftmaxPattern(score_plan=score_plan, io_dtype=operand_dtype)
 
 
+def _flash_block_sizes_reachable(
+    env: CompileEnvironment, targets: dict[int, int]
+) -> bool:
+    """True when every block id's fragment range can reach its flash target."""
+    from ..autotuner.config_fragment import BlockSizeFragment
+
+    if set(env.config_spec.block_sizes.valid_block_ids()) != set(targets):
+        return False
+    for block_id, target in targets.items():
+        block_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+        fragment = block_spec._fragment(env.config_spec)
+        assert isinstance(fragment, BlockSizeFragment)
+        if not fragment.low <= target <= fragment.high:
+            return False
+    return True
+
+
 def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | None:
     """Config-independent flash detector for the autotune search surface.
 
@@ -2909,7 +3120,6 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
     strict prevents the autotuner from benchmarking configs that can only fall
     back to the scalar path after the flash knobs have been added.
     """
-    from ..autotuner.config_fragment import BlockSizeFragment
     from .compile_environment import CompileEnvironment
     from .device_ir import ForLoopGraphInfo
 
@@ -2925,15 +3135,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
     env = CompileEnvironment.current()
 
     def block_sizes_reachable(targets: dict[int, int]) -> bool:
-        if set(env.config_spec.block_sizes.valid_block_ids()) != set(targets):
-            return False
-        for block_id, target in targets.items():
-            block_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
-            fragment = block_spec._fragment(env.config_spec)
-            assert isinstance(fragment, BlockSizeFragment)
-            if not fragment.low <= target <= fragment.high:
-                return False
-        return True
+        return _flash_block_sizes_reachable(env, targets)
 
     flash_surface: FlashSearchSurface | None = None
     generic_fallback_required = False
@@ -2952,6 +3154,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
             continue
         from .cute.cute_flash import _flash_output_requires_tma
         from .cute.cute_flash import flash_attention_graph_lse_plan_valid_from_graphs
+        from .cute.cute_flash import flash_attention_graph_row_epilogue_from_graphs
         from .cute.cute_flash import (
             flash_attention_graph_small_biased_candidate_from_graphs,
         )
@@ -3004,6 +3207,12 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 kv_block_id=block_ids[0],
                 score_plan=pattern.score_plan,
             )
+        )
+        has_row_epilogue = flash_attention_graph_row_epilogue_from_graphs(
+            device_ir.graphs,
+            root_block_ids=root_grid_ids,
+            kv_block_id=block_ids[0],
+            score_plan=pattern.score_plan,
         )
         tensor_4d_batch_heads = flash_attention_graph_tensor_4d_batch_heads_from_graphs(
             device_ir.graphs,
@@ -3071,6 +3280,13 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 standard_causal_output=standard_causal_output,
                 output_requires_tma=output_requires_tma,
                 supports_tensor_4d_tma=supports_tensor_4d_tma,
+                has_row_epilogue=has_row_epilogue,
+                # The 64-row query tile exists only for plain rows.
+                plain_row_body=(
+                    not pattern.score_plan.modifiers and not has_row_epilogue
+                ),
+                # The row programs take a fused row epilogue but no modifier.
+                has_score_modifiers=bool(pattern.score_plan.modifiers),
             )
     if generic_fallback_required:
         env.config_spec.enable_cute_attention_generic_fallback(
@@ -3097,6 +3313,7 @@ def _grouped_rank3_specialized_mma_plan(
 ) -> _SpecializedMmaPlan | None:
     from .cute.cute_mma import _choose_mma_impl
     from .cute.cute_mma import _rank3_grouped_root_axes
+    from .cute.grouped_row_union import physical_schedule
     from .host_function import HostFunction
 
     if node.target is not torch.ops.aten.addmm.default:
@@ -3171,8 +3388,10 @@ def _grouped_rank3_specialized_mma_plan(
         and worklist_profile is None
     ):
         return None
-    if worklist_profile is not None:
-        mma_bm, mma_bn = worklist_profile.mma_m, worklist_profile.mma_n
+    row_profile = physical_schedule(config)
+    collective_profile = row_profile or worklist_profile
+    if collective_profile is not None:
+        mma_bm, mma_bn = collective_profile.mma_m, collective_profile.mma_n
     mma_impl = _choose_mma_impl(
         lhs_val.dtype,
         bm=mma_bm,
@@ -3180,7 +3399,7 @@ def _grouped_rank3_specialized_mma_plan(
         bk=bk,
         config=config,
         input_device=lhs_val.device,
-        defer_grouped_worklist_smem_check=worklist_profile is not None,
+        defer_grouped_worklist_smem_check=collective_profile is not None,
     )
     if mma_impl != "tcgen05":
         return None
@@ -3201,7 +3420,7 @@ def _analyzed_specialized_mma_plan(
     from .cute.cute_mma import analyze_cute_mma_node
     from .cute.cute_mma import ensure_tcgen05_fragment_epilogue_plan
 
-    candidate = analyze_cute_mma_node(node)
+    candidate = analyze_cute_mma_node(node, graphs=fn.codegen.codegen_graphs)
     if (
         candidate is None
         or candidate.requires_accumulator_seed

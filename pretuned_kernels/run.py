@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Run every pretuned kernel's benchmark sweep and emit aggregate metrics as JSON.
 
-Drives the nightly pretuned-kernel dashboard pipeline. Each kernel module under
-``pretuned_kernels/<name>/<name>.py`` defines a ``main()`` that benchmarks its
-checked-in Helion heuristic against one or more reference baselines and returns
-aggregate metrics::
+Drives the nightly pretuned-kernel dashboard pipeline. Each registered kernel
+module defines a ``main()`` that benchmarks its checked-in Helion heuristic
+against one or more reference baselines and returns aggregate metrics::
 
     {"helion_wins": .., "total": .., "geomean": .., "best_speedup": ..,
      "baselines": {"name": {..}}}
@@ -60,6 +59,13 @@ KERNELS = [
     "rms_norm_per_block_quant",
     "silu_and_mul_per_block_quant",
     "fused_qk_norm_rope",
+    # Fixed-shape model regions compiled as one Triton kernel.
+    "kda_decode",
+    "qwen3_decode_layer",
+    "gemma4_a4b_moe",
+    "gpt_oss_moe",
+    "flash_mla",
+    "deepseek_v3_moe_nvfp4",
     # External grouped references compile substantial CuTe/DeepGEMM code.
     "grouped_gemm",
     "grouped_gemm_deepgemm",
@@ -68,6 +74,11 @@ KERNELS = [
 # Map a compute capability (heuristic file suffix) to a hardware alias. The
 # nightly runs one GPU per alias.
 _HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200"}
+
+
+def _kernel_directory(name: str) -> Path:
+    megakernel = PRETUNED_KERNELS_DIR / "megakernels" / name
+    return megakernel if megakernel.is_dir() else PRETUNED_KERNELS_DIR / name
 
 
 def parse_kernel_names(value: str) -> list[str]:
@@ -92,7 +103,7 @@ def _supported_hardware(name: str) -> set[str]:
     single source of truth -- no per-kernel declaration to keep in sync.
     """
     hardware = set()
-    for path in (PRETUNED_KERNELS_DIR / name).glob(f"_helion_aot_{name}_cuda_sm*.py"):
+    for path in _kernel_directory(name).glob(f"_helion_aot_{name}_cuda_sm*.py"):
         match = re.search(r"_cuda_(sm\d+)\.py$", path.name)
         if match:
             hardware.add(_HARDWARE_BY_COMPUTE.get(match.group(1), match.group(1)))
@@ -104,7 +115,7 @@ def _import_kernel_module(name: str) -> ModuleType:
     # global-scope resolution would try to import) that avoids clashing with
     # examples/<name>.py.
     module_name = f"_helion_pretuned_run_{name}"
-    file_path = PRETUNED_KERNELS_DIR / name / f"{name}.py"
+    file_path = _kernel_directory(name) / f"{name}.py"
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

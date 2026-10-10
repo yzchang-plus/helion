@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
 from unittest import mock
 
+import pytest
 import torch
 
 import helion
+from helion._compat import supports_host_tensor_descriptor
+from helion._compiler import cross_loop_codegen
+from helion._compiler import cross_loop_scheduler
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cross_loop_codegen import _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
 from helion._compiler.cross_loop_codegen import _ast_fingerprint
@@ -17,8 +22,13 @@ from helion._compiler.cross_loop_codegen import _clone_opaque_statements
 from helion._compiler.cross_loop_codegen import (
     _clone_opaque_statements_with_loop_segments,
 )
+from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_scope
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
+from helion._compiler.tile_dependency import CoordinateRelation
+from helion._compiler.tile_dependency import DenseTaskOrder
+from helion._compiler.tile_dependency import Incidence
+from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -26,7 +36,25 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
+from helion._testing import skipUnlessTensorDescriptor
+from helion.autotuner.benchmark_provider import _triton_compile
 import helion.language as hl
+from helion.runtime.triton.launcher import compile_only_launch_args
+
+
+def _generated_function(code: str, name: str) -> ast.FunctionDef:
+    matches = [
+        node
+        for node in ast.parse(code).body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    if len(matches) != 1:
+        raise AssertionError(f"expected one generated function {name!r}")
+    return matches[0]
+
+
+def _call_name(node: ast.Call) -> str | None:
+    return node.func.id if isinstance(node.func, ast.Name) else None
 
 
 @helion.kernel(
@@ -260,6 +288,22 @@ def prewait_singleton_reduction(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def fixed_block_dense_span_chain(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    y = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(n, block_size=16):
+        y[tile] = x[tile] + 1
+    for row in hl.tile(n // 16, block_size=1):
+        columns = row.begin * 16 + hl.arange(16)
+        out[columns] = y[columns] * 2
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def streamed_sibling_reductions(x: torch.Tensor) -> torch.Tensor:
     """Exercise two independently ready nested sites in one consumer root task."""
     batch, width = x.size()
@@ -300,6 +344,75 @@ def nested_store_chain(x: torch.Tensor) -> torch.Tensor:
             tmp[producer_batch, producer_width] = x[producer_batch, producer_width] + 1
     for consumer_batch, consumer_width in hl.tile([batch, width], block_size=[1, 16]):
         out[consumer_batch, consumer_width] = tmp[consumer_batch, consumer_width] * 2
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def conditional_payload_completion_chain(
+    x: torch.Tensor,
+    active_children: torch.Tensor,
+) -> torch.Tensor:
+    """Use an unconditional completion value to cover conditional payloads."""
+    groups, fan_in, width = x.size()
+    payload = torch.empty_like(x)
+    completion = torch.empty((groups, fan_in), dtype=torch.int32, device=x.device)
+    out = torch.empty((groups, width), dtype=torch.float32, device=x.device)
+
+    for producer_group, producer_child, producer_width in hl.tile(
+        [groups, fan_in, width], block_size=[1, 1, 32]
+    ):
+        active = hl.load(active_children, [producer_group.begin])
+        if producer_child.begin < active:
+            payload[producer_group, producer_child, producer_width] = (
+                x[producer_group, producer_child, producer_width] + 1
+            )
+        completion[producer_group, producer_child] = 1
+
+    for consumer_group, consumer_width in hl.tile([groups, width], block_size=[1, 32]):
+        completed = torch.zeros([], dtype=torch.int32, device=x.device)
+        for ready_child in hl.tile(fan_in, block_size=1):
+            completed = completed + completion[consumer_group.begin, ready_child.begin]
+        active = hl.load(active_children, [consumer_group.begin])
+        acc = hl.zeros([consumer_width], dtype=torch.float32)
+        child = torch.zeros([], dtype=torch.int32, device=x.device)
+        while (child < active) & (completed == fan_in):
+            acc = acc + payload[consumer_group.begin, child, consumer_width]
+            child = child + 1
+        out[consumer_group.begin, consumer_width] = acc
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def nested_early_completion_chain(x: torch.Tensor) -> torch.Tensor:
+    """Do not let nested completion cover a later access in its parent."""
+    batch, width = x.size()
+    payload = torch.empty_like(x)
+    completion = torch.empty_like(x, dtype=torch.int32)
+    out = torch.empty_like(x)
+
+    for producer_batch, producer_width in hl.tile([batch, width], block_size=[1, 32]):
+        for _marker in hl.tile(1, block_size=1):
+            completion[producer_batch.begin, producer_width] = 1
+        payload[producer_batch.begin, producer_width] = (
+            x[producer_batch.begin, producer_width] + 1
+        )
+
+    for consumer_batch, consumer_width in hl.tile([batch, width], block_size=[1, 32]):
+        completed = torch.zeros([], dtype=torch.int32, device=x.device)
+        for _ready in hl.tile(1, block_size=1):
+            completed = completed + torch.sum(
+                completion[consumer_batch.begin, consumer_width]
+            ).to(torch.int32)
+        if completed == consumer_width.block_size:
+            out[consumer_batch.begin, consumer_width] = payload[
+                consumer_batch.begin, consumer_width
+            ]
     return out
 
 
@@ -525,6 +638,137 @@ def mixed_radix_continuation(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def runtime_bound_store_chain(
+    x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+) -> torch.Tensor:
+    rows, columns = x.size()
+    tmp = torch.zeros_like(x)
+    out = torch.empty([rows], dtype=x.dtype, device=x.device)
+    for producer_tile in hl.tile(rows, block_size=1):
+        row = producer_tile.begin
+        for column in hl.grid(starts[row], ends[row]):
+            tmp[row, column] = x[row, column] * 2
+    for consumer_tile in hl.tile(rows, block_size=1):
+        out[consumer_tile] = torch.sum(tmp[consumer_tile, :], dim=-1)
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def runtime_bound_loop_chain(
+    x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+) -> torch.Tensor:
+    rows, columns = x.size()
+    tmp = torch.empty([rows], dtype=x.dtype, device=x.device)
+    out = torch.empty([rows], dtype=x.dtype, device=x.device)
+    for producer_tile in hl.tile(rows, block_size=1):
+        row = producer_tile.begin
+        acc = hl.zeros([1], dtype=torch.float32)
+        for column in hl.grid(starts[row], ends[row]):
+            acc = acc + x[row, column]
+        tmp[producer_tile] = acc
+    for consumer_tile in hl.tile(rows, block_size=1):
+        out[consumer_tile] = tmp[consumer_tile] * 2
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def split_merge_chain(x: torch.Tensor) -> torch.Tensor:
+    keys, splits = x.size()
+    partial = torch.empty_like(x)
+    out = torch.empty([keys], dtype=x.dtype, device=x.device)
+    for key_tile, split_tile in hl.tile([keys, splits], block_size=[1, 1]):
+        partial[key_tile, split_tile] = x[key_tile, split_tile] * 2
+    for key_tile in hl.tile(keys, block_size=1):
+        out[key_tile] = torch.sum(partial[key_tile, :], dim=-1)
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def conditional_split_merge_chain(
+    x: torch.Tensor, active: torch.Tensor, early: hl.constexpr
+) -> torch.Tensor:
+    keys, rows, splits = x.size()
+    partial = torch.empty_like(x)
+    lse = torch.empty_like(x)
+    out = torch.empty([keys, rows], dtype=x.dtype, device=x.device)
+    for key_tile, split_tile in hl.tile([keys, splits], block_size=[1, 1]):
+        key = key_tile.begin
+        split = split_tile.begin
+        partial[key, :, split] = x[key, :, split] * 2
+        lse[key, :, split] = x[key, :, split] + 1
+    for merge_tile in hl.tile(keys, block_size=1):
+        merge_key = merge_tile.begin
+        top = lse[merge_key, :, 0]
+        for index in hl.static_range(1, splits):
+            top = torch.maximum(top, lse[merge_key, :, index])
+        acc = hl.zeros([rows], dtype=torch.float32)
+        for rank in hl.static_range(early):
+            acc = acc + partial[merge_key, :, rank] * (lse[merge_key, :, rank] - top)
+        # Every split is read twice; the late ones only under a runtime branch.
+        if active[0] > early:
+            for late in hl.static_range(early, splits):
+                weight = lse[merge_key, :, late] - top
+                acc = acc + partial[merge_key, :, late] * weight
+        out[merge_key, :] = acc
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def split_merge_then_independent(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    keys, splits = x.size()
+    partial = torch.empty_like(x)
+    out = torch.empty([keys], dtype=x.dtype, device=x.device)
+    side = torch.empty_like(y)
+    other = torch.empty_like(z)
+    for key_tile, split_tile in hl.tile([keys, splits], block_size=[1, 1]):
+        partial[key_tile, split_tile] = x[key_tile, split_tile] * 2
+    for key_tile in hl.tile(keys, block_size=1):
+        out[key_tile] = torch.sum(partial[key_tile, :], dim=-1)
+    for side_tile in hl.tile(y.size(0), block_size=1):
+        side[side_tile] = y[side_tile] + 1
+    for other_tile in hl.tile(z.size(0), block_size=1):
+        other[other_tile] = z[other_tile] - 1
+    return out, side, other
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def split_independent_merge(
+    x: torch.Tensor, z: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    keys, splits = x.size()
+    partial = torch.empty_like(x)
+    out = torch.empty([keys], dtype=x.dtype, device=x.device)
+    other = torch.empty_like(z)
+    for key_tile, split_tile in hl.tile([keys, splits], block_size=[1, 1]):
+        partial[key_tile, split_tile] = x[key_tile, split_tile] * 2
+    for other_tile in hl.tile(z.size(0), block_size=1):
+        other[other_tile] = z[other_tile] - 1
+    for key_tile in hl.tile(keys, block_size=1):
+        out[key_tile] = torch.sum(partial[key_tile, :], dim=-1)
+    return out, other
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def specialized_quotient_chain(
     x: torch.Tensor,
     numerator: int,
@@ -544,6 +788,18 @@ def specialized_quotient_chain(
 
 
 class TestCrossLoopCodegenHelpers(TestCase):
+    def test_blackwell_dot_root_stays_in_kernel_scope(self) -> None:
+        dot_body = ast.parse("acc = tl.dot(lhs, rhs, acc=acc)\n").body
+        scaled_body = ast.parse(
+            "acc = tl.dot_scaled(lhs, lhs_scale, 'e4m3', rhs, rhs_scale, 'e4m3')\n"
+        ).body
+        ordinary_body = ast.parse("value = tl.load(pointer)\n").body
+
+        self.assertTrue(_triton_root_requires_kernel_scope(dot_body, (10, 0)))
+        self.assertTrue(_triton_root_requires_kernel_scope(scaled_body, (10, 0)))
+        self.assertFalse(_triton_root_requires_kernel_scope(dot_body, (9, 0)))
+        self.assertFalse(_triton_root_requires_kernel_scope(ordinary_body, (10, 0)))
+
     def test_opaque_tile_body_clone_is_structurally_identical(self) -> None:
         body = ast.parse("value = value * 2\nout[index] = value\n").body
         cloned = _clone_opaque_statements(body)
@@ -658,6 +914,13 @@ class TestCrossLoopCodegenHelpers(TestCase):
 
 @onlyBackends(["triton"])
 class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
+    def assertUsesExactReadiness(self, code: str) -> None:
+        self.assertTrue(
+            "tile_dependency_continuation_previous" in code
+            or "tile_dependency_readiness_wait" in code,
+            "expected a final-arrival continuation or an exact readiness wait",
+        )
+
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_nested_producer_iterations_publish_readiness(self) -> None:
@@ -680,7 +943,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     nested_store_chain,
                     (x,),
                     pid_type="persistent_blocked",
-                    cross_loop_schedule="static_pipeline",
+                    cross_loop_pipeline="static",
                     num_sm_multiplier=1,
                     **extra_config,
                 )
@@ -693,44 +956,576 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_nested_loop_can_consume_and_publish_readiness(self) -> None:
+    def test_dynamic_pipeline_preserves_nested_readiness(self) -> None:
         x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
         code, out = code_and_output(
             nested_load_store_chain,
             (x,),
             block_sizes=[1, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="dynamic",
             num_sm_multiplier=1,
             num_warps=1,
         )
 
         torch.testing.assert_close(out, (x + 1) * 2 + 3)
+        self.assertIn("tile_dependency_raw_dispatch_ticket", code)
         self.assertIn("tile_dependency_nested_loop_wait", code)
         self.assertIn("tile_dependency_readiness_wait", code)
+        self.assertNotIn("_minimum_resident_programs=", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_dynamic_pipeline_precompiles_without_launcher_state(self) -> None:
+        x = torch.zeros(1, 4096, device=DEVICE)
+        bound = nested_load_store_chain.bind((x,))
+        config = helion.Config(
+            block_sizes=[1, 16],
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+        compiled = bound.compile_config(config)
+        # The precompiler gets placeholders for the launcher-owned state.
+        self.assertTrue(_triton_compile(compiled, (x,), config, bound))
+
+    @skipIfRefEager("compile-only launcher arguments have no eager reference")
+    def test_compile_only_launch_args_mirror_launcher_state(self) -> None:
+        x = torch.zeros(4)
+        self.assertEqual(
+            compile_only_launch_args(3, num_warps=4, _minimum_resident_programs=2),
+            ((3,), {"num_warps": 4}),
+        )
+        args, kwargs = compile_only_launch_args(
+            x,
+            num_warps=4,
+            _remote_barrier_signal_slots_per_program=1,
+            _remote_copy_scratch_specs=((x.half(), 8),),
+            _persistent_state_specs=(
+                (x, 2, torch.uint32, False),
+                (x, 3, torch.uint64, True),
+            ),
+            _persistent_state_process_group_name="group",
+        )
+        self.assertEqual(
+            [arg.dtype for arg in args[1:]],
+            [torch.int64, torch.float16, torch.uint32, torch.uint64, torch.int64],
+        )
+        self.assertEqual(kwargs, {"num_warps": 4})
+
+    @skipIfNotCUDA()
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_dynamic_pipeline_with_host_tensor_descriptors(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def two_stage(x: torch.Tensor) -> torch.Tensor:
+            tmp = torch.empty_like(x)
+            out = torch.empty_like(x)
+            for producer_m in hl.tile(x.size(0), block_size=32):
+                for producer_n in hl.tile(x.size(1), block_size=32):
+                    tmp[producer_m, producer_n] = x[producer_m, producer_n] + 1
+            for consumer_m, consumer_n in hl.tile(x.size(), block_size=[32, 32]):
+                out[consumer_m, consumer_n] = tmp[consumer_m, consumer_n] * 2
+            return out
+
+        x = torch.arange(64 * 128, device=DEVICE, dtype=torch.float32).reshape(64, 128)
+        for host_descriptors in (False, True):
+            if host_descriptors and not supports_host_tensor_descriptor():
+                continue
+            with self.subTest(host_descriptors=host_descriptors):
+                code, out = code_and_output(
+                    two_stage,
+                    (x,),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="dynamic",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                    range_num_stages=[0, 4, 0],
+                    indexing="tensor_descriptor",
+                    host_tensor_descriptors=host_descriptors,
+                )
+
+                torch.testing.assert_close(out, (x + 1) * 2)
+                if host_descriptors:
+                    self.assertIn("_helion_tensor_descriptor(", code)
+                    self.assertNotIn("tl.make_tensor_descriptor", code)
+                    self.assertIn("num_stages=4", code)
+                else:
+                    self.assertIn("tl.make_tensor_descriptor", code)
+                    self.assertNotIn("num_stages=4", code)
+                self.assertIn("tile_dependency_raw_dispatch_ticket", code)
+                self.assertIn("tile_dependency_root_0_scheduled_task", code)
+                self.assertNotIn("tile_dependency_root_barrier", code)
+                # The TMA store of tmp must complete before its release, and the
+                # consumer's TMA load of tmp must follow a proxy fence.
+                self.assertIn(
+                    "cp.async.bulk.wait_group 0; fence.proxy.async.global", code
+                )
+                self.assertIn("async_load_fence", code)
+
+    @skipIfNotCUDA()
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_middle_root_tma_store_drains_every_release(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def three_stage(x: torch.Tensor) -> torch.Tensor:
+            a = torch.empty_like(x)
+            b = torch.empty_like(x)
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[32, 32]):
+                a[tile_m, tile_n] = x[tile_m, tile_n] + 1
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[32, 32]):
+                b[tile_m, tile_n] = a[tile_m, tile_n] * 2
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[32, 32]):
+                out[tile_m, tile_n] = b[tile_m, tile_n] + 3
+            return out
+
+        x = torch.arange(64 * 128, device=DEVICE, dtype=torch.float32).reshape(64, 128)
+        # Continuations with fan-in 1 publish without atomics; keep every edge
+        # on the release path this test inspects.
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "choose_final_arrival_continuations",
+            return_value=(),
+        ):
+            code, out = code_and_output(
+                three_stage,
+                (x,),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="dynamic",
+                num_sm_multiplier=1,
+                num_warps=4,
+                # Only the store of b is a TMA store; every load uses pointers.
+                indexing=[
+                    "pointer",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "pointer",
+                    "pointer",
+                ],
+            )
+
+        torch.testing.assert_close(out, (x + 1) * 2 + 3)
+        self.assertIn(".store(", code)
+        lines = code.splitlines()
+        releases = [
+            i
+            for i, line in enumerate(lines)
+            if "sem='release'" in line or "sem='acq_rel'" in line
+        ]
+        self.assertTrue(releases)
+        # Walking back from each release must reach a drain before any store.
+        for i in releases:
+            for line in reversed(lines[:i]):
+                if "cp.async.bulk.wait_group 0;" in line:
+                    break
+                self.assertFalse(
+                    ".store(" in line or line.lstrip().startswith("def "),
+                    msg=f"release without a TMA drain: {lines[i].strip()}",
+                )
+
+        # Without a TMA access there is nothing to drain or fence.
+        code, out = code_and_output(
+            three_stage,
+            (x,),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=4,
+            indexing="pointer",
+        )
+        torch.testing.assert_close(out, (x + 1) * 2 + 3)
+        self.assertNotIn("fence.proxy.async", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_completion_relation_covers_conditional_indirect_payload(self) -> None:
+        x = torch.arange(
+            2 * 4 * 32,
+            device=DEVICE,
+            dtype=torch.float32,
+        ).reshape(2, 4, 32)
+        active_children = torch.tensor([4, 2], device=DEVICE, dtype=torch.int32)
+        code, out = code_and_output(
+            conditional_payload_completion_chain,
+            (x, active_children),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        expected = torch.stack(
+            (torch.sum(x[0, :4], dim=0) + 4, torch.sum(x[1, :2], dim=0) + 2)
+        )
+        torch.testing.assert_close(out, expected)
+        self.assertIn("tile_dependency_nested_loop_wait", code)
+        self.assertNotIn("tile_dependency_readiness_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_nested_completion_does_not_cover_later_parent_payload(self) -> None:
+        x = torch.arange(2 * 32, device=DEVICE, dtype=torch.float32).reshape(2, 32)
+        code, out = code_and_output(
+            nested_early_completion_chain,
+            (x,),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, x + 1)
+        self.assertIn("tile_dependency_nested_loop_wait", code)
+        # The later parent payload needs its own root-task readiness event; it
+        # cannot be covered by the earlier nested completion publication.
+        self.assertIn("tile_dependency_readiness_wait", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_dynamic_dispatch_uses_the_selected_local_order(self) -> None:
+        x = torch.arange(4 * 64, device=DEVICE, dtype=torch.float32).reshape(4, 64)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+
+        def build_with_transposed_producer_order(**kwargs: Any):
+            plan = original_build(**kwargs)
+            orders = list(plan.execution_orders)
+            domain = orders[0].tasks_by_ordinal.target_domain
+            replacement = DenseTaskOrder.from_pid(
+                domain, tuple(reversed(domain.axis_order))
+            )
+            assert replacement is not None
+            orders[0] = replacement
+            return dataclasses.replace(plan, execution_orders=tuple(orders))
+
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_with_transposed_producer_order,
+        ):
+            code, out = code_and_output(
+                cartesian_affine_chain,
+                (x,),
+                block_sizes=[1, 16, 1, 32],
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="dynamic",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        torch.testing.assert_close(out, (x + 1) * 2)
+        self.assertIn("tile_dependency_dispatch_ticket", code)
+        self.assertIn("tile_dependency_scheduled_pid_task", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_dynamic_kernel_scope_prefix_outlines_safe_suffix(self) -> None:
+        x = torch.arange(4 * 64, device=DEVICE, dtype=torch.float32).reshape(4, 64)
+        call_index = 0
+
+        def first_root_requires_kernel_scope(*_args: object) -> bool:
+            nonlocal call_index
+            result = call_index % 2 == 0
+            call_index += 1
+            return result
+
+        with (
+            mock.patch.object(
+                cross_loop_scheduler,
+                "choose_final_arrival_continuations",
+                return_value=(),
+            ),
+            mock.patch.object(
+                cross_loop_codegen,
+                "_triton_root_requires_kernel_scope",
+                side_effect=first_root_requires_kernel_scope,
+            ),
+        ):
+            code, out = code_and_output(
+                cartesian_affine_chain,
+                (x,),
+                block_sizes=[1, 16, 1, 32],
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="dynamic",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        torch.testing.assert_close(out, (x + 1) * 2)
+        marker = "@triton.jit(noinline=True)\ndef tile_dependency_packet_dispatch"
+        self.assertIn(marker, code)
+        helper = code[
+            code.index(marker) : code.index(
+                "\n@triton.jit", code.index(marker) + len(marker)
+            )
+        ]
+        self.assertIn("tile_dependency_root_1_scheduled_task", helper)
+        self.assertNotIn("tile_dependency_root_0_scheduled_task", helper)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_exact_nested_keys_wait_inside_each_loop_iteration(self) -> None:
+        x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
+
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "_compact_nested_loop_counters_for_schedule",
+            side_effect=lambda _graph, _schedule, exact, *_args, **_kwargs: exact,
+        ):
+            code, out = code_and_output(
+                nested_load_store_chain,
+                (x,),
+                block_sizes=[1, 16],
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="static",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        torch.testing.assert_close(out, (x + 1) * 2 + 3)
+        tree = ast.parse(code)
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        wait = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id.startswith("tile_dependency_nested_loop_wait")
+                for target in node.targets
+            )
+        )
+        parent = parents.get(wait)
+        while parent is not None and not isinstance(parent, ast.For):
+            parent = parents.get(parent)
+        self.assertIsInstance(parent, ast.For)
+        assert isinstance(parent, ast.For) and isinstance(parent.target, ast.Name)
+        self.assertIn(
+            parent.target.id,
+            {node.id for node in ast.walk(wait.value) if isinstance(node, ast.Name)},
+        )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_partial_constant_nested_key_uses_membership_guard(self) -> None:
+        x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+
+        def build_with_partial_constant_nested_key(**kwargs: Any):
+            plan = original_build(**kwargs)
+            replacement = None
+            replaced_counters = []
+            for counter in plan.readiness_counters:
+                consumers = []
+                for consumer in counter.consumers:
+                    relation = consumer.keys_by_consumer
+                    nested_axes = cross_loop_scheduler.nested_logical_axes(
+                        plan.root_domains[consumer.consumer_root],
+                        relation.source_domain,
+                    )
+                    if replacement is not None or len(nested_axes) != 1:
+                        consumers.append(consumer)
+                        continue
+                    (nested_axis,) = nested_axes
+                    source_bounds = tuple(
+                        (
+                            axis,
+                            1 if axis == nested_axis else 0,
+                            relation.source_domain.axis_count_expressions[axis],
+                            1,
+                        )
+                        for axis in relation.source_domain.axis_order
+                    )
+                    replacement = CoordinateRelation(
+                        relation.source_domain,
+                        relation.target_domain,
+                        (
+                            _CoordinateRelationPiece(
+                                source_bounds,
+                                tuple(
+                                    (axis, 0, 1, 1)
+                                    for axis in relation.target_domain.axis_order
+                                ),
+                            ),
+                        ),
+                    )
+                    consumers.append(
+                        dataclasses.replace(
+                            consumer,
+                            incidence=Incidence._from_constructed(
+                                consumer.incidence.items_by_key,
+                                keys_by_item=replacement,
+                                count_by_key=consumer.incidence.count_by_key,
+                                grouped_items=consumer.incidence.grouped_items,
+                            ),
+                        )
+                    )
+                replaced_counters.append(
+                    dataclasses.replace(counter, consumers=tuple(consumers))
+                )
+            self.assertIsNotNone(replacement)
+            return dataclasses.replace(
+                plan,
+                readiness_counters=tuple(replaced_counters),
+            )
+
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_with_partial_constant_nested_key,
+        ):
+            bound = nested_load_store_chain.bind((x,))
+            code = bound.to_triton_code(
+                helion.Config(
+                    block_sizes=[1, 16],
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="static",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+            )
+
+        tree = ast.parse(code)
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        waits = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id.startswith("tile_dependency_nested_loop_wait")
+                for target in node.targets
+            )
+        ]
+        self.assertTrue(waits)
+
+        def has_if_ancestor(node: ast.AST) -> bool:
+            while node in parents:
+                node = parents[node]
+                if isinstance(node, ast.If):
+                    return True
+            return False
+
+        self.assertTrue(all(has_if_ancestor(wait) for wait in waits))
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_single_trip_root_barrier_publisher_can_inline(self) -> None:
+        x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+
+        def build_with_middle_root_barrier(**kwargs: Any):
+            plan = original_build(**kwargs)
+            return dataclasses.replace(
+                plan,
+                readiness_counters=tuple(
+                    counter
+                    for counter in plan.readiness_counters
+                    if all(
+                        producer.producer_root != 1 for producer in counter.producers
+                    )
+                ),
+                root_barrier_edges=plan.root_barrier_edges | frozenset(((1, 2),)),
+            )
+
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_with_middle_root_barrier,
+        ):
+            code, out = code_and_output(
+                nested_load_store_chain,
+                (x,),
+                block_sizes=[1, 16],
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="static",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        torch.testing.assert_close(out, (x + 1) * 2 + 3)
+        self.assertIn("tile_dependency_root_barrier_wait", code)
+        wrapper = _generated_function(code, "tile_dependency_root_1_scheduled_task")
+        self.assertTrue(
+            all(
+                not isinstance(decorator, ast.Call)
+                for decorator in wrapper.decorator_list
+            )
+        )
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Name)
+                and node.id.startswith("tile_dependency_root_barrier")
+                for node in ast.walk(wrapper)
+            )
+        )
+        kernel = _generated_function(code, "_helion_nested_load_store_chain")
+        dispatch = next(
+            node
+            for node in ast.walk(kernel)
+            if isinstance(node, ast.Call)
+            and _call_name(node) == "tile_dependency_root_1_scheduled_task"
+        )
+        publication = next(
+            node
+            for node in ast.walk(kernel)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr.startswith("atomic_")
+            and any(
+                keyword.arg == "sem"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == "release"
+                for keyword in node.keywords
+            )
+        )
+        wait = next(
+            node
+            for node in ast.walk(kernel)
+            if isinstance(node, ast.Name)
+            and node.id.startswith("tile_dependency_root_barrier_wait")
+        )
+        self.assertLess(dispatch.lineno, publication.lineno)
+        self.assertLess(publication.lineno, wait.lineno)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_two_axis_nested_loop_falls_back_to_root_barrier(self) -> None:
         x = torch.arange(32 * 32, device=DEVICE, dtype=torch.float32).reshape(32, 32)
-        code, out = code_and_output(
-            nested_two_axis_consumer,
-            (x,),
-            block_sizes=[8, 8],
-            pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
-            num_sm_multiplier=1,
-            num_warps=1,
-        )
-
-        torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertNotIn("tile_dependency_nested_loop_wait", code)
-        self.assertIn("tile_dependency_root_barrier_wait", code)
+        for pipeline in ("static", "dynamic"):
+            with self.subTest(pipeline=pipeline):
+                for launch in range(2):
+                    code, out = code_and_output(
+                        nested_two_axis_consumer,
+                        (x + launch,),
+                        block_sizes=[8, 8],
+                        pid_type="persistent_blocked",
+                        cross_loop_pipeline=pipeline,
+                        num_sm_multiplier=1,
+                        num_warps=1,
+                    )
+                    torch.testing.assert_close(out, ((x + launch) + 1) * 2)
+                self.assertNotIn("tile_dependency_nested_loop_wait", code)
+                self.assertIn("tile_dependency_root_barrier_wait", code)
+                self.assertEqual(
+                    "tile_dependency_raw_dispatch_ticket" in code,
+                    pipeline == "dynamic",
+                )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_cartesian_unequal_tiles_choose_proven_readiness(self) -> None:
+    def test_cartesian_unequal_tiles_choose_proven_synchronization(self) -> None:
         for batch, width, producer_width, consumer_width in (
             (2, 64, 16, 32),
             (4, 64, 16, 32),
@@ -753,18 +1548,18 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                         (x + launch,),
                         block_sizes=[1, producer_width, 1, consumer_width],
                         pid_type="persistent_blocked",
-                        cross_loop_schedule="static_pipeline",
+                        cross_loop_pipeline="static",
                         num_sm_multiplier=1,
                         num_warps=1,
                     )
                     torch.testing.assert_close(out, ((x + launch) + 1) * 2)
-                self.assertNotIn("tile_dependency_root_barrier", code)
+                self.assertNotIn("tile_dependency_task_wait", code)
                 if producer_width < consumer_width:
-                    self.assertIn("tile_dependency_continuation_previous", code)
-                    self.assertNotIn("tile_dependency_task_wait", code)
+                    self.assertNotIn("tile_dependency_root_barrier", code)
+                    self.assertUsesExactReadiness(code)
                 else:
-                    self.assertIn("tile_dependency_readiness_wait", code)
-                    self.assertNotIn("tile_dependency_task_wait", code)
+                    self.assertIn("tile_dependency_root_barrier_wait", code)
+                    self.assertNotIn("tile_dependency_readiness_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -776,7 +1571,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 (x + launch,),
                 block_sizes=[1, 16, 1, 16],
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
+                cross_loop_pipeline="static",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -789,39 +1584,52 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             torch.testing.assert_close(out, expected)
         self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("* tl.cast(3, tl.uint32) - 1", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_readiness_counter_supports_chaining(self) -> None:
         x = torch.arange(8 * 4, device=DEVICE, dtype=torch.float32).reshape(8, 4)
-        for launch in range(2):
-            code, out = code_and_output(
-                readiness_counter_chain,
-                (x + launch,),
-                pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
-                num_sm_multiplier=1,
-                num_warps=1,
-            )
-            torch.testing.assert_close(out, torch.sum(x + launch + 1).reshape(1))
-        self.assertGreaterEqual(code.count("tile_dependency_continuation_previous"), 2)
-        continuation_lines = [
-            line
-            for line in code.splitlines()
-            if "tile_dependency_continuation_previous" in line
-            and "tl.atomic_add" in line
-        ]
-        self.assertEqual(len(continuation_lines), 2)
-        for line in continuation_lines:
-            self.assertIn(f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}", line)
-        self.assertIn(
-            f"+ {16 * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS} +",
-            continuation_lines[1],
-        )
-        self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertIn("tile_dependency_root_barrier_wait", code)
+        for pipeline in ("static", "dynamic"):
+            with self.subTest(pipeline=pipeline):
+                for launch in range(2):
+                    code, out = code_and_output(
+                        readiness_counter_chain,
+                        (x + launch,),
+                        pid_type="persistent_blocked",
+                        cross_loop_pipeline=pipeline,
+                        num_sm_multiplier=1,
+                        num_warps=1,
+                    )
+                    torch.testing.assert_close(
+                        out, torch.sum(x + launch + 1).reshape(1)
+                    )
+                continuation_lines = [
+                    line
+                    for line in code.splitlines()
+                    if "tile_dependency_continuation_previous" in line
+                    and "tl.atomic_add" in line
+                ]
+                self.assertGreaterEqual(len(continuation_lines), 1)
+                self.assertLessEqual(len(continuation_lines), 2)
+                for line in continuation_lines:
+                    self.assertIn(f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}", line)
+                if len(continuation_lines) == 2:
+                    self.assertIn(
+                        f"+ {16 * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS} +",
+                        continuation_lines[1],
+                    )
+                else:
+                    self.assertIn("tile_dependency_readiness_wait", code)
+                self.assertNotIn("tile_dependency_task_wait", code)
+                self.assertIn("tile_dependency_root_barrier_wait", code)
+                self.assertIn("ld.acquire.gpu.global.u32", code)
+                self.assertNotIn("ld.acquire.gpu.global.u64", code)
+                self.assertNotIn("tl.atomic_max", code)
+                self.assertEqual(
+                    "tile_dependency_raw_dispatch_ticket" in code,
+                    pipeline == "dynamic",
+                )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -832,19 +1640,18 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16, 1, 32],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_readiness_wait", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertNotIn("tile_dependency_root_barrier", code)
+        self.assertIn("tile_dependency_root_barrier_wait", code)
+        self.assertNotIn("tile_dependency_readiness_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_partial_prefix_uses_counter_continuation(self) -> None:
+    def test_partial_prefix_uses_exact_readiness(self) -> None:
         x = torch.arange(96, device=DEVICE, dtype=torch.float32)
         for launch in range(2):
             code, (tmp, out) = code_and_output(
@@ -852,27 +1659,28 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 (x + launch,),
                 block_sizes=[16, 32],
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
+                cross_loop_pipeline="static",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
             torch.testing.assert_close(tmp, x + launch + 1)
             torch.testing.assert_close(out, (x[:64] + launch + 1) * 2)
-        self.assertIn("tile_dependency_continuation_previous", code)
-        self.assertIn("< 4", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
+        self.assertUsesExactReadiness(code)
+        self.assertIn("tl.cast(2, tl.uint32)", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_mixed_radix_dependency_uses_counter_continuation(self) -> None:
-        x = torch.randn((8, 4096), device=DEVICE, dtype=torch.float32)
+        # Keep the producer within one resident wave so final-arrival
+        # continuation dominance is exact.
+        x = torch.randn((2, 512), device=DEVICE, dtype=torch.float32)
         for launch in range(2):
             code, out = code_and_output(
                 mixed_radix_continuation,
                 (x + launch,),
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
+                cross_loop_pipeline="static",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -886,6 +1694,123 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_runtime_bound_inner_loop_store_is_ordered(self) -> None:
+        x = torch.randn((8, 16), device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 5, 0, 3, 8, 2, 4], device=DEVICE)
+        ends = torch.tensor([0, 2, 9, 16, 3, 15, 16, 11], device=DEVICE)
+        code, out = code_and_output(
+            runtime_bound_store_chain,
+            (x, starts, ends),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+        columns = torch.arange(16, device=DEVICE)
+        mask = (columns[None, :] >= starts[:, None]) & (
+            columns[None, :] < ends[:, None]
+        )
+        torch.testing.assert_close(out, torch.sum(x * mask, dim=1) * 2)
+        # The store's site has no geometry, so the edge falls back to a barrier.
+        self.assertIn("tile_dependency_root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_runtime_bound_inner_loop_keeps_exact_readiness(self) -> None:
+        x = torch.randn((8, 16), device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 5, 0, 3, 8, 2, 4], device=DEVICE)
+        ends = torch.tensor([0, 2, 9, 16, 3, 15, 16, 11], device=DEVICE)
+        code, out = code_and_output(
+            runtime_bound_loop_chain,
+            (x, starts, ends),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+        columns = torch.arange(16, device=DEVICE)
+        mask = (columns[None, :] >= starts[:, None]) & (
+            columns[None, :] < ends[:, None]
+        )
+        torch.testing.assert_close(out, torch.sum(x * mask, dim=1) * 2)
+        self.assertNotIn("tile_dependency_root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_one_wave_producer_keeps_configured_order(self) -> None:
+        workers = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        if workers % 2:
+            self.skipTest("needs an even SM count")
+        for splits, reordered in ((workers // 2, False), (workers, True)):
+            with self.subTest(splits=splits):
+                x = torch.randn((2, splits), device=DEVICE, dtype=torch.float32)
+                code, out = code_and_output(
+                    split_merge_chain,
+                    (x,),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="static",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+                torch.testing.assert_close(out, torch.sum(x * 2, dim=1))
+                self.assertIn("tile_dependency_continuation_previous", code)
+                self.assertEqual(
+                    "tile_dependency_scheduled_pid_task" in code, reordered
+                )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_conditional_rereads_keep_final_arrival_continuation(self) -> None:
+        x = torch.randn((4, 8, 8), device=DEVICE, dtype=torch.float32)
+        lse = x + 1
+        terms = x * 2 * (lse - lse.amax(dim=-1, keepdim=True))
+        for active in (8, 5):
+            with self.subTest(active=active):
+                code, out = code_and_output(
+                    conditional_split_merge_chain,
+                    (x, torch.tensor([active], device=DEVICE), 5),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="static",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+                live = terms if active > 5 else terms[..., :5]
+                torch.testing.assert_close(out, live.sum(dim=-1))
+                self.assertIn("tile_dependency_continuation_previous", code)
+                self.assertNotIn("tile_dependency_root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_trailing_independent_roots_pack_behind_previous_root(self) -> None:
+        workers = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        x = torch.randn((2, 3), device=DEVICE, dtype=torch.float32)
+        y = torch.randn((workers - 1,), device=DEVICE, dtype=torch.float32)
+        z = torch.randn((5,), device=DEVICE, dtype=torch.float32)
+        config = {
+            "pid_type": "persistent_blocked",
+            "cross_loop_pipeline": "static",
+            "num_sm_multiplier": 1,
+            "num_warps": 1,
+        }
+        code, (out, side, other) = code_and_output(
+            split_merge_then_independent, (x, y, z), **config
+        )
+        torch.testing.assert_close(out, torch.sum(x * 2, dim=1))
+        torch.testing.assert_close(side, y + 1)
+        torch.testing.assert_close(other, z - 1)
+        self.assertIn("tile_dependency_continuation_previous", code)
+        # y starts after the six producer tasks and wraps; z packs behind y.
+        self.assertIn(f"% {workers} - 0 + 6, {workers + 5}, {workers})", code)
+        end = workers + 10
+        self.assertIn(f"% {workers} - 0 + {workers + 5}, {end}, {workers})", code)
+        # An edge-free root before a synchronized one keeps its own wave.
+        code, (out, other) = code_and_output(split_independent_merge, (x, z), **config)
+        torch.testing.assert_close(out, torch.sum(x * 2, dim=1))
+        torch.testing.assert_close(other, z - 1)
+        self.assertIn(f"tl.program_id(0) - 0 + {workers}, {workers + 5},", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_partial_in_place_preserves_unowned_reaching_definition(self) -> None:
         x = torch.arange(96, device=DEVICE, dtype=torch.float32)
         for launch in range(2):
@@ -894,16 +1819,15 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 (x + launch,),
                 block_sizes=[16, 32, 16],
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
+                cross_loop_pipeline="static",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
             expected = x + launch + 1
             expected = torch.cat((expected[:64] * 2, expected[64:]))
             torch.testing.assert_close(out, expected)
-        self.assertIn("tile_dependency_continuation_previous", code)
+        self.assertUsesExactReadiness(code)
         self.assertIn("tile_dependency_readiness_wait", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -917,14 +1841,13 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 (x + launch, y + launch),
                 block_sizes=[16, 16, 16],
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
+                cross_loop_pipeline="static",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
             torch.testing.assert_close(out, x + launch + 1 + (y + launch) * 2)
         self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("tl.cast(2, tl.uint32) - 1", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -936,7 +1859,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             coalesced_multi_producer_join,
             (x, y),
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -961,7 +1884,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             self.assertIn(f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}]", line)
         for line in publication_lines:
             self.assertIn(f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}, 1", line)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -972,7 +1894,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             coalesced_single_producer_fanout,
             (x,),
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -981,7 +1903,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, expected)
         self.assertIn("tile_dependency_readiness_wait", code)
         self.assertIn("tl.cast(4, tl.uint32)", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -992,7 +1913,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             direct_nested_continuation,
             (x,),
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1000,7 +1921,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, (x + 1).reshape(4, 2).sum(dim=-1) * 2)
         self.assertIn("tl.cast(2, tl.uint32) - 1", code)
         self.assertNotIn("tl.cast(1, tl.uint32) - 1", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1032,14 +1952,14 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     block_sizes=[1, 16, 1, 32],
                     l2_groupings=[2, 2],
                     pid_type="persistent_blocked",
-                    cross_loop_schedule="static_pipeline",
+                    cross_loop_pipeline="static",
                     num_sm_multiplier=1,
                     num_warps=1,
                 )
 
                 torch.testing.assert_close(out, (x + 1) * 2)
                 self.assertNotIn("tile_dependency_task_wait", code)
-                self.assertIn("tile_dependency_continuation_previous", code)
+                self.assertUsesExactReadiness(code)
                 self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1051,14 +1971,13 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[4, 1, 4, 32],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
 
         torch.testing.assert_close(out, ((x + 1) * 2).unsqueeze(0))
         self.assertIn("tile_dependency_readiness_wait", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1075,53 +1994,99 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[16, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
 
         torch.testing.assert_close(out, (x[32:] + 1) * 2)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertIn("tile_dependency_root_barrier", code)
+        worker_count = torch.cuda.get_device_properties(x.device).multi_processor_count
+        padded_second_root_base = -(-254 // worker_count) * worker_count
+        root = _generated_function(code, "tile_dependency_root_1")
+        pid_assignment = next(
+            node
+            for node in root.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "pid_shared"
+                for target in node.targets
+            )
+        )
+        self.assertIn(
+            "virtual_pid",
+            {
+                node.id
+                for node in ast.walk(pid_assignment.value)
+                if isinstance(node, ast.Name)
+            },
+        )
+        constants = {
+            node.value
+            for node in ast.walk(pid_assignment.value)
+            if isinstance(node, ast.Constant) and isinstance(node.value, int)
+        }
+        self.assertIn(254, constants)
+        self.assertIn(padded_second_root_base, constants)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_specialized_quotient_retains_static_task_geometry(self) -> None:
         x = torch.arange(4, device=DEVICE, dtype=torch.float32)
-        code, out = code_and_output(
-            specialized_quotient_chain,
-            (x, 8, 2),
-            pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
-            num_sm_multiplier=1,
-            num_warps=1,
-        )
+        codes: list[str] = []
+        cache_keys: list[str | None] = []
+        cubin_hashes: set[str] = set()
+        bounds = []
+        for numerator, denominator in ((8, 2), (12, 3)):
+            code, out = code_and_output(
+                specialized_quotient_chain,
+                (x, numerator, denominator),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="static",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+            bound = specialized_quotient_chain.bind((x, numerator, denominator))
+            config, compiled = next(iter(bound._compile_cache.items()))
+            triton_kernel = compiled.__globals__[f"_helion_{bound.kernel.name}"]
+            cubin_hashes.update(
+                compiled_kernel.hash
+                for cache_tuple in triton_kernel.device_caches.values()
+                for compiled_kernel in cache_tuple[0].values()
+                if getattr(compiled_kernel, "hash", None) is not None
+            )
+            codes.append(code)
+            cache_keys.append(bound.backend_cache_key(config))
+            bounds.append(bound)
+            torch.testing.assert_close(out, (x + 1) * 2)
+            self.assertIn("tile_dependency_continuation_task", code)
+            self.assertNotIn("tile_dependency_root_barrier", code)
 
-        torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_continuation_task", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertNotIn("tile_dependency_root_barrier", code)
+        self.assertIsNot(bounds[0], bounds[1])
+        self.assertEqual(codes[0], codes[1])
+        self.assertIsNotNone(cache_keys[0])
+        self.assertEqual(cache_keys[0], cache_keys[1])
+        self.assertEqual(len(cubin_hashes), 1)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_continuation_follows_each_roots_pid_order(self) -> None:
-        x = torch.arange(64 * 1024, device=DEVICE, dtype=torch.float32).reshape(
-            64, 1024
-        )
+    def test_exact_readiness_follows_each_roots_pid_order(self) -> None:
+        # Exercise exact readiness across distinct configured PID orders. The
+        # worker count may select either continuation or counter lowering.
+        x = torch.arange(4 * 256, device=DEVICE, dtype=torch.float32).reshape(4, 256)
         code, out = code_and_output(
             cartesian_affine_chain,
             (x,),
             block_sizes=[1, 16, 1, 32],
             loop_orders=[[1, 0], [0, 1]],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_continuation_previous", code)
-        self.assertIn("tile_dependency_scheduled_pid_task", code)
+        self.assertUsesExactReadiness(code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1133,16 +2098,15 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16, 1, 16, 1, 32],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
 
         torch.testing.assert_close(out, x * 2)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
-        self.assertIn("tile_dependency_continuation_previous", code)
-        self.assertIn("tl.cast(4, tl.uint32) - 1", code)
+        self.assertUsesExactReadiness(code)
+        self.assertIn("tl.cast(4, tl.uint32)", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1153,14 +2117,15 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16, 1, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
 
         torch.testing.assert_close(out, torch.sum(x * 2, dim=-1))
-        self.assertGreaterEqual(code.count("tile_dependency_root_barrier_wait"), 2)
-        self.assertIn("if tl.program_id(0) == 0:", code)
+        self.assertUsesExactReadiness(code)
+        self.assertIn("tl.cast(8, tl.uint32)", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1175,15 +2140,71 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     (x,),
                     block_sizes=[1, 16],
                     pid_type="persistent_blocked",
-                    cross_loop_schedule="static_pipeline",
+                    cross_loop_pipeline="static",
                     num_sm_multiplier=1,
                     num_warps=1,
                 )
 
                 torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
-                self.assertNotIn("tile_dependency_ordered_group", code)
                 self.assertIn("tile_dependency_nested_loop_wait", code)
                 self.assertNotIn("tile_dependency_root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_real_planner_declines_unproved_resident_nested_interleave(self) -> None:
+        x = torch.arange(8192, device=DEVICE, dtype=torch.float32).reshape(1, 8192)
+        code, out = code_and_output(
+            streamed_singleton_reduction,
+            (x,),
+            block_sizes=[1, 16],
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_sm_multiplier=2,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
+        kernel = _generated_function(code, "_helion_streamed_singleton_reduction")
+        scheduled_calls = [
+            _call_name(call)
+            for call in sorted(
+                (
+                    node
+                    for node in ast.walk(kernel)
+                    if isinstance(node, ast.Call)
+                    and (_call_name(node) or "").endswith("_scheduled_task")
+                ),
+                key=lambda node: (node.lineno, node.col_offset),
+            )
+        ]
+        # A CTA-level rank cannot justify admitting a resident nested waiter
+        # before a later producer wave.  Until the scheduler models internal
+        # checkpoints for arbitrary resident roots, retain the baseline order.
+        self.assertEqual(
+            scheduled_calls,
+            [
+                "tile_dependency_root_0_scheduled_task",
+                "tile_dependency_root_1_scheduled_task",
+            ],
+        )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_fixed_block_size_dense_span_is_task_ready(self) -> None:
+        x = torch.arange(256, device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(
+            fixed_block_dense_span_chain,
+            (x,),
+            block_sizes=[],
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, (x + 1) * 2)
+        # arange(16) traces as a constant; block_size=1 keeps a symbolic var.
+        self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1194,13 +2215,25 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
 
         torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
-        self.assertIn("tile_dependency_root_barrier_wait", code)
+        # The early read keeps its own entry wait; the nested wait follows it.
+        self.assertNotIn("tile_dependency_root_barrier", code)
+        scheduled = ast.unparse(
+            _generated_function(code, "tile_dependency_root_1_scheduled_task")
+        )
+        self.assertLess(
+            scheduled.index("tile_dependency_readiness_wait"),
+            scheduled.index("tile_dependency_root_1("),
+        )
+        root = ast.unparse(_generated_function(code, "tile_dependency_root_1"))
+        self.assertLess(
+            root.index("first = "), root.index("tile_dependency_nested_loop_wait")
+        )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1211,7 +2244,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16, 1, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1226,30 +2259,37 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_task_events_are_capture_safe(self) -> None:
-        x = torch.arange(128, device=DEVICE, dtype=torch.float32).reshape(2, 64)
-        bound = cartesian_affine_chain.bind((x,))
-        config = helion.Config(
-            block_sizes=[1, 16, 1, 32],
-            pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
-            num_sm_multiplier=4,
-            num_warps=8,
-        )
-        code = bound.to_triton_code(config)
-        self.assertNotIn("launch_cooperative_grid=True", code)
-        compiled = bound.compile_config(config)
-        compiled(x)
-        torch.cuda.synchronize()
+        for pipeline in ("static", "dynamic"):
+            with self.subTest(pipeline=pipeline):
+                x = torch.arange(128, device=DEVICE, dtype=torch.float32).reshape(2, 64)
+                bound = cartesian_affine_chain.bind((x,))
+                config = helion.Config(
+                    block_sizes=[1, 16, 1, 32],
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline=pipeline,
+                    num_sm_multiplier=4,
+                    num_warps=8,
+                )
+                code = bound.to_triton_code(config)
+                self.assertNotIn("launch_cooperative_grid=True", code)
+                compiled = bound.compile_config(config)
+                compiled(x)
+                torch.cuda.synchronize()
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured = compiled(x)
-        for value in (3.0, 7.0, -2.0):
-            x.fill_(value)
-            graph.replay()
-            torch.cuda.synchronize()
-            torch.testing.assert_close(captured, (x + 1) * 2)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = compiled(x)
+                for value in (3.0, 7.0, -2.0):
+                    x.fill_(value)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    torch.testing.assert_close(captured, (x + 1) * 2)
 
+    # Six static-pipeline schedules, each proved and generated twice by
+    # code_and_output, spend ~30s in host codegen on an idle machine; CI's
+    # four workers per GPU push that past the default 60s timeout, and
+    # pytest-timeout then kills the worker.
+    @pytest.mark.timeout(300)
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_grouped_schedule_requires_the_proven_access_order(self) -> None:
@@ -1297,15 +2337,20 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                             for access in dependency_graph.accesses
                         )
                     )
-                    downstream_edges = dependency_graph.edges_between(1, 2)
+                    downstream_edges = tuple(
+                        edge
+                        for edge in dependency_graph.edges
+                        if edge.producer_root == 1 and edge.consumer_root == 2
+                    )
                     self.assertEqual(len(downstream_edges), 2)
                     nested_site_ids = {
                         site.site_id
                         for edge in downstream_edges
                         for dependency in edge.access_dependencies
-                        for site in dependency_graph.sites_for_access(
+                        for site_id in dependency_graph.site_ids_by_access[
                             dependency.consumer_access_id
-                        )
+                        ]
+                        for site in (dependency_graph.execution_sites[site_id],)
                         if not site.is_root
                     }
                     self.assertEqual(len(nested_site_ids), 1)
@@ -1314,7 +2359,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     kernel_args,
                     block_sizes=block_sizes,
                     pid_type="persistent_blocked",
-                    cross_loop_schedule="static_pipeline",
+                    cross_loop_pipeline="static",
                     num_sm_multiplier=1,
                     num_warps=4,
                     num_stages=2,
@@ -1346,22 +2391,13 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(out, expected, rtol=3e-2, atol=3e-2)
 
                 if reverse_groups:
-                    self.assertNotIn("tile_dependency_group_arrivals", code)
                     self.assertIn("tile_dependency_root_barrier", code)
-                elif group_size != 32:
-                    self.assertNotIn("tile_dependency_group_arrivals", code)
-                    self.assertNotIn("tile_dependency_cohort_wait", code)
-                    self.assertIn("tile_dependency_continuation_previous", code)
-                    self.assertIn("tile_dependency_nested_loop_wait", code)
                 else:
-                    self.assertNotIn("tile_dependency_group_arrivals", code)
                     self.assertNotIn("tile_dependency_root_barrier", code)
-                    self.assertNotIn("tile_dependency_task_wait", code)
                     self.assertTrue(
                         "tile_dependency_continuation_previous" in code
                         or "tile_dependency_readiness_wait" in code
                     )
-                    self.assertNotIn("tile_dependency_cohort_wait", code)
                     self.assertIn("tile_dependency_nested_loop_wait", code)
 
     @skipIfNotCUDA()
@@ -1387,7 +2423,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             kernel_args,
             block_sizes=[1, 16, 1, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=4,
             num_stages=2,
@@ -1402,6 +2438,5 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         ).reshape(1, 128) @ w2.float()
         torch.testing.assert_close(out, expected, rtol=3e-2, atol=3e-2)
         self.assertNotIn("tile_dependency_root_barrier", code)
-        self.assertIn("tile_dependency_continuation_previous", code)
+        self.assertUsesExactReadiness(code)
         self.assertIn("tile_dependency_nested_loop_wait", code)
-        self.assertNotIn("tile_dependency_cohort_wait", code)

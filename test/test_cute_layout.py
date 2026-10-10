@@ -2,20 +2,195 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
+import math
 import unittest
+from unittest.mock import Mock
 from unittest.mock import patch
 
+import pytest
 import torch
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 import helion
+from helion._compiler.cute.indexing import is_cute_direct_iota_index
+from helion._compiler.cute.indexing import is_cute_unit_stride_iota_index
 from helion._compiler.cute.layout import LayoutTag
 from helion._compiler.cute.layout import ThreadLayout
 from helion._compiler.cute.layout_propagation import META_KEY
+from helion._compiler.cute.layout_rules import _layout_from_tensor_strides
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
 import helion.language as hl
 from helion.language import reduce_ops
+
+
+def test_unit_stride_iota_index_proof() -> None:
+    graph = torch.fx.Graph()
+    iota = graph.call_function(
+        torch.ops.prims.iota.default,
+        args=(32,),
+        kwargs={"start": 0, "step": 1, "dtype": torch.int32, "device": "cpu"},
+    )
+    shifted = graph.call_function(torch.ops.aten.add.Tensor, args=(iota, 4))
+    nonzero_start = graph.call_function(
+        torch.ops.prims.iota.default,
+        args=(32,),
+        kwargs={"start": 4, "step": 1, "dtype": torch.int32, "device": "cpu"},
+    )
+    gathered = graph.call_function(torch.ops.aten.div.Tensor, args=(iota, 4))
+    scaled = graph.call_function(
+        torch.ops.aten.add.Tensor, args=(4, iota), kwargs={"alpha": 2}
+    )
+
+    assert is_cute_direct_iota_index(iota)
+    assert is_cute_unit_stride_iota_index(iota)
+    assert not is_cute_direct_iota_index(shifted)
+    assert is_cute_unit_stride_iota_index(shifted)
+    assert not is_cute_direct_iota_index(nonzero_start)
+    assert is_cute_unit_stride_iota_index(nonzero_start)
+    assert not is_cute_unit_stride_iota_index(gathered)
+    assert not is_cute_unit_stride_iota_index(scaled)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    "shape,tile_shape,transpose",
+    [
+        ((4096,), (256,), False),
+        ((128, 512), (16, 64), False),
+        ((512, 128), (16, 64), True),
+    ],
+)
+def test_stride_layout_covers_configured_tile(
+    shape: tuple[int, ...], tile_shape: tuple[int, ...], transpose: bool
+) -> None:
+    """A load's thread/value mapping covers its tile, not its backing tensor."""
+    tensor = torch.empty(shape)
+    if transpose:
+        tensor = tensor.t()
+    graph = torch.fx.Graph()
+    source = graph.placeholder("source")
+    source.meta["val"] = tensor
+    shape_env = ShapeEnv()
+    indices = [graph.placeholder(f"tile_{i}") for i in range(tensor.ndim)]
+    for index in indices:
+        index.meta["val"] = shape_env.create_unbacked_symint()
+    load = graph.call_function(hl.load, args=(source, indices))
+
+    block_ids = {str(index.meta["val"]): i for i, index in enumerate(indices)}
+    env = Mock()
+    env.get_block_id.side_effect = lambda size: block_ids.get(str(size))
+    env.block_sizes = [Mock(from_config=Mock(return_value=n)) for n in tile_shape]
+    strategy = Mock(
+        strategies=[Mock(fn=Mock(config=helion.Config(block_sizes=list(tile_shape))))],
+        thread_block_dims=Mock(return_value=(32, 1, 1)),
+    )
+    with patch(
+        "helion._compiler.cute.layout_rules.CompileEnvironment.current",
+        return_value=env,
+    ):
+        layout = _layout_from_tensor_strides(
+            load, tile_strategy=strategy, tag=LayoutTag.COALESCED
+        )
+
+    assert layout is not None
+    assert layout.tile_numel() == math.prod(tile_shape)
+    assert layout.num_threads() == (16 if transpose else 32)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize("index_shape", [(32,), (4, 8)])
+def test_gather_layout_is_not_inferred_from_source_strides(
+    index_shape: tuple[int, ...],
+) -> None:
+    """Gather indices can repeat or rearrange source elements in any rank."""
+    graph = torch.fx.Graph()
+    source = graph.placeholder("source")
+    source.meta["val"] = torch.empty(4096)
+    index = graph.placeholder("index")
+    index.meta["val"] = torch.arange(32).reshape(index_shape) // 4
+    load = graph.call_function(hl.load, args=(source, [index]))
+    strategy = Mock(thread_block_dims=Mock(return_value=(32, 1, 1)))
+    with patch("helion._compiler.cute.layout_rules.CompileEnvironment.current"):
+        layout = _layout_from_tensor_strides(
+            load, tile_strategy=strategy, tag=LayoutTag.COALESCED
+        )
+    assert layout is None
+
+
+@helion.kernel(
+    backend="cute",
+    static_shapes=False,
+    config=helion.Config(
+        # V=32 consumes one thread axis, forcing the static K=128 reduction
+        # into a 32-thread x four-lane loop.  The four dependent reductions in
+        # the body must therefore be split into ordered lane passes.
+        block_sizes=[32],
+        num_warps=1,
+        num_stages=1,
+        indexing="pointer",
+    ),
+)
+def _state_update_and_project(
+    state: torch.Tensor,
+    k: torch.Tensor,
+    q: torch.Tensor,
+    v: torch.Tensor,
+    active: torch.Tensor,
+) -> torch.Tensor:
+    """Small recurrent-state update with reduction and broadcast fan-out."""
+    V = hl.specialize(state.size(0))
+    K = hl.specialize(state.size(1))
+    block_v = hl.register_block_size(1, V)
+    out = torch.empty([V], dtype=q.dtype, device=q.device)
+    for tile_v in hl.tile(V, block_size=block_v):
+        if active[0] == 0:
+            out[tile_v] = 0.0
+        else:
+            k_offsets = hl.arange(K)
+            state_tile = state[tile_v, k_offsets]
+            k_tile = k[k_offsets].float()
+            k_tile = k_tile / torch.sqrt((k_tile * k_tile).sum() + 1e-6)
+            residual = v[tile_v].float() - (state_tile * k_tile[None, :]).sum(-1)
+            updated = state_tile + residual[:, None] * k_tile[None, :]
+            q_tile = q[k_offsets].float()
+            q_tile = q_tile / torch.sqrt((q_tile * q_tile).sum() + 1e-6)
+            out[tile_v] = (updated * q_tile[None, :]).sum(-1).to(q.dtype)
+            state[tile_v, k_offsets] = updated
+    return out
+
+
+@onlyBackends(["cute"])
+def test_reduction_and_broadcast_fan_out_codegen_accepts_same_lane_update() -> None:
+    """Dynamic exact strides make the in-place state recurrence splittable."""
+    args = (
+        torch.randn(128, 128),
+        torch.randn(128, dtype=torch.bfloat16),
+        torch.randn(128, dtype=torch.bfloat16),
+        torch.randn(128, dtype=torch.bfloat16),
+        torch.ones(1, dtype=torch.int32),
+    )
+    _state_update_and_project.reset()
+    bound = _state_update_and_project.bind(args)
+    code = bound.to_code(bound.config_spec.default_config())
+
+    assert "_helion_lane_reduce" not in code
+    assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
+
+    zero_stride_state = torch.as_strided(
+        torch.randn(128),
+        (128, 128),
+        (1, 0),
+    )
+    zero_stride_bound = _state_update_and_project.bind((zero_stride_state, *args[1:]))
+    assert zero_stride_bound is not bound
+    with pytest.raises(
+        helion.exc.BackendUnsupported,
+        match="potentially aliasing write",
+    ):
+        zero_stride_bound.to_code(zero_stride_bound.config_spec.default_config())
 
 
 @onlyBackends(["cute"])
@@ -161,6 +336,33 @@ class TestLayoutAnnotation(unittest.TestCase):
         bound = self._compile_cute(copy_kernel, x)
         result = bound(x)
         torch.testing.assert_close(result, x)
+
+    def test_reduction_and_broadcast_fan_out(self) -> None:
+        """A state used by both a store and reduced projection keeps its layout."""
+        state = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        k = torch.randn(128, device=DEVICE, dtype=torch.bfloat16)
+        q = torch.randn(128, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(128, device=DEVICE, dtype=torch.bfloat16)
+        active = torch.ones(1, device=DEVICE, dtype=torch.int32)
+        state_ref = state.clone()
+
+        k_ref = torch.nn.functional.normalize(k.float(), dim=0)
+        q_ref = torch.nn.functional.normalize(q.float(), dim=0)
+        residual = v.float() - (state_ref * k_ref[None, :]).sum(-1)
+        state_ref += residual[:, None] * k_ref[None, :]
+        expected = (state_ref * q_ref[None, :]).sum(-1).to(q.dtype)
+
+        actual = _state_update_and_project(state, k, q, v, active)
+
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(state, state_ref, rtol=2e-4, atol=2e-4)
+
+        inactive_state = torch.randn_like(state)
+        inactive_ref = inactive_state.clone()
+        inactive = torch.zeros_like(active)
+        inactive_out = _state_update_and_project(inactive_state, k, q, v, inactive)
+        torch.testing.assert_close(inactive_out, torch.zeros_like(inactive_out))
+        torch.testing.assert_close(inactive_state, inactive_ref)
 
 
 @dataclasses.dataclass
@@ -424,6 +626,221 @@ class TestLayoutChangeInsertion(unittest.TestCase):
 
         _insert_layout_changes(_FakeGraphInfo(graph))  # type: ignore[arg-type]
         _validate_layout_contracts(_FakeGraphInfo(graph))  # type: ignore[arg-type]
+
+    def test_validate_allows_reduction_only_inherited_path_mismatch(self) -> None:
+        """A reduction-only pointwise path owns its inherited transition."""
+        from helion._compiler.cute.layout import LayoutConstraint
+        from helion._compiler.cute.layout_propagation import _validate_layout_contracts
+
+        producer_layout = ThreadLayout.make_1d(
+            128, num_threads=32, tag=LayoutTag.INHERITED
+        )
+        reduction_layout = ThreadLayout.make_1d(
+            128, num_threads=64, tag=LayoutTag.INHERITED
+        )
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.randn(128)
+        x.meta[META_KEY] = LayoutConstraint(output_layout=producer_layout)
+        absolute = graph.call_function(torch.abs, args=(x,))
+        absolute.meta["val"] = torch.randn(128)
+        absolute.meta[META_KEY] = LayoutConstraint(
+            input_layout=reduction_layout,
+            output_layout=reduction_layout,
+        )
+        reduction = graph.call_function(
+            torch.ops.aten.sum.dim_IntList,
+            args=(absolute, [-1], False),
+        )
+        reduction.meta["val"] = torch.randn(())
+        graph.output(reduction)
+
+        _validate_layout_contracts(_FakeGraphInfo(graph))  # type: ignore[arg-type]
+
+    def test_reduced_output_layout_does_not_propagate_to_full_tile(self) -> None:
+        """An inherited reduction-output layout must not constrain its input."""
+        from helion._compiler.cute.layout import LayoutConstraint
+        from helion._compiler.cute.layout_propagation import _collect_user_layouts
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.randn(8, 128)
+        full_tile = ThreadLayout.make_row_major(
+            8, 128, num_threads=128, tag=LayoutTag.COALESCED
+        )
+        x.meta[META_KEY] = LayoutConstraint(preferred_output=full_tile)
+
+        reduction = graph.call_function(
+            torch.ops.aten.sum.dim_IntList, args=(x, [-1], False)
+        )
+        reduction.meta["val"] = torch.randn(8)
+        # Model a dynamic-shape layout whose symbolic tile size could not be
+        # proven smaller than the producer's during layout propagation.
+        inherited = full_tile.with_tag(LayoutTag.INHERITED)
+        reduction.meta[META_KEY] = LayoutConstraint(preferred_input=inherited)
+        graph.output(reduction)
+
+        self.assertEqual(_collect_user_layouts(x), [])
+
+    def test_seeded_reduction_layout_propagates_to_full_tile(self) -> None:
+        """A semantic reduction-axis layout remains a valid producer vote."""
+        from helion._compiler.cute.layout import LayoutConstraint
+        from helion._compiler.cute.layout_propagation import _collect_user_layouts
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.randn(8, 128)
+        full_tile = ThreadLayout.make_row_major(
+            8, 128, num_threads=128, tag=LayoutTag.COALESCED
+        )
+        x.meta[META_KEY] = LayoutConstraint(preferred_output=full_tile)
+
+        reduction = graph.call_function(
+            torch.ops.aten.sum.dim_IntList, args=(x, [-1], False)
+        )
+        reduction.meta["val"] = torch.randn(8)
+        seeded = full_tile.with_tag(LayoutTag.REDUCTION)
+        reduction.meta[META_KEY] = LayoutConstraint(preferred_input=seeded)
+        graph.output(reduction)
+
+        self.assertEqual(_collect_user_layouts(x), [seeded])
+
+    def test_broadcast_output_layout_does_not_propagate_to_operand(self) -> None:
+        """A broadcast result layout must not constrain a smaller operand."""
+        from helion._compiler.cute.layout import LayoutConstraint
+        from helion._compiler.cute.layout_propagation import _collect_user_layouts
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.randn(1, 128)
+        operand_layout = ThreadLayout.make_1d(
+            128, num_threads=128, tag=LayoutTag.COALESCED
+        )
+        x.meta[META_KEY] = LayoutConstraint(preferred_output=operand_layout)
+
+        y = graph.placeholder("y")
+        y.meta["val"] = torch.randn(8, 1)
+        broadcast = graph.call_function(torch.mul, args=(x, y))
+        broadcast.meta["val"] = torch.randn(8, 128)
+        output_layout = ThreadLayout.make_row_major(
+            8, 128, num_threads=128, tag=LayoutTag.INHERITED
+        )
+        broadcast.meta[META_KEY] = LayoutConstraint(preferred_input=output_layout)
+        graph.output(broadcast)
+
+        self.assertEqual(_collect_user_layouts(x), [])
+
+    def test_layout_compatibility_does_not_guard_on_unbacked_symbols(self) -> None:
+        """Distinct unbacked layout extents are safely treated as incompatible."""
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from helion._compiler.cute.layout_propagation import _layouts_compatible
+
+        shape_env = ShapeEnv()
+        left_extent = shape_env.create_unbacked_symint()
+        right_extent = shape_env.create_unbacked_symint()
+        left = ThreadLayout((left_extent,), (1,), (1,), (1,))
+        right = ThreadLayout((right_extent,), (1,), (1,), (1,))
+
+        self.assertFalse(_layouts_compatible(left, right))
+
+    def test_layout_compatibility_does_not_truncate_leading_axes(self) -> None:
+        """Equal trailing axes cannot hide different complete tile sizes."""
+        from helion._compiler.cute.layout_propagation import _layouts_compatible
+
+        left = ThreadLayout((32,), (1,), (8, 4), (4, 1))
+        right = ThreadLayout((32,), (1,), (16, 4), (4, 1))
+
+        self.assertEqual(left.tile_numel(), 1024)
+        self.assertEqual(right.tile_numel(), 2048)
+        self.assertFalse(_layouts_compatible(left, right))
+
+    def test_reduction_only_pointwise_path_does_not_vote(self) -> None:
+        """A reduction-side branch must not block a non-reduction layout vote."""
+        from helion._compiler.cute.layout import LayoutConstraint
+        from helion._compiler.cute.layout_propagation import _collect_user_layouts
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.randn(128)
+        reduction_path = graph.call_function(torch.square, args=(x,))
+        reduction_path.meta["val"] = torch.randn(128)
+        reduction_path.meta[META_KEY] = LayoutConstraint(
+            preferred_input=ThreadLayout.make_1d(
+                128, num_threads=64, tag=LayoutTag.INHERITED
+            )
+        )
+        reduction = graph.call_function(
+            torch.ops.aten.sum.dim_IntList,
+            args=(reduction_path, [-1], False),
+        )
+        reduction.meta["val"] = torch.randn(())
+
+        consumer = graph.call_function(torch.neg, args=(x,))
+        consumer.meta["val"] = torch.randn(128)
+        chosen = ThreadLayout.make_1d(128, num_threads=32, tag=LayoutTag.INHERITED)
+        consumer.meta[META_KEY] = LayoutConstraint(preferred_input=chosen)
+        graph.output((reduction, consumer))
+
+        self.assertEqual(_collect_user_layouts(x), [chosen])
+
+    @staticmethod
+    def _guarded_lane_reduction(*, thread_dependent: bool = False) -> ast.For:
+        from helion._compiler.tile_strategy import _create_lane_loop
+
+        condition = (
+            "cutlass.Int32(cute.arch.thread_idx()[0]) == 0"
+            if thread_dependent
+            else "external_flag"
+        )
+        prefix = ast.parse(f"lane_value = lane + 1\ncondition = {condition}").body
+        marker = ast.parse(
+            "reduced = _helion_lane_reduce("
+            "lane_value, 'sum', cutlass.Float32(0), 32, 1, 0, '', 1)"
+        ).body
+        guard = ast.If(
+            test=ast.Name(id="condition", ctx=ast.Load()),
+            body=marker,
+            orelse=[],
+        )
+        return _create_lane_loop("lane", 4, [*prefix, guard])
+
+    def test_lane_guard_requires_uniform_external_dependencies(self) -> None:
+        """A guard is not lifted when an external value is not proven uniform."""
+        from helion import exc
+        from helion._compiler.tile_strategy import _lift_lane_invariant_if
+        from helion._compiler.tile_strategy import split_lane_loop_reductions
+
+        loop = self._guarded_lane_reduction()
+        self.assertIsNone(_lift_lane_invariant_if(loop, "lane", {"cutlass"}))
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread uniformity"):
+            split_lane_loop_reductions([loop])
+
+    def test_lane_guard_rejects_thread_dependent_condition(self) -> None:
+        """A CUDA-thread-dependent guard cannot enclose a collective."""
+        from helion._compiler.tile_strategy import _lift_lane_invariant_if
+
+        loop = self._guarded_lane_reduction(thread_dependent=True)
+        self.assertIsNone(_lift_lane_invariant_if(loop, "lane", {"cutlass", "cute"}))
+
+    def test_lane_guard_empty_branch_preserves_lane_prefix(self) -> None:
+        """Lifting an empty branch keeps unconditional per-lane statements."""
+        from helion._compiler.tile_strategy import _lift_lane_invariant_if
+
+        loop = self._guarded_lane_reduction()
+        lifted = _lift_lane_invariant_if(
+            loop,
+            "lane",
+            {"cutlass", "external_flag"},
+        )
+        self.assertIsNotNone(lifted)
+        assert lifted is not None
+        outer_if = lifted[-1]
+        self.assertIsInstance(outer_if, ast.If)
+        assert isinstance(outer_if, ast.If)
+        self.assertEqual(len(outer_if.orelse), 1)
+        self.assertIsInstance(outer_if.orelse[0], ast.For)
+        self.assertIn("lane_value = lane + 1", ast.unparse(outer_if.orelse[0]))
 
 
 @onlyBackends(["cute"])

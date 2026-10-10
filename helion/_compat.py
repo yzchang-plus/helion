@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import importlib
+import inspect
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -229,6 +230,40 @@ if triton_is_available():
         )
 
     @functools.cache
+    def _supports_block_ptr() -> bool:
+        """Whether this Triton still lowers ``tl.make_block_ptr``.
+
+        triton-lang/triton#10833 ("Remove block pointer support") drops
+        ``tl.advance`` and keeps ``tl.make_block_ptr`` as a stub whose body is
+        ``raise NotImplementedError(...)``, so presence alone proves nothing:
+        look at the builtin's body.  Without source (frozen or compiled
+        installs) only the 3.7 line is known to have block pointers; main
+        reported 3.8.0 for two months after the removal.
+        """
+        make_block_ptr = getattr(tl, "make_block_ptr", None)
+        if make_block_ptr is None or getattr(tl, "advance", None) is None:
+            return False
+        try:
+            source = inspect.getsource(make_block_ptr)
+        except (OSError, TypeError):
+            return get_triton_version() < version.parse("3.8")
+        return "NotImplementedError" not in source
+
+    @functools.cache
+    def _supports_host_tensor_descriptor() -> bool:
+        """Whether this Triton install provides the host descriptor API."""
+        if torch.version.hip is not None or not (
+            hasattr(triton.language, "make_tensor_descriptor")
+            or hasattr(triton.language, "_experimental_make_tensor_descriptor")
+        ):
+            return False
+        try:
+            module = importlib.import_module("triton.tools.tensor_descriptor")
+        except ImportError:
+            return False
+        return getattr(module, "TensorDescriptor", None) is not None
+
+    @functools.cache
     def get_tensor_descriptor_fn_name() -> str:
         if hasattr(triton.language, "make_tensor_descriptor"):
             return "tl.make_tensor_descriptor"
@@ -380,6 +415,12 @@ else:
     def _supports_tensor_descriptor() -> bool:  # type: ignore[misc]
         return False
 
+    def _supports_host_tensor_descriptor() -> bool:  # type: ignore[misc]
+        return False
+
+    def _supports_block_ptr() -> bool:  # type: ignore[misc]
+        return False
+
     def get_tensor_descriptor_fn_name() -> str:  # type: ignore[misc]
         return "tl.make_tensor_descriptor"
 
@@ -439,6 +480,17 @@ def safe_clear_cache() -> None:
         pass
 
 
+def supports_host_tensor_descriptor() -> bool:
+    # call private func we can patch in testing
+    return _supports_host_tensor_descriptor()
+
+
+def supports_block_ptr() -> bool:
+    """Whether ``indexing="block_ptr"`` can be lowered by the installed Triton."""
+    # call private func we can patch in testing
+    return _supports_block_ptr()
+
+
 def target_device_capability(
     device: torch.device | None = None,
 ) -> tuple[int, int] | None:
@@ -496,7 +548,7 @@ def get_device_name(device: torch.device | None = None) -> str | None:
             device = torch.device("cuda", torch.cuda.current_device())
         elif getattr(torch, "npu", None) is not None and torch.npu.is_available():
             device = torch.device("npu", torch.npu.current_device())
-        elif getattr(torch, "tpu", None) is not None and torch.tpu.is_available():
+        elif hasattr(torch, "tpu") and torch.accelerator.is_available():
             # torch_tpu (PrivateUse1) exposes no per-chip name; report the
             # generation so dashboard rows land on the "tpu" platform instead of
             # "unknown" (matches benchmarks/run_tpu.py).
@@ -610,9 +662,7 @@ def supports_mtia_tunables() -> bool:
 @functools.cache
 def _supports_mtia_tunables() -> bool:
     try:
-        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
-            supports_mtia_tunables as _fb_supports_mtia,
-        )
+        from .fb.mtia_tunables import supports_mtia_tunables as _fb_supports_mtia  # pyrefly: ignore [missing-import]
 
         return _fb_supports_mtia()
     except ImportError:
@@ -777,6 +827,26 @@ def requires_cuda_version(min_version: str) -> bool:
 
 
 @functools.cache
+def torch_uses_template_producer_fusion() -> bool:
+    """Whether this PyTorch version provides the template producer-fusion API."""
+    # pytorch/pytorch#198809 first appears in the 2026-10-07 nightly.
+    # Keep the dev date: earlier 2.16 nightlies still use the prologue API.
+    if version.parse(torch.__version__.split("+")[0]) < version.parse(
+        "2.16.0.dev20261007"
+    ):
+        return False
+    try:
+        from torch._inductor.ir import TemplateBuffer
+    except ImportError:
+        return False
+    return (
+        hasattr(TemplateBuffer, "has_aliasing_or_mutation_for_producer_fusion")
+        and "load_input_fusion_allowed_inputs"
+        in inspect.signature(TemplateBuffer.__init__).parameters
+    )
+
+
+@functools.cache
 def supports_torch_compile_fusion() -> bool:
     """Check whether this PyTorch build exposes Helion's fusion entrypoints."""
     if torch.xpu.is_available():
@@ -792,7 +862,12 @@ def supports_torch_compile_fusion() -> bool:
         init_names = TemplateBuffer.__init__.__code__.co_names
         assert "allow_prologue_fusion" in init_names
         assert "allow_epilogue_fusion" in init_names
-        assert hasattr(TemplateBuffer, "has_aliasing_or_mutation_for_prologue_fusion")
+        fusion_hook = (
+            "has_aliasing_or_mutation_for_producer_fusion"
+            if torch_uses_template_producer_fusion()
+            else "has_aliasing_or_mutation_for_prologue_fusion"
+        )
+        assert hasattr(TemplateBuffer, fusion_hook)
     except (ImportError, AttributeError, AssertionError):
         return False
     return True
@@ -815,9 +890,7 @@ def register_npu_backend() -> None:
     """
     from torch._inductor.codegen.common import register_backend_for_device
     from torch._inductor.codegen.triton import TritonScheduling
-    from torch_npu._inductor.codegen.wrapper import (
-        NPUWrapperCodeGen,  # type: ignore[import-not-found]
-    )
+    from torch_npu._inductor.codegen.wrapper import NPUWrapperCodeGen  # type: ignore[import-not-found]
 
     register_backend_for_device(
         device="npu",
@@ -829,8 +902,6 @@ def register_npu_backend() -> None:
 def _register_interface_for_device() -> None:
     """Register the NPU device interface with torch._dynamo."""
     from torch._dynamo.device_interface import register_interface_for_device
-    from torch_npu.utils._dynamo_device import (
-        NpuInterface,  # type: ignore[import-not-found]
-    )
+    from torch_npu.utils._dynamo_device import NpuInterface  # type: ignore[import-not-found]
 
     register_interface_for_device("npu", NpuInterface)

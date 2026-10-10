@@ -31,19 +31,22 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     is_pure = state.proxy_arg(4)
     pack = state.proxy_arg(5)
 
-    if pack != 1:
+    if pack != 1 and not is_pure:
+        # The per-lane lowering replays the asm once per element (not once per
+        # ``pack`` elements as Triton does), so side effects would run ``pack``
+        # times more often than the program specifies.
         raise exc.BackendUnsupported(
-            "cute",
-            "hl.inline_asm_elementwise with pack != 1",
+            "cute", "hl.inline_asm_elementwise with pack != 1 and is_pure=False"
         )
-
     raw_args = state.ast_args[2]
-    if isinstance(raw_args, list):
-        args_ast = create(ast.Tuple, elts=raw_args, ctx=ast.Load())
-    elif isinstance(raw_args, tuple):
-        args_ast = create(ast.Tuple, elts=list(raw_args), ctx=ast.Load())
-    else:
-        args_ast = create(ast.Tuple, elts=[raw_args], ctx=ast.Load())
+    args_list = list(raw_args) if isinstance(raw_args, (list, tuple)) else [raw_args]
+    if state.fx_node is not None and "cute_philox_host_seed" in state.fx_node.meta:
+        from .philox_stream import stage_explicit_seed
+
+        args_list[0] = stage_explicit_seed(
+            state, state.fx_node.meta["cute_philox_host_seed"]
+        )
+    args_ast = create(ast.Tuple, elts=args_list, ctx=ast.Load())
 
     from ..compile_environment import CompileEnvironment
 
@@ -67,24 +70,32 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         )
         has_multiple_outputs = False
 
+    keywords = [
+        create(ast.keyword, arg="asm", value=create(ast.Constant, value=asm_str)),
+        create(
+            ast.keyword,
+            arg="constraints",
+            value=create(ast.Constant, value=constraints_str),
+        ),
+        create(ast.keyword, arg="dtype", value=dtype_arg),
+        create(
+            ast.keyword,
+            arg="is_pure",
+            value=create(ast.Constant, value=is_pure),
+        ),
+    ]
+    if pack != 1:
+        # Only emitted for packed calls: the exact four-keyword call shape is
+        # what the pure-lane-packet, FP32-rounding and Philox AST matchers
+        # recognize, and they must keep declining packed calls.
+        keywords.append(
+            create(ast.keyword, arg="pack", value=create(ast.Constant, value=pack))
+        )
     inline_asm_call = create(
         ast.Call,
         func=expr_from_string("_cute_inline_asm_elementwise"),
         args=[args_ast],
-        keywords=[
-            create(ast.keyword, arg="asm", value=create(ast.Constant, value=asm_str)),
-            create(
-                ast.keyword,
-                arg="constraints",
-                value=create(ast.Constant, value=constraints_str),
-            ),
-            create(ast.keyword, arg="dtype", value=dtype_arg),
-            create(
-                ast.keyword,
-                arg="is_pure",
-                value=create(ast.Constant, value=is_pure),
-            ),
-        ],
+        keywords=keywords,
     )
 
     if has_multiple_outputs:

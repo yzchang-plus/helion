@@ -206,12 +206,8 @@ def _run_impl(args: argparse.Namespace) -> dict[str, Any]:
         fn = lambda: compiled(x)  # noqa: E731
     elif args.impl == "quack":
         sys.path.insert(0, str(QUACK_PATH))
-        from quack.cute_dsl_utils import (  # pyrefly: ignore [missing-import]
-            torch2cute_dtype_map,
-        )
-        from quack.softmax import (  # pyrefly: ignore [missing-import]
-            _compile_softmax_fwd,
-        )
+        from quack.cute_dsl_utils import torch2cute_dtype_map  # pyrefly: ignore [missing-import]
+        from quack.softmax import _compile_softmax_fwd  # pyrefly: ignore [missing-import]
 
         cute_dtype = torch2cute_dtype_map[x.dtype]
         compiled_kernel = _compile_softmax_fwd(cute_dtype, cute_dtype, args.n)

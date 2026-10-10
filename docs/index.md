@@ -87,6 +87,7 @@ A minimal matrix multiplication kernel in Helion looks like this:
 ```python
 import torch, helion, helion.language as hl
 
+
 @helion.kernel()
 def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.size()
@@ -140,8 +141,9 @@ within a Helion kernel are supported, but must be traceable with
 The above example can be executed with:
 
 ```python
-out = matmul(torch.randn([2048, 2048], device="cuda"),
-             torch.randn([2048, 2048], device="cuda"))
+out = matmul(
+    torch.randn([2048, 2048], device="cuda"), torch.randn([2048, 2048], device="cuda")
+)
 ```
 
 When a kernel runs for the first time, Helion initiates autotuning. A
@@ -164,22 +166,23 @@ example), you may want to manually specify the best configuration found from
 autotuning to avoid repeated tuning:
 
 ```python
-@helion.kernel(config=helion.Config(
-    block_sizes=[64, 64, 64],
-    loop_orders=[[0, 1]],
-    l2_groupings=[4],
-    range_unroll_factors=[0, 1],
-    range_warp_specializes=[None, False],
-    range_num_stages=[0, 3],
-    range_multi_buffers=[None, False],
-    range_flattens=[None, None],
-    num_warps=8,
-    num_stages=6,
-    indexing='block_ptr',
-    pid_type='flat'
-))
-def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    ...
+@helion.kernel(
+    config=helion.Config(
+        block_sizes=[64, 64, 64],
+        loop_orders=[[0, 1]],
+        l2_groupings=[4],
+        range_unroll_factors=[0, 1],
+        range_warp_specializes=[None, False],
+        range_num_stages=[0, 3],
+        range_multi_buffers=[None, False],
+        range_flattens=[None, None],
+        num_warps=8,
+        num_stages=6,
+        indexing="block_ptr",
+        pid_type="flat",
+    )
+)
+def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor: ...
 ```
 
 This explicit configuration skips autotuning on subsequent runs.
@@ -188,12 +191,13 @@ You can also specify multiple configurations, prompting Helion to perform
 a more lightweight autotuning process:
 
 ```python
-@helion.kernel(configs=[
-    helion.Config(block_sizes=[[32, 32], [16]], num_warps=4),
-    helion.Config(block_sizes=[[64, 64], [32]], num_warps=8),
-])
-def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    ...
+@helion.kernel(
+    configs=[
+        helion.Config(block_sizes=[[32, 32], [16]], num_warps=4),
+        helion.Config(block_sizes=[[64, 64], [32]], num_warps=8),
+    ]
+)
+def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor: ...
 ```
 
 In this case, Helion evaluates the provided configurations and selects the fastest one.
@@ -226,8 +230,8 @@ Example combining both:
 ```python
 @helion.kernel(
     # Settings: Control compilation behavior
-    autotune_effort="none",      # Skip autotuning for development
-    print_output_code=True,       # Debug: show generated code
+    autotune_effort="none",  # Skip autotuning for development
+    print_output_code=True,  # Debug: show generated code
     # Config: Control GPU execution (when not using default)
     # config=helion.Config(block_sizes=[64, 32], num_warps=8)
 )

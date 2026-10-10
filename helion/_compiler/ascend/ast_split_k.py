@@ -49,9 +49,7 @@ def _transform_body(body: list[ast.stmt], name_to_subscript: dict) -> bool:
     return changed
 
 
-def _maybe_split_k(
-    stmt: ast.stmt, name_to_subscript: dict
-) -> list[ast.stmt] | None:
+def _maybe_split_k(stmt: ast.stmt, name_to_subscript: dict) -> list[ast.stmt] | None:
     """If ``stmt`` contains an eligible whole-K 2D matmul, return the split-K
     loop statements + the rewritten ``stmt`` (BinOp replaced by the acc)."""
     target_binop = _find_matmul(stmt)

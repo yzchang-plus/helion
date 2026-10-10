@@ -92,6 +92,9 @@ def _find_argument_device_with_path(
 
 def _find_argument_device(values: Sequence[object]) -> torch.device:
     """Return the first device found by normal kernel argument traversal."""
+    # Most callers only need the leading tensor's device, not a reusable path.
+    if values and (device := _leaf_device(values[0])) is not None:
+        return device
     result = _find_argument_device_with_path(values)
     if result is None:
         raise exc.NoTensorArgs
@@ -143,7 +146,7 @@ def _device_at_path(values: Sequence[object], path: _DevicePath) -> torch.device
 
 
 def _current_device_index(device_type: str) -> int:
-    device_module = getattr(torch, device_type, None)
+    device_module = None if device_type == "tpu" else getattr(torch, device_type, None)
     is_available = getattr(device_module, "is_available", None)
     available = None if not callable(is_available) else is_available()
     current_device = getattr(device_module, "current_device", None)

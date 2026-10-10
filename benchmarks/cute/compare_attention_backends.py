@@ -300,6 +300,7 @@ def _helion_source_provenance() -> dict[str, object]:
     helion_expected_package_path = (REPO_ROOT / "helion").resolve()
     attention_module_path = _module_source_path("examples.attention")
     attention_expected_module_path = (REPO_ROOT / "examples" / "attention.py").resolve()
+    owns_checkout = _git_worktree_root_matches(REPO_ROOT)
     source_snapshot = _git_source_snapshot(
         REPO_ROOT,
         (
@@ -327,8 +328,12 @@ def _helion_source_provenance() -> dict[str, object]:
         "attention_example_import_matches_repo": (
             attention_module_path == attention_expected_module_path
         ),
-        "helion_checkout_git_commit": _git_commit(REPO_ROOT, "HEAD"),
-        "helion_checkout_git_describe": _git_describe(REPO_ROOT),
+        "helion_checkout_git_commit": (
+            _git_commit(REPO_ROOT, "HEAD") if owns_checkout else None
+        ),
+        "helion_checkout_git_describe": (
+            _git_describe(REPO_ROOT) if owns_checkout else None
+        ),
         **source_snapshot,
     }
 
@@ -842,8 +847,30 @@ def _git_commit(root: Path, rev: str) -> str | None:
     return proc.stdout.strip()
 
 
+def _git_worktree_root_matches(root: Path) -> bool:
+    """A source copy inside another checkout does not inherit its provenance."""
+    try:
+        worktree = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return bool(worktree) and Path(worktree).resolve() == root.resolve()
+
+
 def _git_source_snapshot(root: Path, pathspecs: tuple[str, ...]) -> dict[str, object]:
-    """Fingerprint tracked and untracked source content used by the benchmark."""
+    """Fingerprint source content only from the requested Git worktree root."""
+    unavailable: dict[str, object] = {
+        "helion_source_tree_sha256": None,
+        "helion_source_tree_file_count": None,
+        "helion_source_tree_dirty": None,
+    }
+    if not _git_worktree_root_matches(root):
+        return unavailable
     try:
         listed = subprocess.run(
             [
@@ -876,11 +903,7 @@ def _git_source_snapshot(root: Path, pathspecs: tuple[str, ...]) -> dict[str, ob
             text=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError):
-        return {
-            "helion_source_tree_sha256": None,
-            "helion_source_tree_file_count": None,
-            "helion_source_tree_dirty": None,
-        }
+        return unavailable
 
     relative_paths = sorted(set(listed.rstrip("\0").split("\0"))) if listed else []
     digest = hashlib.sha256()
@@ -10553,8 +10576,36 @@ def _import_fa4() -> types.ModuleType:
     """
     import cutlass._mlir.dialects.nvvm as nvvm
     import cutlass.cute as cute
+    import cutlass.utils
 
     fa4_root = _resolve_fa4_root()
+    if importlib.util.find_spec("cutlass.utils.ampere_helpers") is None:
+        # cutlass 4.7 removed the sm80 helper module; FA4 only reads
+        # SMEM_CAPACITY["sm80"] from it (and only on the sm80 code path,
+        # which never runs on Blackwell). Stub it so the import succeeds.
+        ampere_stub = types.ModuleType("cutlass.utils.ampere_helpers")
+        ampere_stub.SMEM_CAPACITY = {  # pyrefly: ignore [missing-attribute]
+            "sm80": 163 * 1024,
+            "sm86": 99 * 1024,
+            "sm89": 99 * 1024,
+        }
+        sys.modules["cutlass.utils.ampere_helpers"] = ampere_stub
+        cutlass.utils.ampere_helpers = ampere_stub  # pyrefly: ignore [missing-attribute]
+    if not hasattr(cute, "make_fragment"):
+        # cutlass 4.7 renamed make_fragment -> make_rmem_tensor (same signature).
+        cute.make_fragment = cute.make_rmem_tensor  # pyrefly: ignore [missing-attribute]
+    if not hasattr(cute.core.Tensor, "to"):
+        # cutlass 4.7 removed Tensor.to (rmem fragment dtype conversion);
+        # quack's cvt_copy and FA4 epilogues still call it. Reconstruct it as
+        # fragment-allocate + TensorSSA convert + store (the 4.7-native form).
+        def _tensor_to(
+            self: object, dtype: object, *, loc: object = None, ip: object = None
+        ) -> object:
+            out = cute.make_rmem_tensor(self.layout, dtype)  # pyrefly: ignore
+            out.store(self.load().to(dtype))  # pyrefly: ignore [missing-attribute]
+            return out
+
+        cute.core.Tensor.to = _tensor_to  # pyrefly: ignore [missing-attribute]
     for sym in ("ThrMma", "ThrCopy"):
         if not hasattr(cute.core, sym):
             setattr(cute.core, sym, getattr(cute, sym))

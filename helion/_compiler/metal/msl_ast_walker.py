@@ -21,10 +21,13 @@ Handles:
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
+from typing import Iterator
 
 from ... import exc
 from .mpp_graph_codegen import MPPSetupParams
+from .msl_reduction import REDUCTION_NAMESPACE
 
 
 @dataclasses.dataclass
@@ -34,12 +37,34 @@ class EmitState:
     Tracks declared variable names (to avoid duplicate ``auto`` declarations)
     and MPP matmul setup parameters (keyed by setup variable name).
 
+    Declarations are tracked per C++ block scope.  A rolled reduction emits
+    several sibling ``for`` loops that assign the same Helion variable (e.g.
+    ``rindex_1``); each needs its own ``auto`` because the previous loop's
+    declaration went out of scope at its closing brace.
+
     MPPGraph lowering emits explicit ``_coop_iter`` loops. The walker derives
     the MMA-result substitution from the setup marker's ``fx_name``.
     """
 
     declared: set[str] = dataclasses.field(default_factory=set)
     mpp_setups: dict[str, MPPSetupParams] = dataclasses.field(default_factory=dict)
+    _enclosing: list[set[str]] = dataclasses.field(default_factory=list)
+
+    def is_declared(self, name: str) -> bool:
+        return name in self.declared or any(name in s for s in self._enclosing)
+
+    def declare(self, name: str) -> None:
+        self.declared.add(name)
+
+    @contextlib.contextmanager
+    def block_scope(self) -> Iterator[None]:
+        """Enter a nested C++ block; declarations made inside do not escape."""
+        self._enclosing.append(self.declared)
+        self.declared = set()
+        try:
+            yield
+        finally:
+            self.declared = self._enclosing.pop()
 
 
 # ---------------------------------------------------------------------------
@@ -125,14 +150,14 @@ def _emit_stmts(
                 params = _extract_mpp_setup_params(value)
                 state.mpp_setups[target.id] = params
                 _emit_mpp_setup(target.id, params, parts, indent=indent)
-                state.declared.add(target.id)
+                state.declare(target.id)
                 continue
             val_msl = _ast_expr_to_msl(value, subs=subs)
-            if target.id in state.declared:
+            if state.is_declared(target.id):
                 parts.append(f"{pad}{target.id} = {val_msl};")
             else:
                 parts.append(f"{pad}auto {target.id} = {val_msl};")
-                state.declared.add(target.id)
+                state.declare(target.id)
         elif isinstance(stmt, ast.Expr):
             call = stmt.value
             # tl.store(ptr + offset, val, mask) → if (mask) { *(ptr+offset) = val; }
@@ -144,7 +169,15 @@ def _emit_stmts(
                 setup_arg = call.args[0]
                 assert isinstance(setup_arg, ast.Name)
                 k_offset_expr = _ast_expr_to_msl(call.args[1])
-                _emit_mpp_k_step(setup_arg.id, k_offset_expr, parts, indent=indent)
+                setup_params = state.mpp_setups[setup_arg.id]
+                _emit_mpp_k_step(
+                    setup_arg.id,
+                    k_offset_expr,
+                    parts,
+                    indent=indent,
+                    lhs_transposed=setup_params.lhs_transposed,
+                    rhs_transposed=setup_params.rhs_transposed,
+                )
             elif _is_call_to(call, "_metal_mpp_coop_store"):
                 # Three positional args: setup_var (Name), out_name (str),
                 # out_dtype (str).
@@ -171,12 +204,14 @@ def _emit_stmts(
         elif isinstance(stmt, ast.If):
             test_msl = _ast_expr_to_msl(stmt.test, subs=subs)
             parts.append(f"{pad}if ({test_msl}) {{")
-            _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
+            with state.block_scope():
+                _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
             if stmt.orelse:
                 parts.append(f"{pad}}} else {{")
-                _emit_stmts(
-                    stmt.orelse, parts, indent=indent + 4, state=state, subs=subs
-                )
+                with state.block_scope():
+                    _emit_stmts(
+                        stmt.orelse, parts, indent=indent + 4, state=state, subs=subs
+                    )
             parts.append(f"{pad}}}")
         elif isinstance(stmt, ast.For):
             _emit_for(stmt, parts, indent=indent, state=state, subs=subs)
@@ -238,7 +273,10 @@ def _emit_for(
                 f"{pad}for (auto _it = {coop}.begin(); _it != {coop}.end(); _it++) {{",
             )
         )
-        _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=coop_subs)
+        with state.block_scope():
+            _emit_stmts(
+                stmt.body, parts, indent=indent + 4, state=state, subs=coop_subs
+            )
         parts.append(f"{pad}}}")
         return
 
@@ -278,8 +316,9 @@ def _emit_for(
     parts.append(
         f"{pad}for (int {loop_var} = {start}; {loop_var} < {end}; {loop_var} += {step}) {{"
     )
-    state.declared.add(loop_var)
-    _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
+    with state.block_scope():
+        state.declare(loop_var)
+        _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
     parts.append(f"{pad}}}")
 
 
@@ -328,6 +367,12 @@ def _ast_int_value(node: ast.AST) -> int:
     return node.value
 
 
+def _ast_name_value(node: ast.AST) -> str:
+    """Extract a bare variable name from AST node."""
+    assert isinstance(node, ast.Name)
+    return node.id
+
+
 def _extract_mpp_setup_params(node: ast.Call) -> MPPSetupParams:
     """Extract parameters from ``_metal_mpp_setup(...)`` call.
 
@@ -336,7 +381,10 @@ def _extract_mpp_setup_params(node: ast.Call) -> MPPSetupParams:
       2-4: M, N, K,        5-7: TILE_M, TILE_N, TILE_K,
       8: NUM_SG,           9: in_dtype,       10: acc_dtype,
       11: bias tensor name (or ""),  12: bias metal dtype (or ""),
-      13: FX node name of the MMA op (or "").
+      13: FX node name of the MMA op (or ""),
+      14: lhs transpose flag (0/1),  15: rhs transpose flag (0/1),
+      16: lhs storage row width,  17: rhs storage row width,
+      18: M tile-offset variable,  19: N tile-offset variable (bare names).
 
     Output tensor name and dtype are deliberately carried by the explicit
     ``_metal_mpp_coop_store(setup, out_name, out_dtype)`` marker instead of
@@ -348,8 +396,8 @@ def _extract_mpp_setup_params(node: ast.Call) -> MPPSetupParams:
     will store to the same destination shape/dtype path.
     """
     args = node.args
-    assert len(args) == 14, (
-        f"_metal_mpp_setup expects 14 positional args, got {len(args)}"
+    assert len(args) == 20, (
+        f"_metal_mpp_setup expects 20 positional args, got {len(args)}"
     )
     return MPPSetupParams(
         lhs=_ast_str_value(args[0]),
@@ -366,6 +414,12 @@ def _extract_mpp_setup_params(node: ast.Call) -> MPPSetupParams:
         bias=_ast_str_value(args[11]) or None,
         bias_dtype=_ast_str_value(args[12]) or None,
         fx_name=_ast_str_value(args[13]) or None,
+        lhs_transposed=bool(_ast_int_value(args[14])),
+        rhs_transposed=bool(_ast_int_value(args[15])),
+        lhs_storage_row_width=_ast_int_value(args[16]),
+        rhs_storage_row_width=_ast_int_value(args[17]),
+        m_offset=_ast_name_value(args[18]),
+        n_offset=_ast_name_value(args[19]),
     )
 
 
@@ -377,12 +431,16 @@ def _emit_mpp_setup(
 ) -> None:
     """Emit MPP matmul2d setup MSL.
 
-    Declares the input tensor handles (``_A`` / ``_B``), the
-    ``matmul2d_descriptor`` and operator, the threadgroup-id → tile
-    decomposition, the operand slices, and the cooperative_tensor
-    accumulator.  The output tensor handle (``_C``) is declared by
-    :func:`_emit_mpp_coop_store` because its name and dtype are sourced
-    from the trailing ``tl.store(out_ptr, ...)`` rather than the setup.
+    Declares the input tensor handles (``_lhs`` / ``_rhs``), the
+    ``matmul2d_descriptor`` and operator, the per-axis tile indices, the
+    operand slices, and the cooperative_tensor accumulator.  The output
+    tensor handle (``_C``) is declared by :func:`_emit_mpp_coop_store`
+    because its name and dtype are sourced from the trailing
+    ``tl.store(out_ptr, ...)`` rather than the setup.
+
+    Handles cover each operand's storage: transposed operands swap the
+    handle extents and set the descriptor transpose flag, while row-padded
+    operands widen the handle's physical row width.
     """
     pad = " " * indent
     M_var = _scoped_mpp_name(setup_name, "_M")
@@ -392,24 +450,40 @@ def _emit_mpp_setup(
     TILE_N_var = _scoped_mpp_name(setup_name, "_TILE_N")
     TILE_K_var = _scoped_mpp_name(setup_name, "_TILE_K")
     NUM_SG_var = _scoped_mpp_name(setup_name, "_NUM_SG")
-    A_var = _scoped_mpp_name(setup_name, "_A")
-    B_var = _scoped_mpp_name(setup_name, "_B")
+    lhs_var = _scoped_mpp_name(setup_name, "_lhs")
+    rhs_var = _scoped_mpp_name(setup_name, "_rhs")
     D_var = _scoped_mpp_name(setup_name, "_D")
     Ds_var = _scoped_mpp_name(setup_name, "_Ds")
     desc_var = _scoped_mpp_name(setup_name, "_desc")
     op_var = _scoped_mpp_name(setup_name, "_op")
-    gm_var = _scoped_mpp_name(setup_name, "_gm")
-    flat_id_var = _scoped_mpp_name(setup_name, "_flat_id")
     ty_var = _scoped_mpp_name(setup_name, "_ty")
     tx_var = _scoped_mpp_name(setup_name, "_tx")
-    As_var = _scoped_mpp_name(setup_name, "_As")
-    Bs_var = _scoped_mpp_name(setup_name, "_Bs")
+    lhs_slice_var = _scoped_mpp_name(setup_name, "_lhs_slice")
+    rhs_slice_var = _scoped_mpp_name(setup_name, "_rhs_slice")
     coop_var = _scoped_mpp_name(setup_name, "_coop")
 
     needs_k_loop = params.TILE_K < params.K
     # When bias is provided, always use multiply_accumulate so
     # _op.run accumulates onto the pre-loaded bias values.
     mm_mode = "multiply_accumulate" if needs_k_loop or params.bias else "multiply"
+    lhs_transposed = "true" if params.lhs_transposed else "false"
+    rhs_transposed = "true" if params.rhs_transposed else "false"
+    if params.lhs_transposed:
+        lhs_ext1 = params.K
+        lhs_slice_shape = f"{params.TILE_M}, {params.TILE_K}"
+        lhs_slice_offset = f"{ty_var} * {TILE_M_var}, 0"
+    else:
+        lhs_ext1 = params.M
+        lhs_slice_shape = f"{params.TILE_K}, {params.TILE_M}"
+        lhs_slice_offset = f"0, {ty_var} * {TILE_M_var}"
+    if params.rhs_transposed:
+        rhs_ext1 = params.N
+        rhs_slice_shape = f"{params.TILE_K}, {params.TILE_N}"
+        rhs_slice_offset = f"0, {tx_var} * {TILE_N_var}"
+    else:
+        rhs_ext1 = params.K
+        rhs_slice_shape = f"{params.TILE_N}, {params.TILE_K}"
+        rhs_slice_offset = f"{tx_var} * {TILE_N_var}, 0"
 
     parts.extend(
         [
@@ -422,39 +496,39 @@ def _emit_mpp_setup(
             f"{pad}constexpr int {TILE_K_var} = {params.TILE_K};",
             f"{pad}constexpr int {NUM_SG_var} = {params.NUM_SG};",
             "",
-            f"{pad}auto {A_var} = tensor<device {params.in_dtype}, dextents<int32_t, 2>, tensor_inline>(",
-            f"{pad}    {params.lhs}, dextents<int32_t, 2>({K_var}, {M_var}));",
-            f"{pad}auto {B_var} = tensor<device {params.in_dtype}, dextents<int32_t, 2>, tensor_inline>(",
-            f"{pad}    {params.rhs}, dextents<int32_t, 2>({N_var}, {K_var}));",
+            f"{pad}auto {lhs_var} = tensor<device {params.in_dtype}, dextents<int32_t, 2>, tensor_inline>(",
+            f"{pad}    {params.lhs}, dextents<int32_t, 2>({params.lhs_storage_row_width}, {lhs_ext1}));",
+            f"{pad}auto {rhs_var} = tensor<device {params.in_dtype}, dextents<int32_t, 2>, tensor_inline>(",
+            f"{pad}    {params.rhs}, dextents<int32_t, 2>({params.rhs_storage_row_width}, {rhs_ext1}));",
             "",
             f"{pad}constexpr auto {desc_var} = matmul2d_descriptor(",
             f"{pad}    {TILE_M_var}, {TILE_N_var}, {TILE_K_var},",
-            f"{pad}    false, false, false, matmul2d_descriptor::mode::{mm_mode});",
+            f"{pad}    {lhs_transposed}, {rhs_transposed}, false, matmul2d_descriptor::mode::{mm_mode});",
             f"{pad}matmul2d<{desc_var}, execution_simdgroups<{NUM_SG_var}>> {op_var};",
             "",
-            f"{pad}// Decompose flat threadgroup ID into 2D tile indices",
-            f"{pad}uint {gm_var} = ({M_var} + {TILE_M_var} - 1) / {TILE_M_var};",
-            f"{pad}uint {flat_id_var} = tgid[0];",
-            f"{pad}uint {ty_var} = {flat_id_var} % {gm_var};",
-            f"{pad}uint {tx_var} = {flat_id_var} / {gm_var};",
+            # Tile indices from the branch-local tile offsets.  Each top-level
+            # loop computes its own offsets from its rebased program ids, so
+            # unlike the raw launch id these are exact in every root grid.
+            f"{pad}uint {ty_var} = ({params.m_offset} / {TILE_M_var});",
+            f"{pad}uint {tx_var} = ({params.n_offset} / {TILE_N_var});",
             "",
             # The setup slices only define the cooperative_tensor type.  Keep
             # their extents static so MPP can allocate the cooperative tile
             # without falling back to deferred dynamic storage.
-            f"{pad}auto {As_var} = {A_var}.slice<{params.TILE_K}, {params.TILE_M}>(",
-            f"{pad}    0, {ty_var} * {TILE_M_var});",
-            f"{pad}auto {Bs_var} = {B_var}.slice<{params.TILE_N}, {params.TILE_K}>(",
-            f"{pad}    {tx_var} * {TILE_N_var}, 0);",
+            f"{pad}auto {lhs_slice_var} = {lhs_var}.slice<{lhs_slice_shape}>(",
+            f"{pad}    {lhs_slice_offset});",
+            f"{pad}auto {rhs_slice_var} = {rhs_var}.slice<{rhs_slice_shape}>(",
+            f"{pad}    {rhs_slice_offset});",
             "",
             f"{pad}auto {coop_var} = {op_var}.get_destination_cooperative_tensor<",
-            f"{pad}    decltype({As_var}), decltype({Bs_var}), {params.acc_dtype}>();",
+            f"{pad}    decltype({lhs_slice_var}), decltype({rhs_slice_var}), {params.acc_dtype}>();",
         ]
     )
     if params.bias:
-        # For addmm (C = A*B + bias): load the bias tensor into the
+        # For addmm (output = lhs*rhs + bias): load the bias tensor into the
         # cooperative_tensor BEFORE the K-loop.  Since _op.run uses
-        # multiply_accumulate mode (C += A*B), the bias values serve as
-        # the initial accumulator and the final result is bias + A*B.
+        # multiply_accumulate mode (output += lhs*rhs), the bias values serve
+        # as the initial accumulator and the final result is bias + lhs*rhs.
         bias_dtype = params.bias_dtype
         assert bias_dtype, "bias_dtype must be populated when bias is provided"
         parts.extend(
@@ -481,24 +555,39 @@ def _emit_mpp_k_step(
     k_offset_expr: str,
     parts: list[str],
     indent: int,
+    *,
+    lhs_transposed: bool,
+    rhs_transposed: bool,
 ) -> None:
-    """Emit MPP K-tile step MSL."""
+    """Emit MPP K-tile step MSL.
+
+    Slice offsets mirror the setup slices: a transposed operand stores K
+    along the handle's second axis, so the K offset and tile offset swap.
+    """
     pad = " " * indent
-    A_var = _scoped_mpp_name(setup_name, "_A")
-    B_var = _scoped_mpp_name(setup_name, "_B")
-    Ak_var = _scoped_mpp_name(setup_name, "_Ak")
-    Bk_var = _scoped_mpp_name(setup_name, "_Bk")
+    lhs_var = _scoped_mpp_name(setup_name, "_lhs")
+    rhs_var = _scoped_mpp_name(setup_name, "_rhs")
+    lhs_k_var = _scoped_mpp_name(setup_name, "_lhs_k")
+    rhs_k_var = _scoped_mpp_name(setup_name, "_rhs_k")
     TILE_M_var = _scoped_mpp_name(setup_name, "_TILE_M")
     TILE_N_var = _scoped_mpp_name(setup_name, "_TILE_N")
     ty_var = _scoped_mpp_name(setup_name, "_ty")
     tx_var = _scoped_mpp_name(setup_name, "_tx")
     op_var = _scoped_mpp_name(setup_name, "_op")
     coop_var = _scoped_mpp_name(setup_name, "_coop")
+    if lhs_transposed:
+        lhs_k_slice = f"{ty_var} * {TILE_M_var}, {k_offset_expr}"
+    else:
+        lhs_k_slice = f"{k_offset_expr}, {ty_var} * {TILE_M_var}"
+    if rhs_transposed:
+        rhs_k_slice = f"{k_offset_expr}, {tx_var} * {TILE_N_var}"
+    else:
+        rhs_k_slice = f"{tx_var} * {TILE_N_var}, {k_offset_expr}"
     parts.extend(
         [
-            f"{pad}auto {Ak_var} = {A_var}.slice({k_offset_expr}, {ty_var} * {TILE_M_var});",
-            f"{pad}auto {Bk_var} = {B_var}.slice({tx_var} * {TILE_N_var}, {k_offset_expr});",
-            f"{pad}{op_var}.run({Ak_var}, {Bk_var}, {coop_var});",
+            f"{pad}auto {lhs_k_var} = {lhs_var}.slice({lhs_k_slice});",
+            f"{pad}auto {rhs_k_var} = {rhs_var}.slice({rhs_k_slice});",
+            f"{pad}{op_var}.run({lhs_k_var}, {rhs_k_var}, {coop_var});",
         ]
     )
 
@@ -714,6 +803,22 @@ def _ast_call_to_msl(node: ast.AST, subs: dict[str, str] | None = None) -> str:
     assert isinstance(node, ast.Call)
     func = node.func
 
+    # Inductor's constant_repr spells non-finite floats as float("inf") /
+    # float("-inf") / float("nan"); MSL has literals for those.  Reduction
+    # identities for max/min are the main source.
+    if (
+        isinstance(func, ast.Name)
+        and func.id == "float"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    ):
+        text = node.args[0].value.strip().lower()
+        literal = _NON_FINITE_FLOATS.get(text)
+        if literal is None:
+            raise exc.BackendUnsupported("metal", f"float constant: {text!r}")
+        return literal
+
     # tl.load(ptr + offset, mask, other=0) → (mask ? *(ptr+offset) : (other))
     if (
         isinstance(func, ast.Attribute)
@@ -748,7 +853,14 @@ def _ast_call_to_msl(node: ast.AST, subs: dict[str, str] | None = None) -> str:
     return f"{func_msl}({', '.join(args_msl)})"
 
 
-_CPP_NAMESPACE_ROOTS = frozenset({"metal", "c10"})
+#: What Inductor's ``constant_repr`` emits for non-finite float constants.
+_NON_FINITE_FLOATS = {
+    "inf": "INFINITY",
+    "-inf": "(-INFINITY)",
+    "nan": "NAN",
+}
+
+_CPP_NAMESPACE_ROOTS = frozenset({"metal", "c10", REDUCTION_NAMESPACE})
 
 
 def _is_cpp_namespace_root(node: ast.Attribute) -> bool:
@@ -763,12 +875,34 @@ def _is_cpp_namespace_root(node: ast.Attribute) -> bool:
     return isinstance(node.value, ast.Name) and node.value.id in _CPP_NAMESPACE_ROOTS
 
 
+def _is_broadcast_subscript(index: ast.expr) -> bool:
+    """Return True for a pure reshape/broadcast index such as ``[:, None]``."""
+    elts = index.elts if isinstance(index, ast.Tuple) else [index]
+    if not elts:
+        return False
+    return all(
+        (
+            isinstance(elt, ast.Slice)
+            and elt.lower is None
+            and elt.upper is None
+            and elt.step is None
+        )
+        or (isinstance(elt, ast.Constant) and elt.value is None)
+        for elt in elts
+    )
+
+
 def _ast_subscript_to_msl(node: ast.AST, subs: dict[str, str] | None = None) -> str:
     """Convert an AST Subscript node to MSL.
 
-    Only simple index subscripts (e.g. ``tgid[0]``) are supported.
+    Only simple index subscripts (e.g. ``tgid[0]``) are supported, plus
+    tile-shape broadcasts (``x[:, None]``), which Helion emits when a reduced
+    value is broadcast back over the reduction axis.  Metal values are
+    per-thread scalars, so those are a no-op.
     """
     assert isinstance(node, ast.Subscript)
+    if _is_broadcast_subscript(node.slice):
+        return _ast_expr_to_msl(node.value, subs=subs)
     buf_name = _ast_expr_to_msl(node.value, subs=subs)
     idx = _ast_expr_to_msl(node.slice, subs=subs)
     return f"{buf_name}[{idx}]"

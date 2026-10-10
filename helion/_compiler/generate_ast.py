@@ -4,9 +4,11 @@ import ast
 import collections
 import contextlib
 import dataclasses
+import logging
 import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import cast
 
 import sympy
 import torch
@@ -26,8 +28,14 @@ from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
+from .cute.cute_reshape import run_deferred_rebound_checks
+from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
+from .cute.register_tile_admission import RegisterTileUnsupported
+from .cute.unroll_lane_loads import LaneUnrollNotApplied
+from .cute.unroll_lane_loads import lane_unroll_off_config
 from .device_function import ConstExprArg
 from .device_function import DeviceFunction
+from .device_function import TensorArg
 from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
@@ -45,13 +53,34 @@ if TYPE_CHECKING:
 
     from torch.fx.node import Node
 
-    from ..runtime import Config
+    from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .pallas.compact_worklist import ResidentPrepHoist
     from .pallas.dma import DmaResources
     from .tile_strategy import DeviceLoopOrGridState
     from .type_info import TensorType
+
+log = logging.getLogger(__name__)
+
+
+class VloopSinkNotApplied(exc.Base):
+    """``cute_vloop_sink`` shaped the thread layout but sank no vector loop.
+
+    The knob must not change the code by itself, so the kernel is regenerated
+    with the knob off (``vloop_sink_off_config``): by ``generate_ast`` for the
+    codegen graphs it builds, and by a caller that supplied its own graphs
+    (materialized fission), which layout planning has annotated in place and
+    which therefore have to be rebuilt.  An ``exc.Base`` so the statement
+    visitor propagates it instead of wrapping it.
+    """
+
+
+def vloop_sink_off_config(config: Config) -> Config:
+    """``config`` with vector-loop sinking (and its lane unroll) off."""
+    return Config.from_dict(
+        {**config.config, "cute_vloop_sink": False, "cute_lane_unroll": 1}
+    )
 
 
 def _flatten_starred_args(args: list[ast.expr]) -> list[ast.expr]:
@@ -105,6 +134,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         store_transform: Callable[..., ast.AST] | None = None,
         load_transform: Callable[..., ast.AST] | None = None,
         extra_params: list[str] | None = None,
+        codegen_graphs: list[GraphInfo] | None = None,
     ) -> None:
         # Initialize NodeVisitor first
         NodeVisitor.__init__(self)
@@ -118,17 +148,24 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
         # Initialize our attributes
         self.host_function = func
-        self.codegen_graphs = func.device_ir.build_codegen_graphs(config)
+        config = CompileEnvironment.current().backend.codegen_config(config)
+        self.codegen_graphs = (
+            func.device_ir.build_codegen_graphs(config)
+            if codegen_graphs is None
+            else codegen_graphs
+        )
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
         self.cute_wrapper_plans: list[dict[str, object]] = []
-        self.cute_uses_matmul: bool = False
+        self._cute_uses_matmul: bool = False
+        self._cute_matmul_declaration_count = 0
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
             collections.defaultdict(list)
         )
         self.current_grid_state: DeviceGridState | None = None
+        self.divergent_control_flow_depth = 0
         self.current_root_graph_info: GraphInfo | None = None
         self.max_thread_block_dims = [1, 1, 1]
         self.root_thread_block_dims = [1, 1, 1]
@@ -141,6 +178,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # ``backend.py`` can grow the thread block to cover those lanes.
         self.cute_synthetic_arange_axes: dict[tuple[object, ...], int] = {}
         self.cute_synthetic_arange_axis_sizes: dict[int, int] = {}
+        # ``(load/store node, synthetic axis key) -> index position``: one
+        # synthetic lane may address only one index dim of a given access.
+        self.cute_synthetic_arange_access_positions: dict[
+            tuple[torch.fx.Node, object], int
+        ] = {}
         # CuTe only: stack of ``(if_node_id, branch_side)`` entries describing the
         # mutually-exclusive control-flow branch the current codegen is inside.
         # ``branch_side`` is 0 for the ``if`` body and 1 for the ``else`` body of
@@ -172,7 +214,14 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.next_else_block: list[ast.AST] | None = None
         self.store_transform = store_transform
         self.load_transform = load_transform
+        # Per-pass state of ``load_transform``: the fused inputs whose prologue
+        # placeholder this pass has emitted, mapped to their first dim-index
+        # expressions (``HelionTemplateBuffer._codegen_prologue_fusion``).  It
+        # lives on the pass rather than on the transform so the register-tile
+        # retry in ``generate_ast`` emits every placeholder again.
+        self.prologue_first_indexing: dict[str, str] = {}
         self._statement_owner_fx_node: Node | None = None
+        self._codegen_results_by_owner_node_id: dict[int, object] = {}
         self.resident_prep_lowering_stack: list[
             dict[tuple[int, str], ResidentPrepLowering]
         ] = []
@@ -208,6 +257,64 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # Same, for a store->load read-after-write *within* one loop body.
         self._compute_intra_loop_barriers()
 
+    @property
+    def cute_uses_matmul(self) -> bool:
+        return self._cute_uses_matmul
+
+    @cute_uses_matmul.setter
+    def cute_uses_matmul(self, value: bool) -> None:
+        self._cute_uses_matmul = value
+        # Count declarations, not False-to-True transitions: an unrelated
+        # matmul path must not inherit a register chain's shape-bake exemption.
+        if value:
+            self._cute_matmul_declaration_count += 1
+
+    def _cute_can_bake_tensor_shapes(self) -> bool:
+        if not self.cute_uses_matmul:
+            return True
+        if self.cute_wrapper_plans:
+            return all(
+                plan.get("kind")
+                in {
+                    "helion_small_biased_attention",
+                    "helion_flash_row_mma",
+                    "helion_warp_mma_gemm",
+                    "helion_flash",
+                    "helion_flash_gated",
+                    "chunk_prepare_tma",
+                    "chunk_recurrence_sm100",
+                    "chunk_recurrence_warp_dv4",
+                    "gdn_recurrence_sm100",
+                    "helion_flash_bwd",
+                    "gathered_mma_tma",
+                    "block_scaled_mma",
+                }
+                for plan in self.cute_wrapper_plans
+            )
+        state = self.device_function.cute_state
+        return (
+            state.collective_register_chain_lowered
+            and self._cute_matmul_declaration_count >= 2
+            and self._cute_matmul_declaration_count == len(state.collective_mma_sites)
+        ) or self._cute_has_complete_static_collectives()
+
+    def allow_dead_assignments_owned_by_nodes(self, nodes: tuple[Node, ...]) -> None:
+        """Allow liveness-based DCE for assignments from proven pure FX nodes.
+
+        Unlike removing their statements, this preserves any CSE temporary
+        still read by another node or by a replacement collective lowering.
+        The caller must prove that the supplied nodes have no side effects.
+        """
+        for node in nodes:
+            for _body, statement in self._statements_by_owner_node_id.get(id(node), ()):
+                for assignment in ast.walk(statement):
+                    if (
+                        isinstance(assignment, ast.Assign)
+                        and len(assignment.targets) == 1
+                        and isinstance(target := assignment.targets[0], ast.Name)
+                    ):
+                        self.device_function.dce_vars.append(target.id)
+
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
 
@@ -239,6 +346,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def offset_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
+
+    def tile_begin_var(self, block_idx: int) -> str:
+        """Uniform first index of the current tile along ``block_idx``.
+
+        ``tile.begin`` / ``tile.end`` / ``tile.id`` and their symbols render
+        through this; the CuTe backend derives it from the owning strategy's
+        thread / lane partition (see ``cute_tile_begin_expr``).
+        """
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.tile_ops import cute_tile_begin_expr
+
+            return cute_tile_begin_expr(self, block_idx)
+        return self.active_device_loops[block_idx][-1].strategy.tile_begin_var(
+            block_idx
+        )
 
     def index_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)
@@ -365,12 +487,33 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         cute_state = self.device_function.cute_state
         cute_state.attention_flash_block_ids = None
         cute_state.attention_flash_score_plan = None
+        cute_state.attention_flash_gated_match = None
         cute_state.attention_flash_threads = 128
 
     def _try_codegen_attention_flash_root(self) -> bool:
         cute_state = self.device_function.cute_state
+        if cute_state.attention_flash_bwd_block_ids is not None:
+            from .cute.cute_flash_bwd import codegen_attention_flash_bwd
+
+            if codegen_attention_flash_bwd(self):
+                return True
+            cute_state.attention_flash_bwd_block_ids = None
+            cute_state.attention_flash_bwd_match = None
+            raise exc.BackendUnsupported(
+                "cute", "flash attention backward failed late validation"
+            )
         if cute_state.attention_flash_block_ids is None:
             return False
+
+        if cute_state.attention_flash_gated_match is not None:
+            from .cute.cute_flash_gated import codegen_gated_attention_flash
+
+            if codegen_gated_attention_flash(self):
+                return True
+            self._clear_attention_flash_state()
+            raise exc.BackendUnsupported(
+                "cute", "gated attention failed late validation"
+            )
 
         from .cute.cute_flash import codegen_attention_flash
 
@@ -379,19 +522,216 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self._clear_attention_flash_state()
         raise exc.BackendUnsupported("cute", "flash attention failed late validation")
 
-    def add_statement(self, stmt: ast.AST | str | None) -> None:
+    def _try_codegen_warp_mma_gemm_root(self) -> bool:
+        if self.device_function.cute_state.warp_mma_gemm_plan is None:
+            return False
+        from .cute.cute_warp_mma_gemm import codegen_warp_mma_gemm
+
+        if codegen_warp_mma_gemm(self):
+            return True
+        self.device_function.cute_state.warp_mma_gemm_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "warp_mma GEMM family failed late validation"
+        )
+
+    def _try_codegen_single_token_rank1_root(self) -> bool:
+        plan = self.device_function.cute_state.single_token_rank1_plan
+        if plan is None:
+            return False
+        from .cute.single_token_rank1_recurrence import (
+            codegen_single_token_rank1_recurrence,
+        )
+
+        if codegen_single_token_rank1_recurrence(self):
+            return True
+        self.device_function.cute_state.single_token_rank1_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "single-token rank-1 recurrence failed late validation"
+        )
+
+    def _try_codegen_split_single_token_rank1_root(self) -> bool:
+        plan = self.device_function.cute_state.split_single_token_rank1_plan
+        if plan is None:
+            return False
+        from .cute.split_single_token_rank1_recurrence import (
+            codegen_split_single_token_rank1_recurrence,
+        )
+
+        if codegen_split_single_token_rank1_recurrence(self, plan):
+            return True
+        self.device_function.cute_state.split_single_token_rank1_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "split single-token rank-1 recurrence failed late validation"
+        )
+
+    def _try_codegen_fixed_token_rank1_root(self) -> bool:
+        plan = self.device_function.cute_state.fixed_token_rank1_plan
+        if plan is None:
+            return False
+        from .cute.fixed_token_rank1_recurrence import (
+            codegen_fixed_token_rank1_recurrence,
+        )
+
+        if codegen_fixed_token_rank1_recurrence(self):
+            return True
+        self.device_function.cute_state.fixed_token_rank1_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "fixed-token rank-1 recurrence failed late validation"
+        )
+
+    def _try_codegen_chunk_prepare_root(self) -> bool:
+        plan = self.device_function.cute_state.chunk_prepare_plan
+        if plan is None:
+            return False
+        from .cute.chunk_prepare import codegen_chunk_prepare
+
+        if codegen_chunk_prepare(self):
+            return True
+        self.device_function.cute_state.chunk_prepare_plan = None
+        raise exc.BackendUnsupported("cute", "chunk prepare failed late validation")
+
+    def _try_codegen_block_scaled_root(self) -> bool:
+        if self.device_function.cute_state.block_scaled_plan is None:
+            return False
+        from .cute.block_scaled_mma import codegen_block_scaled
+
+        if codegen_block_scaled(self):
+            return True
+        raise exc.BackendUnsupported("cute", "block scaling failed late validation")
+
+    def _try_codegen_chunk_recurrence_root(self) -> bool:
+        plan = self.device_function.cute_state.chunk_recurrence_plan
+        if plan is None:
+            return False
+        from .cute.chunk_recurrence import codegen_chunk_recurrence
+
+        if codegen_chunk_recurrence(self):
+            return True
+        self.device_function.cute_state.chunk_recurrence_plan = None
+        raise exc.BackendUnsupported("cute", "chunk recurrence failed late validation")
+
+    def _try_codegen_gdn_recurrence_root(self) -> bool:
+        plan = self.device_function.cute_state.gdn_recurrence_plan
+        if plan is None:
+            return False
+        from .cute.gdn_recurrence import codegen_gdn_recurrence
+
+        if codegen_gdn_recurrence(self):
+            return True
+        self.device_function.cute_state.gdn_recurrence_plan = None
+        raise exc.BackendUnsupported("cute", "gdn recurrence failed late validation")
+
+    def _try_lower_direct_affine_root(
+        self,
+        grid: DeviceGridState,
+        root_body: list[ast.AST],
+    ) -> bool:
+        """Replace one proven affine-scan root after ordinary CuTe lowering."""
+
+        if (
+            self.device_function.config.cute_affine_scan_schedule
+            == DIRECT_AFFINE_ORDINARY_SCHEDULE
+        ):
+            return False
+        root = self.current_root_graph_info
+        if root is None:
+            raise exc.BackendUnsupported(
+                "cute", "direct affine scan has no active root"
+            )
+        candidates = tuple(
+            candidate
+            for candidate in self.device_function.cute_state.direct_affine_candidates
+            if candidate.graph_id == root.graph_id
+        )
+        if len(candidates) != 1:
+            raise exc.BackendUnsupported(
+                "cute", "direct affine scan requires one candidate in its root"
+            )
+
+        from .cute.direct_affine_lowering import resolve_direct_affine_lowering
+        from .cute.direct_affine_replay import replace_direct_affine_replay
+
+        resolved = resolve_direct_affine_lowering(
+            candidates[0],
+            root,
+            self,
+            grid,
+            root_body,
+            name_prefix=self.device_function.new_var("_helion_direct_affine"),
+        )
+        if resolved is None:
+            raise exc.BackendUnsupported(
+                "cute", "direct affine scan failed late validation"
+            )
+
+        existing_module_statements = {
+            ast.dump(statement, include_attributes=False)
+            for statement in self.module_statements
+        }
+        module_additions: list[ast.stmt] = []
+        for statement in resolved.emission.module_statements:
+            key = ast.dump(statement, include_attributes=False)
+            if key not in existing_module_statements:
+                module_additions.append(statement)
+                existing_module_statements.add(key)
+
+        body_snapshot = tuple(root_body)
+        owner_snapshot = {
+            owner: list(entries)
+            for owner, entries in self._statements_by_owner_node_id.items()
+        }
+        thread_dims_snapshot = tuple(self.referenced_thread_block_dims)
+        module_snapshot = tuple(self.module_statements)
+        previous_plan = self.device_function.cute_state.direct_affine_plan
+        previous_has_barrier = self.device_function.has_barrier
+        try:
+            if not replace_direct_affine_replay(
+                resolved.replay,
+                root,
+                self,
+                root_body,
+                resolved.emission.replacement_statements,
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "direct affine scan failed late validation"
+                )
+            self.module_statements.extend(module_additions)
+            self.device_function.cute_state.direct_affine_plan = resolved.plan
+            self.device_function.has_barrier = True
+        except Exception:
+            root_body[:] = body_snapshot
+            self._statements_by_owner_node_id.clear()
+            self._statements_by_owner_node_id.update(owner_snapshot)
+            self.referenced_thread_block_dims[:] = thread_dims_snapshot
+            self.module_statements[:] = module_snapshot
+            self.device_function.cute_state.direct_affine_plan = previous_plan
+            self.device_function.has_barrier = previous_has_barrier
+            raise
+        return True
+
+    def append_statement(
+        self,
+        body: list[ast.AST],
+        stmt: ast.AST | str | None,
+    ) -> None:
+        """Append a statement while preserving its exact FX owner."""
+
         if stmt is None:
             return
         if isinstance(stmt, str):
             stmt = statement_from_string(stmt)
-        self.statements_stack[-1].append(stmt)
+        body.append(stmt)
         owner_node = self._statement_owner_fx_node
         if owner_node is not None and self._track_statement_owners:
             self._statements_by_owner_node_id.setdefault(id(owner_node), []).append(
-                (self.statements_stack[-1], stmt)
+                (body, stmt)
             )
         self._record_statement_thread_references([stmt])
-        self._record_tcgen05_owned_statement(stmt)
+        if body is self.statements_stack[-1]:
+            self._record_tcgen05_owned_statement(stmt)
+
+    def add_statement(self, stmt: ast.AST | str | None) -> None:
+        self.append_statement(self.statements_stack[-1], stmt)
 
     def remove_statements_owned_by_nodes(self, nodes: tuple[Node, ...]) -> None:
         """Remove statements emitted earlier for exactly these FX nodes."""
@@ -400,6 +740,109 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             for body, stmt in entries:
                 with contextlib.suppress(ValueError):
                     body.remove(stmt)
+
+    def statements_owned_by_node(
+        self, node: Node
+    ) -> tuple[tuple[list[ast.AST], ast.AST], ...]:
+        """Return exact statement/container pairs recorded for one FX node."""
+
+        return tuple(self._statements_by_owner_node_id.get(id(node), ()))
+
+    def replace_owned_statement_span(
+        self,
+        body: list[ast.AST],
+        nodes: tuple[Node, ...],
+        replacement: tuple[ast.AST, ...],
+    ) -> bool:
+        """Atomically replace one contiguous, exactly-owned statement span.
+
+        The method performs every ownership and contiguity check before
+        changing ``body`` or the owner index.  This gives late CuTe rewrites a
+        fail-closed commit point after constructing and validating detached
+        replacement AST.
+        """
+
+        if not nodes or len(set(nodes)) != len(nodes):
+            return False
+        if any(not isinstance(statement, ast.stmt) for statement in replacement):
+            return False
+        source_ast_ids = {
+            id(child)
+            for statement in body
+            for child in ast.walk(statement)
+            if isinstance(child, (ast.stmt, ast.expr))
+        }
+        replacement_ast_ids = {
+            id(child)
+            for statement in replacement
+            for child in ast.walk(statement)
+            if isinstance(child, (ast.stmt, ast.expr))
+        }
+        if source_ast_ids & replacement_ast_ids:
+            return False
+        positions = {id(statement): index for index, statement in enumerate(body)}
+        if len(positions) != len(body):
+            return False
+        claimed: list[ast.AST] = []
+        for node in nodes:
+            entries = self.statements_owned_by_node(node)
+            if not entries or any(owner_body is not body for owner_body, _ in entries):
+                return False
+            claimed.extend(statement for _, statement in entries)
+        claimed_ids = [id(statement) for statement in claimed]
+        if len(claimed_ids) != len(set(claimed_ids)) or any(
+            statement_id not in positions for statement_id in claimed_ids
+        ):
+            return False
+        first = min(positions[statement_id] for statement_id in claimed_ids)
+        last = max(positions[statement_id] for statement_id in claimed_ids)
+        if {id(statement) for statement in body[first : last + 1]} != set(claimed_ids):
+            return False
+
+        referenced_dims = getattr(self, "referenced_thread_block_dims", None)
+        previous_referenced_dims = (
+            list(referenced_dims) if isinstance(referenced_dims, list) else None
+        )
+        try:
+            self._record_statement_thread_references(list(replacement))
+        except Exception:
+            if previous_referenced_dims is not None and isinstance(
+                referenced_dims, list
+            ):
+                referenced_dims[:] = previous_referenced_dims
+            raise
+        body[first : last + 1] = replacement
+        for node in nodes:
+            self._statements_by_owner_node_id.pop(id(node), None)
+        return True
+
+    def record_codegen_result(self, node: Node, result: object) -> None:
+        """Record the final result returned for an FX node without mutating metadata."""
+
+        self._codegen_results_by_owner_node_id[id(node)] = result
+
+    def codegen_result_for_node(self, node: Node) -> tuple[bool, object]:
+        """Return the final generated result for ``node``, if it was lowered."""
+
+        key = id(node)
+        if key not in self._codegen_results_by_owner_node_id:
+            return False, None
+        return True, self._codegen_results_by_owner_node_id[key]
+
+    def _cute_has_complete_static_collectives(self) -> bool:
+        state = self.device_function.cute_state
+        return (
+            cast(
+                "bool",
+                self.device_function.config.get(
+                    "cute_collective_static_layouts", False
+                ),
+            )
+            and not self.cute_wrapper_plans
+            and state.collective_mma_static_layouts
+            and self._cute_matmul_declaration_count > 0
+            and self._cute_matmul_declaration_count == len(state.collective_mma_sites)
+        )
 
     def _record_tcgen05_owned_statement(self, stmt: ast.AST) -> None:
         owner_node = self._statement_owner_fx_node
@@ -540,7 +983,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         """
         self._cute_branch_path.append((if_node_id, branch_side))
         try:
-            yield
+            with self.divergent_control_flow():
+                yield
         finally:
             self._cute_branch_path.pop()
 
@@ -563,6 +1007,39 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def _record_active_thread_axis_sizes(self) -> None:
         self._record_thread_axis_sizes(self._current_active_thread_axis_sizes())
+
+    @contextlib.contextmanager
+    def divergent_control_flow(self) -> Iterator[None]:
+        """Generate statements of a branch or while loop whose condition a
+        CuTe SIMT thread may evaluate differently from its neighbours; a
+        block-wide barrier must not be placed inside
+        (``divergent_control_flow_depth``)."""
+        self.divergent_control_flow_depth += 1
+        try:
+            yield
+        finally:
+            self.divergent_control_flow_depth -= 1
+
+    def active_thread_axis_sizes(self) -> dict[int, int]:
+        """The thread count along each launch axis the body being generated may
+        address: the active loops' and the free ``hl.arange`` dims'."""
+        return self._current_active_thread_axis_sizes()
+
+    def launch_thread_axis_sizes(self) -> dict[int, int]:
+        """The thread count along each launch axis, as far as the kernel has claimed it.
+
+        The maximum over the loops emitted so far (``max_thread_block_dims``,
+        the launch's block), the active loops and the free ``hl.arange`` dims,
+        and every strategy's reserved axes, entered or not.  A block-wide
+        barrier concerns every thread of the launch: the threads a loop
+        nested in a body addresses run the rest of the body too.
+        """
+        sizes = self._strategy_thread_axis_sizes()
+        for axis, size in self._current_active_thread_axis_sizes().items():
+            sizes[axis] = max(sizes.get(axis, 1), size)
+        for axis, size in enumerate(self.max_thread_block_dims):
+            sizes[axis] = max(sizes.get(axis, 1), size)
+        return sizes
 
     def _current_active_thread_axis_sizes(self) -> dict[int, int]:
         seen: set[int] = set()
@@ -953,11 +1430,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self._record_statement_thread_references(device_loop.inner_statements)
             try:
                 yield
+                # Finalizers first: a collected tile-vector store that a later
+                # statement of the body observes returns to its scalar form
+                # here, so the nest check and the barrier pass below judge the
+                # body as it is emitted.
+                for finalize in device_loop.body_finalizers:
+                    finalize()
             finally:
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
+        # The body is complete: the CuTe per-thread lane loops nested around
+        # it must be the tile program (or pin their uniform atomics).
+        device_loop.check_lane_loop_nest()
         if needs_barrier_before:
-            self.add_statement(statement_from_string("tl.debug_barrier()"))
+            for statement in self.device_function.cta_barrier():
+                self.add_statement(statement)
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
@@ -1134,8 +1621,22 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
 
                         codegen_fn(state)
+                    if isinstance(self.current_grid_state, DeviceGridState):
+                        self.current_grid_state.hoist_parent_statements = (
+                            self.statements_stack[-1]
+                        )
                     root = root_graph_info.graph
-                    if not self._try_codegen_attention_flash_root():
+                    if (
+                        not self._try_codegen_block_scaled_root()
+                        and not self._try_codegen_chunk_prepare_root()
+                        and not self._try_codegen_chunk_recurrence_root()
+                        and not self._try_codegen_gdn_recurrence_root()
+                        and not self._try_codegen_single_token_rank1_root()
+                        and not self._try_codegen_split_single_token_rank1_root()
+                        and not self._try_codegen_fixed_token_rank1_root()
+                        and not self._try_codegen_warp_mma_gemm_root()
+                        and not self._try_codegen_attention_flash_root()
+                    ):
                         grid_state = self.current_grid_state
                         if isinstance(grid_state, DeviceGridState):
                             # Codegen the body first so synthetic free-``hl.arange``
@@ -1144,7 +1645,17 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             wrapped_body: list[ast.AST] = []
                             with self.set_statements(wrapped_body):
                                 codegen_call_with_graph(self, root, [])
-                            if grid_state.has_lane_loops():
+                            if self._try_lower_direct_affine_root(
+                                grid_state, wrapped_body
+                            ):
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_prefix
+                                )
+                                self.statements_stack[-1].extend(wrapped_body)
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_suffix
+                                )
+                            elif grid_state.has_lane_loops():
                                 self.statements_stack[-1].extend(
                                     grid_state.outer_prefix
                                 )
@@ -1158,7 +1669,19 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                                     grid_state.outer_suffix
                                 )
                             else:
+                                # The index and mask definitions a strategy
+                                # hoists ahead of its lane loops are the
+                                # body's whether or not it has any: a tile
+                                # widened to a sibling loop's launch keeps one
+                                # element per thread and parks them there.
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_prefix
+                                )
+                                grid_state.add_body_barriers(wrapped_body)
                                 self.statements_stack[-1].extend(wrapped_body)
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_suffix
+                                )
                         else:
                             codegen_call_with_graph(self, root, [])
                 finally:
@@ -1220,23 +1743,172 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     )
                     from .tile_strategy import restore_unprocessed_lane_reduce_markers
                     from .tile_strategy import split_lane_loop_reductions
+                    from .tile_strategy import validate_lane_reduce_owners
 
                     # First interchange any ``for LANE: ... for MB: ...`` nest
                     # whose inner serial loop carries lane-reduce markers into a
                     # lane-outside-mb accumulator nest plus a lane-inside-mb
                     # reduction nest; then split the (now inner) lane loops into
                     # the two-pass accumulate/finalize/consume structure.
-                    self.device_function.body = (
-                        interchange_lane_outside_serial_reductions(
-                            list(self.device_function.body)
+                    proven_disjoint_pairs = (
+                        self.device_function.proven_disjoint_tensor_pairs()
+                    )
+                    if self.device_function.cute_state.resident_sequence_regions:
+                        from .cute.resident_sequence import (
+                            materialize_resident_sequences,
                         )
+
+                        fn = self.device_function
+                        env = CompileEnvironment.current()
+                        fn.body = materialize_resident_sequences(
+                            list(fn.body),
+                            regions=fn.cute_state.resident_sequence_regions,
+                            tensor_dtypes={
+                                argument.name: env.backend.dtype_str(
+                                    argument.fake_value.dtype
+                                )
+                                for argument in fn.arguments
+                                if isinstance(argument, TensorArg)
+                            },
+                            rename_groups={
+                                name: aliases[0]
+                                for name, aliases in fn._variable_renames.items()
+                            },
+                            disjoint_pairs=proven_disjoint_pairs,
+                            boundary_names={argument.name for argument in fn.arguments}
+                            | set(self._extra_params),
+                            resident=fn.config.config.get("cute_reduction_sequence")
+                            == "resident",
+                            new_var=fn.new_var,
+                        )
+                    if self.device_function.cute_state.resident_reduction_layouts:
+                        from .cute.resident_reductions import (
+                            materialize_resident_reductions,
+                        )
+                        from .cute.resident_reductions import (
+                            proven_resident_tensor_alignments,
+                        )
+                        from .cute.resident_reductions import (
+                            proven_resident_tensor_strides,
+                        )
+                        from .reduction_strategy import _cute_shared_memory_budget_bytes
+
+                        fn = self.device_function
+                        env = CompileEnvironment.current()
+                        pipelined = (
+                            fn.config.config.get("cute_reduction_schedule")
+                            == "pipelined"
+                        )
+                        constexpr_values = {
+                            name: size
+                            for block_ids, name in fn.block_size_var_cache.items()
+                            if len(block_ids) == 1
+                            and isinstance(
+                                size := fn.resolved_block_size(block_ids[0]), int
+                            )
+                        }
+                        fn.body = materialize_resident_reductions(
+                            list(fn.body),
+                            layouts=fn.cute_state.resident_reduction_layouts,
+                            tensor_dtypes={
+                                argument.name: env.backend.dtype_str(
+                                    argument.fake_value.dtype
+                                )
+                                for argument in fn.arguments
+                                if isinstance(argument, TensorArg)
+                            },
+                            tensor_strides=proven_resident_tensor_strides(fn),
+                            tensor_alignments=proven_resident_tensor_alignments(fn),
+                            group_rows=cast(
+                                "int",
+                                fn.config.config.get("cute_reduction_group_rows", 1),
+                            ),
+                            pipelined=pipelined,
+                            pipeline_depth=fn.config.cute_reduction_pipeline_depth,
+                            row_schedule=cast(
+                                "str",
+                                fn.config.get("cute_reduction_row_schedule", "batched"),
+                            ),
+                            pack_output=cast(
+                                "bool",
+                                fn.config.get("cute_reduction_pack_output", False),
+                            ),
+                            local_tree=cast(
+                                "bool",
+                                fn.config.get("cute_reduction_local_tree", False),
+                            ),
+                            shared_memory_budget=_cute_shared_memory_budget_bytes()
+                            if pipelined
+                            else 0,
+                            disjoint_pairs=proven_disjoint_pairs,
+                            rename_groups={
+                                name: aliases[0]
+                                for name, aliases in fn._variable_renames.items()
+                            },
+                            new_var=fn.new_var,
+                            constexpr_values=constexpr_values,
+                            uniform_names={argument.name for argument in fn.arguments}
+                            | set(self._extra_params),
+                            require_proof=True,
+                        )
+                    from .cute.nested_lane_reductions import (
+                        normalize_nested_lane_reductions,
                     )
+                    from .cute.nested_lane_reductions import resolve_pruned_lane_owners
+
+                    resolve_pruned_lane_owners(
+                        list(self.device_function.body),
+                        self.device_function.cute_state.reshape_lane_fallbacks,
+                    )
+                    self.device_function.body = normalize_nested_lane_reductions(
+                        list(self.device_function.body),
+                        uniform_names={
+                            *(
+                                argument.name
+                                for argument in self.device_function.arguments
+                            ),
+                            *self._extra_params,
+                        },
+                        proven_disjoint_tensor_pairs=proven_disjoint_pairs,
+                        proven_tensor_stride_values=self.device_function.proven_tensor_stride_values(),
+                        rename_groups={
+                            name: aliases[0]
+                            for name, aliases in self.device_function._variable_renames.items()
+                        },
+                    )
+                    validate_lane_reduce_owners(list(self.device_function.body))
+                    self.device_function.body = interchange_lane_outside_serial_reductions(
+                        list(self.device_function.body),
+                        proven_disjoint_tensor_pairs=proven_disjoint_pairs,
+                        protected_names={
+                            alias
+                            for name, aliases in self.device_function._variable_renames.items()
+                            if any(alias != name for alias in aliases)
+                            for alias in (name, *aliases)
+                        },
+                    )
+                    validate_lane_reduce_owners(list(self.device_function.body))
                     self.device_function.body = split_lane_loop_reductions(
-                        list(self.device_function.body)
+                        list(self.device_function.body),
+                        uniform_names={
+                            *(
+                                argument.name
+                                for argument in self.device_function.arguments
+                            ),
+                            *self._extra_params,
+                        },
+                        proven_disjoint_tensor_pairs=proven_disjoint_pairs,
+                        proven_tensor_stride_values=(
+                            self.device_function.proven_tensor_stride_values()
+                        ),
+                        rename_groups={
+                            name: aliases[0]
+                            for name, aliases in self.device_function._variable_renames.items()
+                        },
+                        running_sums=self.device_function.cute_matmul_running_sums,
                     )
-                    # Safety net: revert any lane-reduce marker that neither pass
-                    # rewrote so no ``_helion_lane_reduce`` call leaks into the
-                    # emitted kernel.
+                    # Reject any owned marker without a proved lowering, so an
+                    # incomplete per-lane input cannot stand in for a reduction.
                     self.device_function.body = restore_unprocessed_lane_reduce_markers(
                         list(self.device_function.body)
                     )
@@ -1245,14 +1917,59 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     # lane-invariant rescale / chunk-entry stores / final combine
                     # hoisted to run once per chunk (gdn_fwd_h).
                     self.device_function.body = hoist_lane_invariant_chunk_recurrence(
-                        list(self.device_function.body)
+                        list(self.device_function.body),
+                        rename_groups={
+                            name: aliases[0]
+                            for name, aliases in self.device_function._variable_renames.items()
+                        },
+                        running_sums=self.device_function.cute_matmul_running_sums,
                     )
+                    # Interchange a grid constexpr vector loop into the serial
+                    # reduction nest it wraps (column sums): one vector load
+                    # per row, V register accumulators, one grouped combine.
+                    if (
+                        self.device_function.config.config.get("cute_vloop_sink")
+                        is True
+                    ):
+                        self._sink_grid_vector_loops()
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
                     raise exc.EmptyDeviceLoopAfterDCE
                 return self.device_function.codegen_function_call()
             return None
         return self.generic_visit(node)
+
+    def _sink_grid_vector_loops(self) -> None:
+        cute_state = self.device_function.cute_state
+        fired = False
+        if cute_state.vloop_sink_wrappers:
+            from .cute.sink_vector_loops import sink_grid_vector_loops
+
+            self.device_function.body, fired = sink_grid_vector_loops(
+                list(self.device_function.body),
+                wrappers=cute_state.vloop_sink_wrappers,
+                loads=cute_state.vloop_sink_loads,
+                rename_groups={
+                    name: aliases[0]
+                    for name, aliases in self.device_function._variable_renames.items()
+                },
+                lane_unroll=cast(
+                    "int",
+                    self.device_function.config.config.get("cute_lane_unroll", 1),
+                ),
+                new_var=self.device_function.new_var,
+                tensor_dtypes={
+                    arg.name: arg.fake_value.dtype
+                    for arg in self.device_function.arguments
+                    if isinstance(arg, TensorArg)
+                },
+            )
+        if not fired and cute_state.vloop_sink_layout_applied:
+            # The knob shaped the thread layout but nothing was sunk.  The
+            # knob must not change the code by itself, so start over with it
+            # off (``generate_ast`` or the owner of the codegen graphs
+            # regenerates the knob-off code).
+            raise VloopSinkNotApplied
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         assert isinstance(node, ExtendedAST)
@@ -1372,7 +2089,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def host_dead_code_elimination(self) -> None:
         dce_vars: OrderedSet[str] = OrderedSet()
         allow_compiler_shape_helpers = (
-            self.device_function.config.cross_loop_schedule == "static_pipeline"
+            self.device_function.config.cross_loop_pipeline != "barrier"
         )
         for stmt in self.host_statements:
             if (
@@ -1433,9 +2150,300 @@ def generate_ast(
     store_transform: Callable[..., ast.AST] | None = None,
     load_transform: Callable[..., ast.AST] | None = None,
     extra_params: list[str] | None = None,
+    _codegen_graphs: list[GraphInfo] | None = None,
+    _memory_counters: dict[str, int] | None = None,
+    _host_prefix: list[ast.AST] | None = None,
+    _bounded_cache_request: BoundedCacheRequest | None = None,
+) -> ast.Module:
+    """Generate the kernel module for ``config``.
+
+    Two CuTe decisions are made before the tile body exists and are revisited
+    once it does, each by generating the kernel again:
+
+    - A persistent reduction chooses its register-tile lane nesting from the
+      device IR; when the generated body then holds a statement the two-pass
+      register-tile schedule cannot place (``cute/register_tile_admission.py``,
+      ``RegisterTileUnsupported``), the kernel is generated again without the
+      register tile.  The register tile was the only reason normalization kept
+      a reduction thread count below the extent persistent, so the retry
+      re-normalizes ``config`` with register tiles withheld: the looped
+      reduction when the remaining threads cannot cover the extent, otherwise
+      the same config with the rolled lane nesting the strategy used before
+      register tiles existed.  Caller-built codegen graphs
+      (``_codegen_graphs``) were rolled for ``config`` as given, so that retry
+      keeps the config and only the lane nesting changes.
+    - ``cute_vloop_sink`` shapes the thread layout during layout planning;
+      when no vector loop is sunk after all (``VloopSinkNotApplied``), the
+      kernel is generated again with the knob off (``vloop_sink_off_config``)
+      so the knob alone never changes the code.
+    - ``cute_lane_unroll`` without sinking asks the last kernel-body pass to
+      unroll the grid lane loops loads-first; when no loop takes it
+      (``LaneUnrollNotApplied``) the kernel is generated again with the
+      unroll off (``lane_unroll_off_config``), for the same reason.
+
+    The two compose: the register tile is admitted afresh on the knob-off
+    pass, and the sink pass runs on the rolled body of a rejected register
+    tile.  Each retry fires at most once per call (its handler switches off
+    what raised it), so a call generates the kernel at most three times.  The
+    abandoned passes leave nothing behind but their host prefix; per-pass
+    state of the memory transforms lives on the pass's ``GenerateAST``
+    (``prologue_first_indexing``), so a retry starts it afresh.
+    """
+    prefix_length = len(_host_prefix) if _host_prefix is not None else 0
+    env = CompileEnvironment.current()
+    register_tiles_disabled = env.cute_register_tile_disabled
+    try:
+        while True:
+            try:
+                return _generate_ast(
+                    func,
+                    config,
+                    emit_repro_caller,
+                    store_transform=store_transform,
+                    load_transform=load_transform,
+                    extra_params=extra_params,
+                    _codegen_graphs=_codegen_graphs,
+                    _memory_counters=_memory_counters,
+                    _host_prefix=_host_prefix,
+                    _bounded_cache_request=_bounded_cache_request,
+                )
+            except RegisterTileUnsupported as failure:
+                if env.cute_register_tile_disabled:
+                    raise
+                log.debug("regenerating with the rolled reduction lane: %s", failure)
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                if _codegen_graphs is None:
+                    retried = env.config_spec.normalized_config(
+                        config, _cute_register_tiles=False
+                    )
+                    if retried.config != config.config:
+                        log.debug(
+                            "the retry loops the reduction: reduction_loops=%s",
+                            retried.reduction_loops,
+                        )
+                        config = retried
+                env.cute_register_tile_disabled = True
+            except VloopSinkNotApplied:
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                if _codegen_graphs is not None:
+                    # Layout planning annotated the caller's graphs in place;
+                    # the caller rebuilds them for the knob-off run.
+                    raise
+                config = vloop_sink_off_config(config)
+            except LaneUnrollNotApplied:
+                # The unroll is a late AST pass that touches no graph, so
+                # the knob-off run reuses the caller's graphs as they are.
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                config = lane_unroll_off_config(config)
+    finally:
+        env.cute_register_tile_disabled = register_tiles_disabled
+
+
+def _generate_ast(
+    func: HostFunction,
+    config: Config,
+    emit_repro_caller: bool,
+    *,
+    store_transform: Callable[..., ast.AST] | None = None,
+    load_transform: Callable[..., ast.AST] | None = None,
+    extra_params: list[str] | None = None,
+    _codegen_graphs: list[GraphInfo] | None = None,
+    _memory_counters: dict[str, int] | None = None,
+    _host_prefix: list[ast.AST] | None = None,
+    _bounded_cache_request: BoundedCacheRequest | None = None,
 ) -> ast.Module:
     with func:
         env = CompileEnvironment.current()
+        if (
+            env.backend_name == "cute"
+            and config.get("cute_materialized_operand_schedule", "off") != "off"
+        ):
+            from .cute.packed_operand_codegen import generate_packed_operand
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+                or _codegen_graphs is not None
+                or _memory_counters is not None
+                or _host_prefix is not None
+                or _bounded_cache_request is not None
+                or config.get("cute_materialized_schedule", "off") != "off"
+            ):
+                raise exc.InvalidConfig(
+                    "packed-operand schedule requires complete ordinary codegen"
+                )
+            return generate_packed_operand(func, config, emit_repro_caller)
+        if (
+            env.backend_name == "cute"
+            and config.get("cute_materialized_schedule", "off") != "off"
+        ):
+            from .cute.row_resident_codegen import generate_row_resident
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+                or _codegen_graphs is not None
+                or _memory_counters is not None
+                or _host_prefix is not None
+                or _bounded_cache_request is not None
+            ):
+                raise exc.InvalidConfig(
+                    "row-resident schedule does not support external transforms or partial codegen"
+                )
+            return generate_row_resident(func, config, emit_repro_caller)
+        if (
+            env.backend.name == "cute"
+            and config.get("cute_mma_f32_conversion") == "warp_raw"
+        ):
+            from .cute.tcgen05_config import CuteTcgen05Config
+            from .cute.tcgen05_flat_grouped_codegen import (
+                generate_grouped_warp_tf32_candidate,
+            )
+            from .cute.tcgen05_flat_grouped_config import (
+                CONFIG_KEYS as GROUPED_WARP_KEYS,
+            )
+
+            if (
+                store_transform is None
+                and load_transform is None
+                and not extra_params
+                and _codegen_graphs is None
+                and _memory_counters is None
+                and _host_prefix is None
+                and _bounded_cache_request is None
+            ):
+                return generate_grouped_warp_tf32_candidate(
+                    func,
+                    config,
+                    emit_repro_caller,
+                    shared_capacity=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                        env.device
+                    ),
+                )
+            config = Config.from_dict(
+                {
+                    key: value
+                    for key, value in config.config.items()
+                    if key not in GROUPED_WARP_KEYS
+                }
+            )
+        if env.backend.name == "cute" and (
+            config.get("cute_grouped_rna_warps", 0)
+            or config.get("cute_mma_f32_conversion") == "tma_rn"
+        ):
+            from .cute.tcgen05_config import CuteTcgen05Config
+            from .cute.tcgen05_flat_grouped_codegen import (
+                generate_flat_grouped_native_candidate,
+            )
+            from .cute.tcgen05_flat_grouped_config import (
+                CONFIG_KEYS as GROUPED_RNA_KEYS,
+            )
+            from .cute.tcgen05_flat_grouped_config import K_KEY as GROUPED_RNA_K_KEY
+            from .cute.tcgen05_flat_grouped_config import K_STAGES
+            from .cute.tcgen05_flat_grouped_config import (
+                STAGES_KEY as GROUPED_RNA_STAGES_KEY,
+            )
+            from .cute.tcgen05_flat_grouped_config import (
+                WARPS_KEY as GROUPED_RNA_WARPS_KEY,
+            )
+
+            if (
+                store_transform is None
+                and load_transform is None
+                and not extra_params
+                and _codegen_graphs is None
+                and _memory_counters is None
+                and _host_prefix is None
+                and _bounded_cache_request is None
+            ):
+                block_k = config[GROUPED_RNA_K_KEY]
+                converter_warps = config.get(GROUPED_RNA_WARPS_KEY, 0)
+                assert isinstance(block_k, int)
+                assert isinstance(converter_warps, int)
+                return generate_flat_grouped_native_candidate(
+                    func,
+                    config,
+                    emit_repro_caller,
+                    converter_warps=converter_warps,
+                    block_k=block_k,
+                    ab_stages=cast(
+                        "int", config.get(GROUPED_RNA_STAGES_KEY, K_STAGES[block_k])
+                    ),
+                    shared_capacity=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                        env.device
+                    ),
+                )
+            config = Config.from_dict(
+                {
+                    key: value
+                    for key, value in config.config.items()
+                    if key not in GROUPED_RNA_KEYS
+                }
+            )
+        if env.backend.name == "cute" and config.get("cute_reduction_sequence") in {
+            "bounded",
+            "bounded_layout",
+        }:
+            if (
+                store_transform is None
+                and load_transform is None
+                and not extra_params
+                and _codegen_graphs is None
+                and _memory_counters is None
+                and _host_prefix is None
+            ):
+                from .cute.bounded_cache_codegen import generate_bounded_cache
+
+                return generate_bounded_cache(func, config, emit_repro_caller)
+            # Unsupported external transforms keep the ordinary lowering.
+            config = type(config).from_dict(
+                {**config.config, "cute_reduction_sequence": "scalar"}
+            )
+        if config.get("cute_split_k_schedule") == "cluster8_k4":
+            from .cute.split_k_cluster_codegen import generate_split_k_cluster
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+                or _codegen_graphs is not None
+                or _memory_counters is not None
+                or _host_prefix is not None
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "cluster split-K excludes external lowering transforms"
+                )
+            return generate_split_k_cluster(func, config, emit_repro_caller)
+        if config.get("cute_split_k_workspace", False) and _codegen_graphs is None:
+            from .cute.split_k_workspace_codegen import generate_split_k_workspace
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "split-K workspace does not support external memory transforms",
+                )
+            return generate_split_k_workspace(func, config, emit_repro_caller)
+        if env.cute_fission_plan is not None and len(func.device_ir.root_ids) > 1:
+            from .cute.materialized_fission_codegen import generate_materialized_fission
+
+            return generate_materialized_fission(
+                func,
+                config,
+                emit_repro_caller,
+                env.cute_fission_plan,
+                store_transform=store_transform,
+                load_transform=load_transform,
+                extra_params=extra_params,
+            )
         env.cute_resolved_wrapper_plans = []
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
@@ -1446,7 +2454,11 @@ def generate_ast(
             store_transform=store_transform,
             load_transform=load_transform,
             extra_params=extra_params,
+            codegen_graphs=_codegen_graphs,
         )
+        if _memory_counters is not None:
+            for name, value in _memory_counters.items():
+                setattr(codegen.device_function, name, value)
         with codegen.device_function:
             CompileEnvironment.current().backend.pre_codegen(
                 graphs=codegen.codegen_graphs,
@@ -1459,10 +2471,42 @@ def generate_ast(
             # via build_launcher_args -- is generated during that visit).
             _maybe_emit_compact_worklist_builder(codegen)
 
+            prefix_recorded = False
             for stmt in func.body:
+                if (
+                    _host_prefix is not None
+                    and not prefix_recorded
+                    and isinstance(stmt, ExtendedAST)
+                    and stmt._loop_type is LoopType.GRID
+                ):
+                    _host_prefix.extend(codegen.host_statements)
+                    prefix_recorded = True
                 codegen.add_statement(codegen.visit(stmt))
             codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
-            kernel_def = codegen.device_function.codegen_function_def()
+            # Re-binding checks deferred from tcgen05 epilogue chains that no
+            # store drained (chains ending in an atomic or a specialized
+            # store path).
+            run_deferred_rebound_checks(codegen)
+            if _bounded_cache_request is None:
+                kernel_def = codegen.device_function.codegen_function_def()
+            else:
+                kernel_def = codegen.device_function.codegen_function_def(
+                    bounded_cache_request=_bounded_cache_request
+                )
+            block_dims = (
+                codegen.device_function.cute_state.collective_register_chain_block_dims
+            )
+            if block_dims is not None:
+                from .cute.thread_block_projection import update_launch_block
+
+                assert (
+                    update_launch_block(
+                        codegen.host_statements,
+                        codegen.device_function.name,
+                        block_dims,
+                    )
+                    > 0
+                )
             codegen.host_dead_code_elimination()
 
             # Retarget output-only tensor allocations to ``device='meta'`` so
@@ -1527,12 +2571,11 @@ def generate_ast(
                 if codegen.device_function.has_rng_ops()
                 else []
             )
-            final_host_statements = rng_statements + codegen.host_statements
-            shape_bake_safe_wrapper_only = codegen.cute_wrapper_plans and all(
-                plan.get("kind") in {"helion_small_biased_attention", "helion_flash"}
-                for plan in codegen.cute_wrapper_plans
-            )
-            if codegen.cute_uses_matmul and not shape_bake_safe_wrapper_only:
+            final_host_statements: list[ast.AST] = [
+                *rng_statements,
+                *codegen.host_statements,
+            ]
+            if not codegen._cute_can_bake_tensor_shapes():
                 final_host_statements = [
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_disable_bake_tensor_shapes = True"
@@ -1571,12 +2614,37 @@ def generate_ast(
                     for key in (
                         "lhs_name",
                         "rhs_name",
+                        "lhs_scale_name",
+                        "rhs_scale_name",
+                        "workspace_name",
                         "c_name",
                         "d_name",
                         "q_name",
                         "k_name",
+                        "g_name",
+                        "w_name",
+                        "u_name",
+                        "h_name",
+                        "beta_name",
+                        "a_log_name",
+                        "dt_name",
+                        "cu_seqlens_name",
+                        "cu_chunks_name",
+                        "chunk_to_seq_name",
+                        "kd_name",
+                        "qd_name",
+                        "ak_name",
+                        "aq_name",
+                        "gt_name",
                         "v_name",
                         "o_name",
+                        "out_name",
+                        "state_name",
+                        "do_name",
+                        "delta_name",
+                        "dq_name",
+                        "dk_name",
+                        "dv_name",
                         "lse_name",
                         "bias_name",
                         "alibi_name",
@@ -1586,6 +2654,12 @@ def generate_ast(
                         "k_sizes_name",
                         "direct_pointers_name",
                         "direct_strides_name",
+                        "scale_name",
+                        "m_extent_name",
+                        "epi_aux0_name",
+                        "epi_aux1_name",
+                        "epi_aux2_name",
+                        "epi_aux3_name",
                     ):
                         if key in resolved:
                             arg_name = str(resolved.pop(key))
@@ -1626,6 +2700,26 @@ def generate_ast(
                 }
                 assert not remaining, (
                     f"sourceless prologue params not removed by DCE: {remaining}"
+                )
+
+            if env.backend_name == "cute":
+                from .cute.host_paired_sum import PAIRED_SUM_KEY
+                from .cute.host_paired_sum import lower_host_sum_pairs
+                from .cute.host_single_sum import lower_host_single_sum
+
+                final_host_statements = lower_host_sum_pairs(
+                    func,
+                    final_host_statements,
+                    cast(
+                        "str", codegen.device_function.config.get(PAIRED_SUM_KEY, "off")
+                    ),
+                )
+                final_host_statements = lower_host_single_sum(
+                    func,
+                    final_host_statements,
+                    cast(
+                        "str", codegen.device_function.config.get(PAIRED_SUM_KEY, "off")
+                    ),
                 )
 
             host_def = func.codegen_function_def(
@@ -1673,6 +2767,9 @@ def generate_ast(
             result.body[insert_at:insert_at] = [
                 statement_from_string(line) for line in missing_imports
             ]
+            if _memory_counters is not None:
+                for name in _memory_counters:
+                    _memory_counters[name] = getattr(codegen.device_function, name)
             # break circular reference for better GC
             del codegen.device_function.codegen
             return result

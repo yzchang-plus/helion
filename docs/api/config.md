@@ -143,7 +143,7 @@ Configs are typically discovered automatically through autotuning, but can also 
 
    - ``"pointer"``: Pointer-based indexing (default)
    - ``"tensor_descriptor"``: Tensor descriptor indexing (requires Hopper+ GPU)
-   - ``"block_ptr"``: Block pointer indexing
+   - ``"block_ptr"``: Block pointer indexing (Triton < 3.9 only; newer Triton removed block pointers, so this value is lowered as ``"pointer"`` and the autotuner no longer searches it)
 
    .. note::
       When using a list, provide one strategy for each load and store operation in the order
@@ -209,11 +209,12 @@ import helion.language as hl
 
 # Create a specific configuration
 config = helion.Config(
-    block_sizes=[64, 32],      # 64 elements per tile in dim 0, 32 in dim 1
-    num_warps=8,               # Use 8 warps (256 threads) per block
-    num_stages=4,              # 4-stage pipeline
-    pid_type="xyz"             # Use 3D program ID layout
+    block_sizes=[64, 32],  # 64 elements per tile in dim 0, 32 in dim 1
+    num_warps=8,  # Use 8 warps (256 threads) per block
+    num_stages=4,  # 4-stage pipeline
+    pid_type="xyz",  # Use 3D program ID layout
 )
+
 
 # Use with kernel
 @helion.kernel(config=config)
@@ -231,6 +232,7 @@ import torch
 import helion
 import helion.language as hl
 
+
 @helion.kernel(
     config={
         "block_size": 16,
@@ -240,10 +242,11 @@ import helion.language as hl
 def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
-        a = hl.load(x, [tile])                 # No eviction policy
-        b = hl.load(y, [tile])                 # Will use evict_last from config
+        a = hl.load(x, [tile])  # No eviction policy
+        b = hl.load(y, [tile])  # Will use evict_last from config
         out[tile] = a + b
     return out
+
 
 # Explicit policy on hl.load overrides config:
 # hl.load(x, [tile], eviction_policy="evict_first")
@@ -256,6 +259,7 @@ import torch
 import helion
 import helion.language as hl
 
+
 # Single indexing strategy for all loads and stores (backward compatible)
 @helion.kernel(config={"indexing": "block_ptr"})
 def kernel_uniform_indexing(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -263,8 +267,9 @@ def kernel_uniform_indexing(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size(0)):
         a = hl.load(x, [tile])  # Load: uses block_ptr
         b = hl.load(y, [tile])  # Load: uses block_ptr
-        out[tile] = a + b       # Store: uses block_ptr
+        out[tile] = a + b  # Store: uses block_ptr
     return out
+
 
 # Per-operation indexing strategies for fine-grained control
 # Indexing list is ordered: [load1, load2, ..., store1, store2, ...]
@@ -279,7 +284,7 @@ def kernel_mixed_indexing(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size(0)):
         a = hl.load(x, [tile])  # First load: pointer indexing
         b = hl.load(y, [tile])  # Second load: pointer indexing
-        out[tile] = a + b       # Store: block_ptr indexing
+        out[tile] = a + b  # Store: block_ptr indexing
     return out
 ```
 
@@ -306,6 +311,7 @@ configs = [
     helion.Config(block_sizes=[64, 16], num_warps=8),
     helion.Config(block_sizes=[16, 64], num_warps=4),
 ]
+
 
 @helion.kernel(configs=configs)
 def matrix_multiply(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

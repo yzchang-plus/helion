@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -11,6 +13,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -115,6 +118,88 @@ def atomic_add_1d_tensor_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tenso
         hl.atomic_add(z, [hl.arange(0, n)], z_vec)
 
     return z
+
+
+@helion.kernel(static_shapes=True)
+def atomic_add_full_slice_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """atomic_add into ``[tile, :]`` with values computed from two loads."""
+    out = torch.zeros_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        hl.atomic_add(out, [tile_m, slice(None)], x[tile_m, :] * 2 + y[tile_m, :])
+        hl.atomic_add(out, [tile_m, slice(None)], y[tile_m, :])
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def atomic_add_full_slice_reduce_kernel(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """Column sums accumulated through a bare ``[:]`` index."""
+    m, n = x.shape
+    n = hl.specialize(n)
+    out = torch.zeros([n], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        hl.atomic_add(out, [slice(None)], torch.sum(x[tile_m, :] * y[tile_m, :], dim=0))
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def atomic_max_full_slice_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """atomic_max into ``[tile, :]``."""
+    for tile_m in hl.tile(x.size(0)):
+        hl.atomic_max(x, [tile_m, slice(None)], y[tile_m, :])
+    return x
+
+
+@helion.kernel(static_shapes=True)
+def atomic_add_partial_slice_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """atomic_add into the partial slice ``[tile, 16:]``."""
+    out = torch.zeros_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        hl.atomic_add(out, [tile_m, slice(16, None)], x[tile_m, 16:] + y[tile_m, 16:])
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def atomic_add_two_partial_slices_kernel(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """Two atomic_adds on slices of different widths in one tile loop."""
+    out = torch.zeros_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        hl.atomic_add(out, [tile_m, slice(16, None)], x[tile_m, 16:] + y[tile_m, 16:])
+        hl.atomic_add(out, [tile_m, slice(None, 16)], y[tile_m, :16])
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def atomic_add_invariant_inner_tile_kernel(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """atomic_add inside an inner tile loop whose tile it does not index.
+
+    The value only depends on the inner tile's block size, so the loop adds
+    ``y.size(0) * x`` in total however the inner loop is tiled.
+    """
+    out = torch.zeros([x.size(0)], device=x.device, dtype=x.dtype)
+    for tile_m in hl.tile(x.size(0)):
+        for tile_n in hl.tile(y.size(0)):
+            hl.atomic_add(out, [tile_m], x[tile_m] * tile_n.block_size)
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def atomic_add_invariant_inner_2d_tile_kernel(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """atomic_add inside a 2-D inner tile loop whose tiles it does not index."""
+    out = torch.zeros([x.size(0)], device=x.device, dtype=x.dtype)
+    for tile_m in hl.tile(x.size(0)):
+        for tile_i, tile_j in hl.tile([y.size(0), y.size(1)]):
+            hl.atomic_add(
+                out, [tile_m], x[tile_m] * (tile_i.block_size * tile_j.block_size)
+            )
+    return out
 
 
 @helion.kernel()
@@ -644,6 +729,125 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         expected = torch.tensor([1, 0], device=DEVICE, dtype=torch.int32).repeat(10)
         torch.testing.assert_close(result, expected)
 
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_add_full_slice(self):
+        x = torch.randn(96, 48, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(96, 48, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            atomic_add_full_slice_kernel,
+            (x, y),
+            block_sizes=[32],
+        )
+        torch.testing.assert_close(result, 2 * x + 2 * y)
+        if _get_backend() == "cute":
+            self.assertIn("atomic_add", code)
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_add_full_slice_reduce(self):
+        x = torch.randn(128, 64, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, 64, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            atomic_add_full_slice_reduce_kernel,
+            (x, y),
+            block_sizes=[32],
+        )
+        torch.testing.assert_close(result, (x * y).sum(dim=0), rtol=1e-4, atol=1e-4)
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_max_full_slice(self):
+        x = torch.randn(64, 48, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(64, 48, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            atomic_max_full_slice_kernel,
+            (x.clone(), y),
+            block_sizes=[32],
+        )
+        torch.testing.assert_close(result, torch.maximum(x, y))
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_add_partial_slice(self):
+        x = torch.randn(96, 48, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(96, 48, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            atomic_add_partial_slice_kernel,
+            (x, y),
+            block_sizes=[32],
+        )
+        expected = torch.zeros_like(x)
+        expected[:, 16:] = x[:, 16:] + y[:, 16:]
+        torch.testing.assert_close(result, expected)
+        if _get_backend() == "cute":
+            self.assertIn("atomic_add", code)
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_add_two_partial_slices(self):
+        x = torch.randn(96, 48, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(96, 48, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            atomic_add_two_partial_slices_kernel,
+            (x, y),
+            block_sizes=[32],
+        )
+        expected = torch.zeros_like(x)
+        expected[:, 16:] = x[:, 16:] + y[:, 16:]
+        expected[:, :16] = y[:, :16]
+        torch.testing.assert_close(result, expected)
+        if _get_backend() == "cute":
+            # The 16-wide slice is walked by a per-thread lane loop.  The
+            # 32-wide slice's atomic reads none of that loop's coordinates, so
+            # it is placed before the loop (or pinned to its first lane) and
+            # fires once per thread instead of once per lane.
+            atomic_at = code.find("cute.arch.atomic_add(")
+            lane_loop_at = code.find("for synthetic_lane_")
+            self.assertTrueIfInNormalMode(
+                0 <= atomic_at < lane_loop_at
+                or re.search(r"if [^\n]*lane_\d+ == 0", code) is not None
+            )
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_add_invariant_in_inner_tile_loop(self):
+        x = torch.randn(64, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, 8, device=DEVICE, dtype=torch.float32)
+        configs = [{}]
+        if _get_backend() == "cute":
+            # Scalar lane loop and outer x constexpr-vector lane partition: the
+            # body ignores the inner tile's lanes, so the nest check splices
+            # the lane loop out, or pins the atomic to lane 0 if it keeps it.
+            configs = [{}, {"cute_vector_widths": [1, 4]}]
+        for config in configs:
+            code, result = code_and_output(
+                atomic_add_invariant_inner_tile_kernel,
+                (x, y),
+                block_sizes=[32, 64],
+                **config,
+            )
+            torch.testing.assert_close(result, y.size(0) * x)
+            if config:
+                self.assertTrueIfInNormalMode(
+                    re.search(r"for (vec_)?lane_\d+ in", code) is None
+                    or re.search(r"if lane_\d+ == 0 and vec_lane_\d+ == 0", code)
+                    is not None
+                )
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_add_invariant_in_inner_2d_tile_loop(self):
+        x = torch.randn(64, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            atomic_add_invariant_inner_2d_tile_kernel,
+            (x, y),
+            block_sizes=[32, 8, 8],
+        )
+        torch.testing.assert_close(result, y.numel() * x)
+        if _get_backend() == "cute":
+            # Both inner tile blocks are walked by single-thread lane loops
+            # that the body never reads: the loops are eliminated, or the
+            # atomic is pinned to their first lanes.
+            self.assertTrueIfInNormalMode(
+                "for lane_" not in code
+                or re.search(r"if lane_\d+ == 0 and lane_\d+ == 0", code) is not None
+            )
+
     @xfailIfPallas(
         "atomic scalar-origin reduction pattern is only validated on GPU backends"
     )
@@ -657,7 +861,10 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             block_sizes=[2, 2],
         )
 
-        expected = torch.tensor([4, 0, 4, 0], device=DEVICE, dtype=x.dtype)
+        # ``x[tile_m, tile_n]`` covers both tile axes, so every element of a
+        # tile is added to ``out[tile_m.begin]``: two column tiles of four
+        # ones per row tile, whatever the thread mapping of the row axis.
+        expected = torch.tensor([8, 0, 8, 0], device=DEVICE, dtype=x.dtype)
         torch.testing.assert_close(result, expected)
 
     @xfailIfPallas("AtomicOnDeviceTensor error message differs on Pallas")
@@ -756,6 +963,119 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             self.assertIn("tl.atomic_cas", code)
 
     @onlyBackends("triton")
+    @skipIfNotCUDA()
+    @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
+    @skipIfRefEager("program-level atomic synchronization is codegen-only")
+    def test_release_acquire_atomics_sync_program(self):
+        """Release and acquire atomics order every thread of the program, not only the issuing one."""
+        config = helion.Config(block_sizes=[128], num_warps=4)
+
+        @helion.kernel(config=config, static_shapes=True)
+        def release_unused(
+            out: torch.Tensor, x: torch.Tensor, count: torch.Tensor, done: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+                hl.atomic_add(count, [0], 1, sem="release")
+            return out
+
+        @helion.kernel(config=config, static_shapes=True)
+        def acq_rel_unused(
+            out: torch.Tensor, x: torch.Tensor, count: torch.Tensor, done: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+                hl.atomic_add(count, [0], 1, sem="acq_rel")
+            return out
+
+        @helion.kernel(config=config, static_shapes=True)
+        def acq_rel_used(
+            out: torch.Tensor, x: torch.Tensor, count: torch.Tensor, done: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+                arrived = hl.atomic_add(count, [0], 1, sem="acq_rel")
+                if arrived == 3:
+                    done[0] = 1
+            return out
+
+        @helion.kernel(config=config, static_shapes=True)
+        def cas_acquire_unused(
+            out: torch.Tensor, x: torch.Tensor, count: torch.Tensor, done: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                hl.atomic_cas(done, [0], 0, 1, sem="acquire")
+                hl.atomic_add(count, [0], 1, sem="relaxed")
+                out[tile] = x[tile] * 2.0
+            return out
+
+        @helion.kernel(config=config, static_shapes=True)
+        def relaxed(
+            out: torch.Tensor, x: torch.Tensor, count: torch.Tensor, done: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+                hl.atomic_add(count, [0], 1, sem="relaxed")
+            return out
+
+        # kernel: (atomic call, barrier before it, barrier after it, final done)
+        cases = {
+            release_unused: ("tl.atomic_add(", True, False, 0),
+            acq_rel_unused: ("tl.atomic_add(", True, True, 0),
+            # Triton itself broadcasts a used scalar result behind a bar.sync.
+            acq_rel_used: ("tl.atomic_add(", True, False, 1),
+            cas_acquire_unused: ("tl.atomic_cas(", False, True, 1),
+            relaxed: ("tl.atomic_add(", False, False, 0),
+        }
+        x = torch.randn(512, device=DEVICE)
+        for kernel, (call, before, after, final_done) in cases.items():
+            out = torch.empty_like(x)
+            count = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+            done = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+            code, result = code_and_output(kernel, (out, x, count, done))
+            torch.testing.assert_close(result, x * 2.0)
+            self.assertEqual(int(count.item()), 4)
+            self.assertEqual(int(done.item()), final_done)
+            atomic = code.index(call)
+            barrier = code.rfind("tl.debug_barrier()", 0, atomic)
+            if before:
+                self.assertGreater(barrier, code.rfind("tl.store(", 0, atomic))
+            else:
+                self.assertEqual(barrier, -1)
+            self.assertEqual(code.find("tl.debug_barrier()", atomic) != -1, after)
+
+    @onlyBackends("triton")
+    @skipIfRocm("Tensor descriptor not supported on ROCm")
+    @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("TMA drains are codegen-only")
+    def test_release_drains_tma_store_after_tile_index(self):
+        """A tile-index read shifts codegen's memory-op slots; the TMA store still drains."""
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def store_then_release(x: torch.Tensor, flag: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[32, 32]):
+                rows = tile_m.index[:, None]
+                out[tile_m, tile_n] = x[tile_m, tile_n] + rows
+                hl.atomic_add(flag, [0], 1, sem="release")
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE)
+        flag = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+        code, out = code_and_output(
+            store_then_release,
+            (x, flag),
+            indexing=["pointer", "tensor_descriptor", "pointer"],
+        )
+        rows = torch.arange(64, device=DEVICE)[:, None]
+        torch.testing.assert_close(out, x + rows)
+        self.assertIn("out_desc.store(", code)
+        drain = code.find("cp.async.bulk.wait_group 0;")
+        self.assertNotEqual(drain, -1)
+        self.assertLess(drain, code.index("tl.atomic_add("))
+
+    @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
     def test_atomic_td_fallbacks(self):
@@ -804,11 +1124,16 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
 
         x2 = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
         y2 = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
-        code2, result2 = code_and_output(atomic_add_td_release_kernel, (x2, y2))
+        with patch(
+            "helion._compiler.compile_environment.target_device_capability",
+            return_value=(8, 0),
+        ):
+            code2, result2 = code_and_output(atomic_add_td_release_kernel, (x2, y2))
         expected2 = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
         torch.testing.assert_close(result2, expected2)
         self.assertIn("tl.atomic_add", code2)
         self.assertNotIn("desc.atomic_add(", code2)
+        self.assertNotIn("cp.async.bulk.wait_group", code2)
 
     @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")

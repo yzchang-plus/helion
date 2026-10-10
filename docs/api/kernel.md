@@ -30,6 +30,7 @@ import torch
 import helion
 import helion.language as hl
 
+
 @helion.kernel
 def vector_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     result = torch.zeros_like(a)
@@ -37,9 +38,10 @@ def vector_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         result[i] = a[i] + b[i]
     return result
 
+
 # Usage
-a = torch.randn(1000, device='cuda')
-b = torch.randn(1000, device='cuda')
+a = torch.randn(1000, device="cuda")
+b = torch.randn(1000, device="cuda")
 c = vector_add(a, b)  # Automatically compiles and executes
 ```
 
@@ -47,8 +49,8 @@ c = vector_add(a, b)  # Automatically compiles and executes
 
 ```python
 @helion.kernel(
-    autotune_effort="none",    # Skip autotuning
-    print_output_code=True      # Debug generated code
+    autotune_effort="none",  # Skip autotuning
+    print_output_code=True,  # Debug generated code
 )
 def my_kernel(x: torch.Tensor) -> torch.Tensor:
     # Implementation
@@ -58,10 +60,12 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 ### With Restricted Configurations
 
 ```python
-@helion.kernel(configs=[
-    helion.Config(block_sizes=[32], num_warps=4),
-    helion.Config(block_sizes=[64], num_warps=8)
-])
+@helion.kernel(
+    configs=[
+        helion.Config(block_sizes=[32], num_warps=4),
+        helion.Config(block_sizes=[64], num_warps=8),
+    ]
+)
 def optimized_kernel(x: torch.Tensor) -> torch.Tensor:
     # Implementation
     pass
@@ -78,11 +82,13 @@ bound = my_kernel.bind((example_tensor,))
 result1 = bound(tensor1)  # Compatible tensor (same dtype/device)
 result2 = bound(tensor2)  # Compatible tensor (same dtype/device)
 
+
 # With static_shapes=True, tensors must have exact same shapes/strides
 @helion.kernel(static_shapes=True)
 def shape_specialized_kernel(x: torch.Tensor) -> torch.Tensor:
     # Implementation
     pass
+
 
 bound_static = shape_specialized_kernel.bind((torch.randn(100, 50),))
 result = bound_static(torch.randn(100, 50))  # Must be exactly [100, 50]
@@ -147,11 +153,11 @@ Dynamic buckets also track whether any tensor exceeds the ``torch.int32`` indexi
 
 ```python
 # These create separate cache entries
-tensor_float = torch.randn(100, dtype=torch.float32, device='cuda')
-tensor_int = torch.randint(0, 10, (100,), dtype=torch.int32, device='cuda')
+tensor_float = torch.randn(100, dtype=torch.float32, device="cuda")
+tensor_int = torch.randint(0, 10, (100,), dtype=torch.int32, device="cuda")
 
 result1 = my_kernel(tensor_float)  # Compiles for float32
-result2 = my_kernel(tensor_int)    # Compiles for int32 (separate cache)
+result2 = my_kernel(tensor_int)  # Compiles for int32 (separate cache)
 ```
 
 ## Settings vs Config in Kernel Creation
@@ -164,12 +170,12 @@ Settings control **how the kernel is compiled** and the development environment:
 ```python
 @helion.kernel(
     # Settings parameters
-    autotune_effort="none",      # Skip autotuning for development
-    autotune_effort="quick",     # Smaller autotuning budget when search is enabled
-    print_output_code=True,       # Debug: show generated Triton code
-    print_repro=True,             # Debug: show Helion kernel code, config, and caller code as a standalone repro script
-    static_shapes=True,           # Compilation optimization strategy
-    autotune_log_level=logging.DEBUG  # Verbose autotuning output
+    autotune_effort="none",  # Skip autotuning for development
+    autotune_effort="quick",  # Smaller autotuning budget when search is enabled
+    print_output_code=True,  # Debug: show generated Triton code
+    print_repro=True,  # Debug: show Helion kernel code, config, and caller code as a standalone repro script
+    static_shapes=True,  # Compilation optimization strategy
+    autotune_log_level=logging.DEBUG,  # Verbose autotuning output
 )
 def debug_kernel(x: torch.Tensor) -> torch.Tensor:
     # Implementation
@@ -183,10 +189,10 @@ Config parameters control **how the kernel executes** on GPU hardware:
 @helion.kernel(
     # Config parameters
     config=helion.Config(
-        block_sizes=[64, 128],    # GPU tile sizes
-        num_warps=8,              # Thread parallelism
-        num_stages=4,             # Pipeline stages
-        indexing='block_ptr'      # Memory access strategy
+        block_sizes=[64, 128],  # GPU tile sizes
+        num_warps=8,  # Thread parallelism
+        num_stages=4,  # Pipeline stages
+        indexing="block_ptr",  # Memory access strategy
     )
 )
 def production_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -200,13 +206,13 @@ You can specify both Settings and Config together:
 ```python
 @helion.kernel(
     # Settings: control compilation
-    print_output_code=False,      # No debug output
-    static_shapes=True,           # Shape specialization
+    print_output_code=False,  # No debug output
+    static_shapes=True,  # Shape specialization
     # Config: control execution
     config=helion.Config(
-        block_sizes=[32, 32],     # Execution parameters
-        num_warps=4
-    )
+        block_sizes=[32, 32],  # Execution parameters
+        num_warps=4,
+    ),
 )
 def optimized_kernel(x: torch.Tensor) -> torch.Tensor:
     # Implementation

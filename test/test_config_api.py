@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import os
 import pickle
+import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -51,6 +53,9 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -80,7 +85,10 @@ from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
+from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_fragment import ListOf
+from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import MatmulFact
@@ -154,12 +162,35 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "store_cache_modifiers": st.lists(
                 st.sampled_from(["", ".cs", ".wt"]), max_size=4
             ),
+            "cute_async_load_stages": st.integers(min_value=0, max_value=5),
+            "cute_async_load_lookahead": st.integers(min_value=0, max_value=4),
+            "cute_async_load_group_rows": st.sampled_from([2, 4]),
+            "cute_async_load_cache": st.sampled_from(["cg", "ca"]),
+            "cute_async_store_policy": st.sampled_from(["default", "l2_evict_last"]),
+            "cute_bf16x2_recurrence": st.booleans(),
+            "cute_proven_bounds": st.booleans(),
+            "cute_affine_scan_schedule": st.sampled_from(
+                ["ordinary", "direct_m16n8_v1", "direct_m16n16_v1"]
+            ),
+            "cute_packet_prefetch": st.sampled_from([0, 2, 4, 8]),
             "num_warps": st.integers(min_value=1, max_value=64),
             "num_stages": st.integers(min_value=1, max_value=16),
             "pid_type": st.sampled_from(
                 ["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
             ),
-            "cross_loop_schedule": st.sampled_from(["barrier", "static_pipeline"]),
+            "cross_loop_pipeline": st.sampled_from(["barrier", "static", "dynamic"]),
+            "host_tensor_descriptors": st.booleans(),
+            "cute_chunk_recurrence_dv_partitions": st.sampled_from([2, 4]),
+            "cute_chunk_recurrence_register_cap": st.sampled_from([72, 76, 80]),
+            "cute_chunk_prepare_schedule": st.sampled_from(
+                [
+                    "split_alias_cpc1",
+                    "split_alias_cpc2",
+                    "split_alias_cpc3",
+                    "split_alias_cpc4",
+                    "split_alias_cpc5",
+                ]
+            ),
             "indexing": st.sampled_from(["pointer", "tensor_descriptor"]),
         }
     )
@@ -190,10 +221,22 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "load_eviction_policies",
                     "load_cache_modifiers",
                     "store_cache_modifiers",
+                    "cute_async_load_stages",
+                    "cute_async_load_lookahead",
+                    "cute_async_load_group_rows",
+                    "cute_async_load_cache",
+                    "cute_async_store_policy",
+                    "cute_bf16x2_recurrence",
+                    "cute_proven_bounds",
+                    "cute_affine_scan_schedule",
+                    "cute_packet_prefetch",
                     "num_warps",
                     "num_stages",
                     "pid_type",
-                    "cross_loop_schedule",
+                    "cross_loop_pipeline",
+                    "cute_chunk_recurrence_dv_partitions",
+                    "cute_chunk_recurrence_register_cap",
+                    "cute_chunk_prepare_schedule",
                     "indexing",
                 }
             )
@@ -306,6 +349,85 @@ class TestPallasLoadBufferCountConfig(TestCase):
 
 @onlyBackends(["triton", "cute"])
 class TestConfigAPI(TestCase):
+    def test_num_sm_multiplier_explicit_values_and_search_space(self) -> None:
+        spec = ConfigSpec(backend=TritonBackend())
+        for value in (1, 3, 128):
+            config = helion.Config(
+                pid_type="persistent_blocked", num_sm_multiplier=value
+            )
+            spec.normalize(config)
+            self.assertEqual(config.num_sm_multiplier, value)
+
+        for value in (0, 129, 3.0, True):
+            with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                spec.normalize(
+                    helion.Config.from_dict(
+                        {
+                            "pid_type": "persistent_blocked",
+                            "num_sm_multiplier": value,
+                        }
+                    )
+                )
+
+        fragment = spec._flat_fields()["num_sm_multiplier"]
+        self.assertIsInstance(fragment, PowerOfTwoFragment)
+        assert isinstance(fragment, PowerOfTwoFragment)
+        self.assertEqual(
+            fragment.search_values(),
+            [1, 2, 4, 8, 16, 32, 64, 128],
+        )
+
+    def test_maxnreg_explicit_values_and_search_space(self) -> None:
+        with (
+            patch("helion.autotuner.config_spec.supports_maxnreg", return_value=True),
+            patch("helion.autotuner.config_spec._regs_per_block", return_value=65536),
+            patch(
+                "helion.autotuner.config_spec.warps_to_threads",
+                side_effect=lambda num_warps: num_warps * 32,
+            ),
+        ):
+            spec = ConfigSpec(backend=TritonBackend())
+            for value in (1, 80, 100, 256):
+                config = helion.Config(pid_type="persistent_blocked", maxnreg=value)
+                spec.normalize(config)
+                self.assertEqual(config.maxnreg, value)
+
+            unlimited = helion.Config.from_dict(
+                {"pid_type": "persistent_blocked", "maxnreg": None}
+            )
+            spec.normalize(unlimited)
+            self.assertIsNone(unlimited.maxnreg)
+
+            for value in (0, 257, 32.0, True):
+                with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                    spec.normalize(
+                        helion.Config.from_dict(
+                            {"pid_type": "persistent_blocked", "maxnreg": value}
+                        )
+                    )
+
+            fragment = spec._flat_fields()["maxnreg"]
+            self.assertIsInstance(fragment, EnumFragment)
+            assert isinstance(fragment, EnumFragment)
+            self.assertEqual(fragment.search_values(), [None, 32, 64, 128, 256])
+
+            repaired = helion.Config(
+                pid_type="persistent_blocked", num_warps=32, maxnreg=100
+            )
+            spec.normalize(repaired, _fix_invalid=True)
+            self.assertEqual(repaired.maxnreg, 64)
+
+            round_trip = helion.Config.from_json(
+                helion.Config(
+                    pid_type="persistent_blocked",
+                    num_sm_multiplier=3,
+                    maxnreg=100,
+                ).to_json()
+            )
+            spec.normalize(round_trip)
+            self.assertEqual(round_trip.num_sm_multiplier, 3)
+            self.assertEqual(round_trip.maxnreg, 100)
+
     def test_config_import_path_stability(self) -> None:
         runtime = importlib.import_module("helion.runtime")
 
@@ -385,11 +507,26 @@ class TestConfigAPI(TestCase):
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
+            "cute_async_load_stages",
+            "cute_async_load_lookahead",
+            "cute_async_load_group_rows",
+            "cute_async_load_cache",
+            "cute_async_store_policy",
+            "cute_bf16x2_recurrence",
+            "cute_proven_bounds",
+            "cute_affine_scan_schedule",
+            "cute_packet_prefetch",
             "num_warps",
             "num_stages",
             "pid_type",
-            "cross_loop_schedule",
+            "cross_loop_pipeline",
+            "host_tensor_descriptors",
             "indexing",
+        }
+        compiler_internal = {
+            "cute_chunk_recurrence_dv_partitions",
+            "cute_chunk_recurrence_register_cap",
+            "cute_chunk_prepare_schedule",
         }
 
         sig = inspect.signature(helion.Config.__init__)
@@ -400,45 +537,46 @@ class TestConfigAPI(TestCase):
         }
         # Expected kwargs must be present as keyword-only
         self.assertTrue(expected.issubset(kwonly))
+        self.assertTrue(compiler_internal.isdisjoint(kwonly))
 
-    def test_cross_loop_schedule_is_an_admitted_triton_field(self) -> None:
+    def test_cross_loop_pipeline_is_an_admitted_triton_field(self) -> None:
         from helion.autotuner.config_generation import ConfigGeneration
 
-        self.assertEqual(helion.Config().cross_loop_schedule, "barrier")
+        self.assertEqual(helion.Config().cross_loop_pipeline, "barrier")
         self.assertEqual(
-            helion.Config(cross_loop_schedule="static_pipeline").cross_loop_schedule,
-            "static_pipeline",
+            helion.Config(cross_loop_pipeline="dynamic").cross_loop_pipeline,
+            "dynamic",
         )
 
         with patch("helion._compat.is_hip", return_value=False):
             spec = ConfigSpec(backend=TritonBackend())
-            self.assertTrue(spec.supports_config_key("cross_loop_schedule"))
-            self.assertNotIn("cross_loop_schedule", spec._flat_fields())
+            self.assertTrue(spec.supports_config_key("cross_loop_pipeline"))
+            self.assertNotIn("cross_loop_pipeline", spec._flat_fields())
             with self.assertRaisesRegex(
                 exc.InvalidConfig,
                 "only for kernels with compiler-inferred cross-loop dependencies",
             ):
-                spec.normalize(helion.Config(cross_loop_schedule="barrier"))
+                spec.normalize(helion.Config(cross_loop_pipeline="barrier"))
 
-            spec.enable_cross_loop_schedule()
-            field = spec._flat_fields()["cross_loop_schedule"]
+            spec.enable_cross_loop_pipeline()
+            field = spec._flat_fields()["cross_loop_pipeline"]
             self.assertIsInstance(field, EnumFragment)
             assert isinstance(field, EnumFragment)
-            self.assertIs(field, spec.cross_loop_schedule)
-            self.assertEqual(field.choices, ("barrier", "static_pipeline"))
+            self.assertIs(field, spec.cross_loop_pipeline)
+            self.assertEqual(field.choices, ("barrier", "static", "dynamic"))
             self.assertEqual(
-                spec.default_config()["cross_loop_schedule"],
+                spec.default_config()["cross_loop_pipeline"],
                 "barrier",
             )
 
-            static_config = spec.default_config()
-            static_config.config["cross_loop_schedule"] = "static_pipeline"
-            spec.normalize(static_config)
+            dynamic_config = spec.default_config()
+            dynamic_config.config["cross_loop_pipeline"] = "dynamic"
+            spec.normalize(dynamic_config)
             generation = ConfigGeneration(spec)
-            round_trip = generation.unflatten(generation.flatten(static_config))
+            round_trip = generation.unflatten(generation.flatten(dynamic_config))
             self.assertEqual(
-                round_trip["cross_loop_schedule"],
-                "static_pipeline",
+                round_trip["cross_loop_pipeline"],
+                "dynamic",
             )
 
             with self.assertRaisesRegex(
@@ -446,27 +584,279 @@ class TestConfigAPI(TestCase):
                 "must be one of",
             ):
                 spec.normalize(
+                    helion.Config.from_dict({"cross_loop_pipeline": "unknown"})
+                )
+
+    def test_legacy_cross_loop_schedule_normalizes_to_pipeline(self) -> None:
+        with patch("helion._compat.is_hip", return_value=False):
+            spec = ConfigSpec(backend=TritonBackend())
+            spec.enable_cross_loop_pipeline()
+
+            barrier = helion.Config.from_dict({"cross_loop_schedule": "barrier"})
+            spec.normalize(barrier)
+            self.assertNotIn("cross_loop_schedule", barrier)
+            self.assertEqual(barrier["cross_loop_pipeline"], "barrier")
+
+            static = helion.Config.from_dict({"cross_loop_schedule": "static_pipeline"})
+            spec.normalize(static)
+            self.assertNotIn("cross_loop_schedule", static)
+            self.assertEqual(static["cross_loop_pipeline"], "static")
+
+            matching = helion.Config.from_dict(
+                {
+                    "cross_loop_schedule": "static_pipeline",
+                    "cross_loop_pipeline": "static",
+                }
+            )
+            spec.normalize(matching)
+            self.assertNotIn("cross_loop_schedule", matching)
+            self.assertEqual(matching["cross_loop_pipeline"], "static")
+
+            with self.assertRaisesRegex(exc.InvalidConfig, "conflicting"):
+                spec.normalize(
+                    helion.Config.from_dict(
+                        {
+                            "cross_loop_schedule": "static_pipeline",
+                            "cross_loop_pipeline": "dynamic",
+                        }
+                    )
+                )
+
+            with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+                spec.normalize(
                     helion.Config.from_dict({"cross_loop_schedule": "unknown"})
                 )
 
-    def test_cross_loop_schedule_is_not_supported_on_amd(self) -> None:
+    def test_legacy_cross_loop_schedule_keeps_dependency_gate(self) -> None:
+        with patch("helion._compat.is_hip", return_value=False):
+            spec = ConfigSpec(backend=TritonBackend())
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "only for kernels with compiler-inferred cross-loop dependencies",
+            ):
+                spec.normalize(
+                    helion.Config.from_dict({"cross_loop_schedule": "static_pipeline"})
+                )
+
+    def test_cross_loop_pipeline_is_not_supported_on_amd(self) -> None:
         with patch("helion._compat.is_hip", return_value=True):
             spec = ConfigSpec(backend=TritonBackend())
-            self.assertFalse(spec.supports_config_key("cross_loop_schedule"))
+            self.assertFalse(spec.supports_config_key("cross_loop_pipeline"))
             with self.assertRaisesRegex(
                 exc.InvalidConfig,
                 "is not supported by backend",
             ):
-                spec.enable_cross_loop_schedule()
+                spec.enable_cross_loop_pipeline()
 
-    def test_cross_loop_schedule_is_not_supported_on_xpu(self) -> None:
+    def test_cross_loop_pipeline_is_not_supported_on_xpu(self) -> None:
         with patch("helion._compat.is_hip", return_value=False):
             spec = ConfigSpec(
                 backend=TritonBackend(),
                 device=torch.device("xpu"),
                 num_sm=1,
             )
-            self.assertFalse(spec.supports_config_key("cross_loop_schedule"))
+            self.assertFalse(spec.supports_config_key("cross_loop_pipeline"))
+
+    def test_host_tensor_descriptors_require_cuda_host_support(self) -> None:
+        with patch(
+            "helion._compat.supports_host_tensor_descriptor",
+            return_value=True,
+        ):
+            cuda_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(9, 0),
+            )
+            xpu_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("xpu"),
+                num_sm=1,
+            )
+            self.assertTrue(cuda_spec.supports_config_key("host_tensor_descriptors"))
+            self.assertFalse(xpu_spec.supports_config_key("host_tensor_descriptors"))
+            pre_hopper_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(8, 0),
+            )
+            self.assertFalse(
+                pre_hopper_spec.supports_config_key("host_tensor_descriptors")
+            )
+
+        with patch(
+            "helion._compat.supports_host_tensor_descriptor",
+            return_value=False,
+        ):
+            cuda_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(9, 0),
+            )
+            self.assertFalse(cuda_spec.supports_config_key("host_tensor_descriptors"))
+
+    def test_host_tensor_descriptors_autotune_and_normalize(self) -> None:
+        with patch(
+            "helion._compat.supports_host_tensor_descriptor",
+            return_value=True,
+        ):
+            spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(9, 0),
+            )
+            choices = EnumFragment(("pointer", "tensor_descriptor"))
+            spec.indexing = ListOf(choices, length=1)
+            self.assertIsInstance(
+                spec._flat_fields()["host_tensor_descriptors"], BooleanFragment
+            )
+
+            pointer = helion.Config(indexing="pointer", host_tensor_descriptors=True)
+            spec.normalize(pointer)
+            self.assertFalse(pointer.host_tensor_descriptors)
+
+            descriptor = helion.Config(
+                indexing="tensor_descriptor", host_tensor_descriptors=True
+            )
+            spec.normalize(descriptor)
+            self.assertTrue(descriptor.host_tensor_descriptors)
+
+            spec.indexing = ListOf(choices, length=0)
+            spec.atomic_indexing = ListOf(choices, length=1)
+            self.assertIsInstance(
+                spec._flat_fields()["host_tensor_descriptors"], BooleanFragment
+            )
+
+    def test_cute_chunk_internal_config_mapping_serialization(self) -> None:
+        from helion.autotuner.local_cache import parse_cache_entry
+
+        values = {
+            "cute_chunk_recurrence_dv_partitions": 4,
+            "cute_chunk_recurrence_register_cap": 76,
+            "cute_chunk_prepare_schedule": "split_alias_cpc2",
+        }
+        config = helion.Config.from_dict(values)
+        self.assertEqual(dict(config), values)
+        self.assertEqual(dict(helion.Config.from_json(config.to_json())), values)
+        cache_entry = parse_cache_entry(
+            json.dumps(
+                {
+                    "key": {
+                        "fields": {
+                            "hardware": "test",
+                            "specialization_key": "test",
+                            "config_spec_hash": "test",
+                        }
+                    },
+                    "config": config.to_json(),
+                    "flat_config": json.dumps([4, 76, "split_alias_cpc2"]),
+                }
+            )
+        )
+        self.assertEqual(dict(cache_entry.config), values)
+
+    def test_cute_chunk_recurrence_register_cap_serialization_and_scope(self) -> None:
+        from helion._compiler.backend import CuteBackend
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        config = helion.Config.from_dict(
+            {
+                "cute_chunk_recurrence_dv_partitions": 4,
+                "cute_chunk_recurrence_register_cap": 76,
+            }
+        )
+
+        spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "available only for matched BT16 chunk-recurrence kernels",
+        ):
+            spec.normalize(config)
+
+        spec.enable_cute_chunk_recurrence_search(preferred_partitions=2)
+        field = spec._flat_fields()["cute_chunk_recurrence_register_cap"]
+        self.assertIs(field, spec.cute_chunk_recurrence_register_cap)
+        self.assertEqual(field.choices, (None, 72, 76, 80))
+        self.assertIsNone(
+            spec.default_config().config.get("cute_chunk_recurrence_register_cap")
+        )
+        generation = ConfigGeneration(spec)
+        round_trip = generation.unflatten(generation.flatten(config))
+        self.assertEqual(round_trip["cute_chunk_recurrence_dv_partitions"], 4)
+        self.assertEqual(round_trip["cute_chunk_recurrence_register_cap"], 76)
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            spec.normalize(
+                helion.Config.from_dict({"cute_chunk_recurrence_register_cap": 64})
+            )
+
+        triton_spec = ConfigSpec(backend=TritonBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "Unsupported config keys for backend 'triton'",
+        ):
+            triton_spec.normalize(
+                helion.Config.from_dict({"cute_chunk_recurrence_register_cap": 72})
+            )
+
+    def test_cute_chunk_recurrence_integer_knobs_require_exact_integers(self) -> None:
+        from helion._compiler.backend import CuteBackend
+
+        spec = ConfigSpec(backend=CuteBackend())
+        spec.enable_cute_chunk_recurrence_search(preferred_partitions=4)
+        for key, value, expected in (
+            ("cute_chunk_recurrence_dv_partitions", True, 4),
+            ("cute_chunk_recurrence_dv_partitions", 4.0, 4),
+            ("cute_chunk_recurrence_register_cap", False, None),
+            ("cute_chunk_recurrence_register_cap", 72.0, None),
+        ):
+            with self.subTest(key=key, value=value):
+                config = {key: value}
+                with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+                    spec.normalize(config)
+
+                spec.normalize(config, _fix_invalid=True)
+                self.assertEqual(config[key], expected)
+
+    def test_cute_chunk_prepare_schedule_serialization_and_scope(self) -> None:
+        from helion._compiler.backend import CuteBackend
+
+        config = helion.Config.from_dict(
+            {"cute_chunk_prepare_schedule": "split_alias_cpc2"}
+        )
+
+        spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "available only for matched BT16 chunk-prepare kernels",
+        ):
+            spec.normalize(config)
+
+        spec.enable_cute_chunk_prepare_schedule_search(
+            preferred_schedule="split_alias_cpc2"
+        )
+        field = spec._flat_fields()["cute_chunk_prepare_schedule"]
+        self.assertIs(field, spec.cute_chunk_prepare_schedule)
+        self.assertEqual(
+            field.choices,
+            (
+                "split_alias_cpc2",
+                "split_alias_cpc1",
+                "split_alias_cpc3",
+                "split_alias_cpc4",
+                "split_alias_cpc5",
+            ),
+        )
+        self.assertEqual(
+            spec.default_config()["cute_chunk_prepare_schedule"],
+            "split_alias_cpc2",
+        )
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            spec.normalize(
+                helion.Config.from_dict({"cute_chunk_prepare_schedule": "delayed_qk"})
+            )
 
     def test_warp_specialization_uses_effective_launcher_warp_count(self) -> None:
         backend = TritonBackend()
@@ -1096,6 +1486,22 @@ class TestHardwareConfigSpecRanges(TestCase):
             ("", "first", "last"),
         )
 
+    def test_scalar_empty_eviction_policy_survives_normalization(self) -> None:
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=False,
+        ):
+            config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec.load_eviction_policies.length = 2
+        config = helion.Config(load_eviction_policies="")
+
+        config_spec.normalize(config)
+
+        self.assertEqual(config.load_eviction_policies, "")
+
     def test_load_cache_modifier_choices_do_not_leak_mocked_amd_state(self) -> None:
         """Mocked AMD capability detection should not poison later Triton specs."""
         from helion._compiler.backend import TritonBackend
@@ -1396,7 +1802,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             ] = invalid_value
             with self.assertRaisesRegex(
                 exc.InvalidConfig,
-                r"source_m_tile.*\(32, 224, 256\)",
+                r"source_m_tile.*"
+                + re.escape(str(TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES)),
             ):
                 spec.normalize(wrong_type_config)
 
@@ -2668,3 +3075,14 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_every_cute_only_config_key_is_backend_specific() -> None:
+    """The base backend accepts every key outside BACKEND_SPECIFIC_KEYS, so a
+    CuTe-only knob missing from the set reaches Triton configs unrejected."""
+    from helion.autotuner.config_spec import BACKEND_SPECIFIC_KEYS
+    from helion.autotuner.config_spec import VALID_KEYS
+
+    cute_only = {key for key in VALID_KEYS if key.startswith(("cute_", "tcgen05_"))}
+    assert cute_only
+    assert sorted(cute_only - BACKEND_SPECIFIC_KEYS) == []

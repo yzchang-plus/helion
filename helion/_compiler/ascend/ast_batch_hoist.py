@@ -114,35 +114,34 @@ class _BmmBatchRewriter(ast.NodeTransformer):
         self.loop_var = loop_var
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
-        node = self.generic_visit(node)
-        func_name = None
+        self.generic_visit(node)
         if isinstance(node.func, ast.Attribute):
-            func_name = node.func.attr
-        # torch.bmm -> torch.matmul (3D -> 2D)
-        if func_name == "bmm":
-            node.func.attr = "matmul"
-        # .transpose(0, 1) -> remove (return the value being transposed)
-        if func_name == "transpose":
-            if (
-                len(node.args) == 2
-                and isinstance(node.args[0], ast.Constant)
-                and node.args[0].value == 0
-                and isinstance(node.args[1], ast.Constant)
-                and node.args[1].value == 1
-            ):
-                return node.func.value  # the object being .transpose(0,1)'d
-        # hl.zeros / hl.full: remove H from shape list
-        if func_name in ("zeros", "full") and node.args:
-            if isinstance(node.args[0], ast.List):
-                node.args[0].elts = [
-                    e
-                    for e in node.args[0].elts
-                    if not (isinstance(e, ast.Name) and e.id == self.h_name)
-                ]
+            func = node.func
+            # torch.bmm -> torch.matmul (3D -> 2D)
+            if func.attr == "bmm":
+                func.attr = "matmul"
+            # .transpose(0, 1) -> remove (return the value being transposed)
+            if func.attr == "transpose":
+                if (
+                    len(node.args) == 2
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == 0
+                    and isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value == 1
+                ):
+                    return func.value  # the object being .transpose(0,1)'d
+            # hl.zeros / hl.full: remove H from shape list
+            if func.attr in ("zeros", "full") and node.args:
+                if isinstance(node.args[0], ast.List):
+                    node.args[0].elts = [
+                        e
+                        for e in node.args[0].elts
+                        if not (isinstance(e, ast.Name) and e.id == self.h_name)
+                    ]
         return node
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
-        node = self.generic_visit(node)
+        self.generic_visit(node)
         sl = node.slice
         if not isinstance(sl, ast.Tuple):
             return node

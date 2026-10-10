@@ -7,6 +7,7 @@ import csv
 from dataclasses import replace
 import functools
 import inspect
+import itertools
 import json
 import logging
 import math
@@ -31,6 +32,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import torch
+from torch._inductor.runtime.triton_compat import OutOfResources
 
 import helion
 from helion import _compat
@@ -70,10 +72,12 @@ from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.benchmark_provider import _MAX_REFERENCE_BASELINE_ATTEMPTS
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
 from helion.autotuner.benchmark_provider import _compile_config_failure_source_hash
 from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
+from helion.autotuner.benchmark_worker import BenchmarkWorkerUnkillable
 from helion.autotuner.benchmarking import MirroredBenchmarkTrace
 from helion.autotuner.benchmarking import _mirrored_bench_call_layout
 from helion.autotuner.config_fragment import BlockSizeFragment
@@ -100,8 +104,10 @@ from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.local_cache import _cute_flash_search_policy_hash
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.metrics import KernelMetadata
 from helion.autotuner.pattern_search import InitialPopulationStrategy
+from helion.autotuner.pattern_search import random_fallback_population_target
 from helion.autotuner.random_search import RandomSearch
 from helion.autotuner.search_space_logger import canonical_config_id
 from helion.autotuner.surrogate_pattern_search import (
@@ -123,12 +129,14 @@ _CACHE_POLICY_BASELINE_SCALE = 1
 _CACHE_POLICY_DYNAMIC_HELPER: object = None
 _TEST_CUTE_FLASH_BACKEND = SimpleNamespace(
     generated_source_hash=lambda _fn: None,
+    autotune_config_is_viable=lambda _config_spec, _config: True,
 )
 
 
 def _cute_flash_test_config_spec() -> SimpleNamespace:
     return SimpleNamespace(
         cute_flash_search_enabled=True,
+        compiler_coverage_groups=(),
         backend=_TEST_CUTE_FLASH_BACKEND,
     )
 
@@ -235,11 +243,11 @@ def _get_examples_matmul():
     return import_path(examples_dir / "matmul.py").matmul
 
 
-# Pin the compute capability for config-space golden tests. The matmul-seed
-# heuristics are hardware-gated (the H100 formula fires on sm90, the B200 formula on
-# sm100), so which compiler seed configs get injected into ``random_population``
-# depends on the CI runner's GPU. Force a fixed capability so the golden is stable
-# across every runner (H100/B200/A10G) and does not shift as new sm-gated seed
+# Pin the architecture and SM count for config-space golden tests. The matmul-seed
+# heuristics are hardware-gated and use the SM count for wave sizing, so which
+# compiler seed configs get injected into ``random_population`` depends on the CI
+# runner's GPU. Force a fixed H100 identity so the golden is stable across every
+# runner (H100/B200/A10G) and does not shift as new hardware-sensitive seed
 # heuristics are added. sm90 is used because ``examples/matmul.py`` is a clean 2-D
 # static GEMM that the sm90 budget-formula seed fires on.
 _SM90_HARDWARE = _hardware.HardwareInfo(
@@ -248,27 +256,31 @@ _SM90_HARDWARE = _hardware.HardwareInfo(
     runtime_version="12.8",
     compute_capability="sm90",
 )
+_SM90_NUM_SM = 132
 
 
 def _pin_sm90(fn):
-    """Run ``fn`` with ``get_hardware_info`` pinned to sm90, and evict the shared
-    ``examples/matmul`` bound-kernel cache on both entry and exit.
+    """Run ``fn`` with the hardware identity and SM count pinned to H100, and
+    evict the shared ``examples/matmul`` bound-kernel cache on entry and exit.
 
-    The pin only patches ``get_hardware_info``; the ``Kernel`` bind cache keys on the
-    *real* device capability instead (``_device_specialization_key``). Without the
-    eviction, a config computed under this pin (the sm90 budget-formula seed, e.g.
-    ``block_sizes=[64, 64, 64], num_stages=6``) is cached against the real-GPU key and
-    then reused by a later *un-pinned* test that actually compiles/executes it — which
-    OOMs on a smaller GPU (A10G's 99KB shared memory). Clearing on entry gives this test
-    a clean compute; clearing on exit guarantees no sm90-simulated config leaks into a
-    test that runs on the true hardware.
+    The ``Kernel`` bind cache keys on the real device capability instead
+    (``_device_specialization_key``). Without the eviction, a config computed under
+    this pin (the sm90 budget-formula seed, e.g. ``block_sizes=[64, 64, 64],
+    num_stages=6``) is cached against the real-GPU key and then reused by a later
+    *un-pinned* test that actually compiles/executes it, which OOMs on a smaller GPU
+    (A10G's 99KB shared memory). Clearing on entry gives this test a clean compute;
+    clearing on exit guarantees no sm90-simulated config leaks into a test that runs
+    on the true hardware.
     """
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         matmul = _get_examples_matmul()
-        with patch.object(
-            _hardware, "get_hardware_info", lambda device=None: _SM90_HARDWARE
+        with (
+            patch.object(
+                _hardware, "get_hardware_info", lambda device=None: _SM90_HARDWARE
+            ),
+            patch("helion.runtime.get_num_sm", return_value=_SM90_NUM_SM),
         ):
             matmul._bound_kernels.clear()
             try:
@@ -328,6 +340,60 @@ class TestMismatchTolerance(TestCase):
                 max_mismatch_pct=0.5,
                 max_mismatched_abs_diff=5.0,
             )
+
+    def test_assert_close_with_mismatch_tolerance_non_finite(self) -> None:
+        # Matching infinities (e.g. -inf outside an attention window) are not
+        # mismatches, so only the 1.5 counts against the 30% budget here ...
+        inf = float("inf")
+        expected = torch.tensor([-inf, 1.0, 1.0, 1.0], device=DEVICE)
+        assert_close_with_mismatch_tolerance(
+            torch.tensor([-inf, 1.0, 1.0, 1.5], device=DEVICE),
+            expected,
+            max_mismatch_pct=0.3,
+            max_mismatched_abs_diff=1.0,
+        )
+        # ... while a one-sided inf or NaN is a mismatch with infinite diff.
+        for bad in (-inf, inf, float("nan")):
+            with self.assertRaisesRegex(
+                AssertionError, "Mismatched absolute diff too large"
+            ):
+                assert_close_with_mismatch_tolerance(
+                    torch.tensor([-inf, 1.0, 1.0, bad], device=DEVICE),
+                    expected,
+                    max_mismatch_pct=0.3,
+                    max_mismatched_abs_diff=1.0,
+                )
+        # A matching pair of infinities (or NaNs) has a NaN raw difference,
+        # which must not hide the 0.5 miss from the whole-tensor bounds.
+        for pad in (-inf, float("nan")):
+            actual = torch.tensor([pad, 1.0, 1.0, 1.5], device=DEVICE)
+            expected = torch.tensor([pad, 1.0, 1.0, 1.0], device=DEVICE)
+            assert_close_with_mismatch_tolerance(
+                actual,
+                expected,
+                max_mismatch_pct=0.3,
+                max_abs_diff=0.5,
+                max_rel_diff=0.5,
+            )
+            with self.assertRaisesRegex(AssertionError, "Absolute diff too large"):
+                assert_close_with_mismatch_tolerance(
+                    actual, expected, max_mismatch_pct=0.3, max_abs_diff=0.25
+                )
+            with self.assertRaisesRegex(AssertionError, "Relative diff too large"):
+                assert_close_with_mismatch_tolerance(
+                    actual, expected, max_mismatch_pct=0.3, max_rel_diff=0.25
+                )
+
+    def test_assert_close_with_mismatch_tolerance_mixed_dtypes(self) -> None:
+        # torch.isclose rejects differing dtypes; the helper must still judge
+        # such inputs numerically and raise only AssertionError, which is all
+        # the autotuner's accuracy check catches.
+        # CPU tensors: MPS has no float64, and the helper is device-agnostic.
+        actual = torch.tensor([1.0, 1.0, 1.0, 1.5])
+        expected = torch.ones(4, dtype=torch.float64)
+        assert_close_with_mismatch_tolerance(actual, expected, max_mismatch_pct=0.3)
+        with self.assertRaisesRegex(AssertionError, "Too many mismatches"):
+            assert_close_with_mismatch_tolerance(actual, expected, max_mismatch_pct=0.1)
 
     def test_accuracy_scaled_atol_tolerates_reduction_noise(self) -> None:
         from helion.autotuner.accuracy import assert_close
@@ -401,9 +467,11 @@ class TestAutotuneIgnoreErrors(TestCase):
             cute_flash_search_enabled=False,
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
+                autotune_config_is_viable=lambda _config_spec, _config: True,
                 should_deduplicate_generated_sources=lambda config_spec: False,
                 get_do_bench=lambda: None,
                 classify_autotune_exception=lambda error: None,
+                probe_long_autotune_kernels=lambda _config_spec: False,
             ),
         )
         kernel = SimpleNamespace(
@@ -787,6 +855,20 @@ class TestAutotuneIgnoreErrors(TestCase):
                 ):
                     search.benchmark_batch([config], desc="initial")
 
+    def test_initial_compile_failures_skipped_when_fallback_available(self) -> None:
+        search = self._make_compile_failure_search()
+        with patch.object(
+            search.kernel,
+            "compile_config",
+            side_effect=exc.BackendUnsupported("cute", "seed config unsupported"),
+        ):
+            results = search.benchmark_batch(
+                ["seed"], desc="initial", raise_if_no_viable_config=False
+            )
+        self.assertEqual([result.perf for result in results], [float("inf")])
+        self.assertEqual([result.status for result in results], ["error"])
+        self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
+
     def test_late_compile_failures_are_skipped(self) -> None:
         cases = (
             (
@@ -979,7 +1061,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         "fork" not in mp.get_all_start_methods(),
         reason="fork start method is unavailable on this platform",
     )
-    def test_fork_precompile_avoids_cuda_reinit(self):
+    def test_fork_precompile_avoids_device_reinit(self):
         settings = Settings(
             autotune_precompile="fork",
             autotune_log_level=logging.CRITICAL,
@@ -989,6 +1071,7 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         parent_pid = os.getpid()
         lazy_calls: list[int] = []
+        device_module = torch.get_device_module(DEVICE)
 
         def fake_lazy_init() -> None:
             lazy_calls.append(os.getpid())
@@ -1005,7 +1088,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         def fake_compiled_fn(
             *fn_args: object, _launcher: Callable[..., object]
         ) -> None:
-            torch.cuda._lazy_init()
+            device_module._lazy_init()  # pyrefly: ignore[missing-attribute]
             _launcher("fake_kernel", (1,), *fn_args)
 
         with (
@@ -1013,7 +1096,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                 "helion.autotuner.precompile_future.make_precompiler",
                 side_effect=fake_make_precompiler,
             ),
-            patch("torch.cuda._lazy_init", side_effect=fake_lazy_init),
+            patch.object(device_module, "_lazy_init", side_effect=fake_lazy_init),
         ):
             future = search.benchmark_provider._create_precompile_future(
                 "cfg", fake_compiled_fn
@@ -1308,6 +1391,32 @@ class TestConfigFragmentCardinality(TestCase):
             ListOf(EnumFragment(("a", "b", "c")), length=4).search_values()
         )
 
+    def test_power_of_two_fragment_off_grid_seed(self) -> None:
+        fragment = PowerOfTwoFragment(1, 128)
+
+        # Explicit configs may start off the autotuned power-of-two surface.
+        # Pattern and differential search must re-enter that surface without
+        # changing any of its generated candidates.
+        self.assertEqual(fragment.pattern_neighbors(3), [2, 4])
+        self.assertEqual(fragment.pattern_neighbors(5), [4, 8])
+        self.assertEqual(fragment.pattern_neighbors(5, radius=2), [2, 4, 8, 16])
+        self.assertEqual(fragment.differential_mutation(3, 1, 2), 2)
+        self.assertEqual(fragment.differential_mutation(3, 2, 1), 4)
+        self.assertEqual(fragment.differential_mutation(3, 1, 1), 2)
+        self.assertEqual(fragment.differential_mutation(6, 1, 1), 4)
+
+        clamped = PowerOfTwoFragment(1, 32)
+        self.assertEqual(clamped.pattern_neighbors(48), [32])
+        self.assertEqual(clamped.pattern_neighbors(64), [32])
+        self.assertEqual(clamped.differential_mutation(48, 1, 2), 32)
+        self.assertEqual(clamped.differential_mutation(64, 2, 1), 32)
+
+        # Existing on-grid behavior is unchanged.
+        self.assertEqual(fragment.pattern_neighbors(4), [2, 8])
+        self.assertEqual(fragment.differential_mutation(4, 1, 2), 2)
+        self.assertEqual(fragment.differential_mutation(4, 2, 1), 8)
+        self.assertEqual(fragment.differential_mutation(4, 1, 1), 4)
+
     def test_enum_fragment_coverage_choices(self):
         fragment = EnumFragment(
             ("a", "b", "c"),
@@ -1384,6 +1493,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         random.seed(112)
 
     @_pin_sm90
+    @patch.object(_compat, "_supports_host_tensor_descriptor", lambda: False)
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
@@ -1404,6 +1514,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         lambda num_warps: num_warps * 32,
     )
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
+    @patch.object(_compat, "_supports_host_tensor_descriptor", lambda: False)
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
@@ -1425,6 +1536,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         lambda num_warps: num_warps * 32,
     )
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
+    @patch.object(_compat, "_supports_host_tensor_descriptor", lambda: False)
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
@@ -1445,6 +1557,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
     @_pin_sm90
+    @patch.object(_compat, "_supports_host_tensor_descriptor", lambda: False)
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
@@ -1465,6 +1578,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         configs = ConfigGeneration(spec).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
+    @patch.object(_compat, "_supports_host_tensor_descriptor", lambda: False)
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     def test_config_generation_overrides(self):
         args = (
@@ -2464,6 +2578,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         raw_flat = gen.default_flat()
         original_flat = copy.deepcopy(raw_flat)
         search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.config_spec = spec
         search.config_gen = gen
 
         member = search.make_unbenchmarked(raw_flat)
@@ -2482,6 +2597,31 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         self.assertEqual(seed_config.num_warps, 8)
         self.assertEqual(seed_flat, gen.flatten(seed_config))
+
+    def test_initial_population_refills_backend_rejections(self):
+        configs = {value: helion.Config(block_sizes=[value]) for value in range(1, 7)}
+        backend = SimpleNamespace(
+            autotune_config_is_viable=lambda _spec, config: (
+                config.config["block_sizes"][0] % 2 == 0
+            )
+        )
+        config_gen = SimpleNamespace(
+            config_spec=SimpleNamespace(backend=backend),
+            invalid_config_count=0,
+            canonicalize_flat=lambda flat: (flat, configs[flat[0]]),
+            random_flat=Mock(side_effect=([3], [4], [5], [6])),
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.config_spec = config_gen.config_spec
+        search.config_gen = config_gen
+        search.log = Mock()
+
+        population = search._pad_initial_population_with_unique_random(
+            [[1], [2]], target=3
+        )
+
+        self.assertEqual(population, [[2], [4], [6]])
+        self.assertEqual(config_gen.random_flat.call_count, 4)
 
     def test_scalar_list_override_has_encodable_flat_values(self):
         args = (
@@ -4298,7 +4438,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         generation = ConfigGeneration.__new__(ConfigGeneration)
         generation.config_spec = _cute_flash_test_config_spec()
         generation.flat_spec = [EnumFragment(tuple(range(7)))]
+        generation.compiler_coverage_enabled = True
         generation._override_values = {}
+        # The one-fragment stub carries no pipeline-family axis, so the exact
+        # enumeration runs as one global product.
+        generation._key_to_flat_indices = {}
         generation.unflatten = lambda _flat: initial.config
         self.assertIsNone(generation.flash_exact_effective_search_space_configs(1))
         self.assertEqual(
@@ -4860,6 +5004,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         qualification_counts = prefix_leaf_counts(qualification_count)
         self.assertTrue(compound_leaves)
         self.assertTrue(all(parent_counts[leaf] == 1 for leaf in leaves))
+        # A leaf with a single reachable normalized config under these
+        # overrides is complete after its one parent row.
+        singleton_leaves = set(generation.flash_structural_singleton_leaves())
+        self.assertEqual(singleton_leaves, set())
         self.assertTrue(
             all(qualification_counts[leaf] == 2 for leaf in ordinary_leaves)
         )
@@ -4880,6 +5028,115 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(
             generation.flash_structural_population_budget(2 * qualification_count),
             qualification_count,
+        )
+
+    def test_flash_initial_prefix_singleton_leaf_takes_one_witness(self):
+        # A small grid admits the row_mma family, whose only searchable
+        # knobs are its two row knobs. Overriding them leaves the leaf a
+        # single reachable normalized config: every other live key is dead
+        # for the row programs, so no second distinct witness exists and
+        # qualification reserves one row for it, two for every other
+        # ordinary leaf.
+        with patch("helion.autotuner.config_spec.get_num_xcd", return_value=1):
+            spec = ConfigSpec(
+                backend=CuteBackend(),
+                target_device_capability=(10, 0),
+                num_sm=148,
+            )
+        for block_id, target in enumerate((1, 128, 128)):
+            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+        surface = {
+            "num_bh": 1,
+            "dtype": torch.float16,
+            "standard_dense_output": True,
+        }
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=4,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            **surface,
+        )
+        fragments = cute_flash.flash_autotune_fragments(64, 4, **surface)
+        self.assertIn(
+            "row_mma", fragments[cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices
+        )
+        ws_values = cute_flash.flash_effective_config_values(
+            cute_flash.resolve_flash_config(
+                64, 4, {cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"}, **surface
+            )
+        )
+        live_prefix_keys = {
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY,
+            cute_flash.FLASH_EXP2_PACKET_KEY,
+            cute_flash.FLASH_WAIT_HINT_KEY,
+            *(
+                key
+                for key, fragment in fragments.items()
+                if ws_values.get(key) != fragment.default()
+            ),
+        }
+        generation = spec.create_config_generation(
+            overrides={
+                key: fragment.default()
+                for key, fragment in fragments.items()
+                if key not in live_prefix_keys
+            }
+        )
+        rows = generation.flash_deterministic_population_configs()
+        leaves = generation.flash_structural_leaf_catalog()
+        singleton_leaves = generation.flash_structural_singleton_leaves()
+        self.assertEqual(
+            [leaf.pipeline_family for leaf in singleton_leaves], ["row_mma"]
+        )
+        ordinary_leaves = [
+            leaf
+            for leaf in leaves
+            if leaf.compound_exp2_packet is None and leaf not in singleton_leaves
+        ]
+        self.assertTrue(ordinary_leaves)
+        parent_count = generation.flash_structural_parent_coverage_prefix_count()
+        qualification_count = generation.flash_structural_qualification_prefix_count()
+
+        def prefix_leaf_counts(limit: int) -> dict[object, int]:
+            counts = dict.fromkeys(leaves, 0)
+            for config in rows[:limit]:
+                leaf = flash_structural_leaf_from_config(config.config)
+                if leaf in counts:
+                    counts[leaf] += 1
+            return counts
+
+        parent_counts = prefix_leaf_counts(parent_count)
+        qualification_counts = prefix_leaf_counts(qualification_count)
+        self.assertTrue(all(parent_counts[leaf] == 1 for leaf in leaves))
+        self.assertTrue(
+            all(qualification_counts[leaf] == 1 for leaf in singleton_leaves)
+        )
+        self.assertTrue(
+            all(qualification_counts[leaf] == 2 for leaf in ordinary_leaves)
+        )
+        self.assertEqual(qualification_count, parent_count + len(ordinary_leaves))
+        self.assertEqual(
+            generation.flash_structural_coverage_underqualified_leaves(), []
+        )
+        # The family value keeps reporting its single witness: the report
+        # stays honest about the collapsed surface while the leaf catalog
+        # carries the singleton exemption.
+        self.assertEqual(
+            generation.flash_structural_coverage_underqualified_values(),
+            [(cute_flash.FLASH_PIPELINE_FAMILY_KEY, "row_mma", 1)],
+        )
+        # The row_mma leaf is a singleton only because its knobs are
+        # overridden: the live surface gives it two witnesses.
+        live = spec.create_config_generation()
+        self.assertEqual(live.flash_structural_singleton_leaves(), [])
+        self.assertGreaterEqual(
+            sum(
+                config.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "row_mma"
+                for config in live.flash_deterministic_population_configs()[
+                    : live.flash_structural_qualification_prefix_count()
+                ]
+            ),
+            2,
         )
 
     def test_lfbo_flash_pipeline_lane_witness_uses_generation_catalog(self):
@@ -8064,6 +8321,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
+        search.best_available_pad_random = True
+        search.initial_population = 1
         search.log = Mock()
         search.copies = 1
         search.max_generations = 0
@@ -8116,6 +8375,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         generated = [member(0, 2.0), member(1, 1.0)]
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
+        search.best_available_pad_random = True
+        search.initial_population = 1
         search.log = Mock()
         search.copies = 1
         search.max_generations = 0
@@ -8182,6 +8443,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         constraints = LFBOPatternSearch._flash_leaf_constraints(constrained_leaf)
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
+        search.best_available_pad_random = True
+        search.initial_population = 1
         search.log = Mock()
         search.copies = 2
         search.max_generations = 0
@@ -8245,6 +8508,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
+        search.best_available_pad_random = True
+        search.initial_population = 1
         search.log = Mock()
         search.copies = 1
         search.max_generations = 20
@@ -8315,6 +8580,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             random_flat=Mock(side_effect=([-1], [4])),
         )
         search = PatternSearch.__new__(PatternSearch)
+        search.config_spec = config_gen.config_spec
         search.config_gen = config_gen
         search.initial_population_strategy = (
             InitialPopulationStrategy.FROM_BEST_AVAILABLE
@@ -9017,7 +9283,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 resolve_block_id=lambda _shape: 3,
             ),
         ):
-            compacted = dispatch._compact_shape([object()])
+            compacted = dispatch.compact_shape([object()])
 
         self.assertEqual(len(compacted), 1)
         self.assertEqual(compacted[0].size_str, "_BLOCK_3")
@@ -9361,6 +9627,137 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             "Custom baseline function failed while computing baseline",
         ):
             add(*args)
+
+    @staticmethod
+    def _rejecting_baseline_search(
+        reject: Callable[[int, int], bool],
+        attempted: list[int],
+        error: Exception | None = None,
+    ) -> tuple[FiniteSearch, tuple[torch.Tensor, torch.Tensor], int]:
+        """A search whose baseline compiles are rejected by *reject*.
+
+        ``reject`` is called with the attempted block size and the reference
+        config's block size.  A rejected compile raises *error*, by default the
+        ``OutOfResources`` Intel's backend raises when a tile overflows its
+        per-thread scratch space.  ``_prepare()`` builds the benchmark provider
+        (and with it the accuracy baseline) but does not compile the candidate
+        configs, so replacing ``compile_config`` here only intercepts the
+        baseline.
+        """
+
+        @helion.kernel(autotune_log_level=0, autotune_benchmark_subprocess=False)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([1024], device=DEVICE),
+            torch.randn([1024], device=DEVICE),
+        )
+        bound = add.bind(args)
+        reference_block = bound.config_spec.autotune_reference_config()["block_sizes"][
+            0
+        ]
+        original = bound.compile_config
+
+        def compile_config(config: helion.Config, **kwargs: object) -> object:
+            block = config["block_sizes"][0]
+            attempted.append(block)
+            if reject(block, reference_block):
+                if error is not None:
+                    raise error
+                raise OutOfResources(406912, 262144, "per-thread scratch space")
+            return original(config, **kwargs)  # pyrefly: ignore[bad-argument-type]
+
+        search = FiniteSearch(
+            bound,
+            args,
+            configs=[
+                helion.Config(block_sizes=[16], num_warps=4),
+                helion.Config(block_sizes=[32], num_warps=4),
+            ],
+        )
+        search.kernel.compile_config = compile_config  # pyrefly: ignore[bad-assignment]
+        return search, args, reference_block
+
+    def test_reference_baseline_shrinks_after_hardware_rejection(self) -> None:
+        """A reference config the device rejects backs off instead of aborting.
+
+        The reference config only exists to produce baseline outputs, so a
+        hardware limit Helion cannot model at config-generation time must not
+        cost the whole autotune.
+        """
+        attempted: list[int] = []
+        search, args, reference_block = self._rejecting_baseline_search(
+            lambda block, reference: block > reference // 4, attempted
+        )
+        self.assertGreaterEqual(reference_block, 4)
+
+        search._prepare()
+
+        # Halve once per failure until the tile is accepted.
+        self.assertEqual(
+            attempted,
+            [reference_block, reference_block // 2, reference_block // 4],
+        )
+        torch.testing.assert_close(
+            search.benchmark_provider._baseline_output, args[0] + args[1]
+        )
+
+    def test_reference_baseline_aborts_when_every_block_size_fails(self) -> None:
+        """Shrinking is bounded: a config nothing fixes still reports clearly."""
+        attempted: list[int] = []
+        search, _, reference_block = self._rejecting_baseline_search(
+            lambda block, reference: True, attempted
+        )
+
+        with (
+            patch.object(search.log, "warning") as warn,
+            self.assertRaisesRegex(
+                helion.exc.InvalidConfig,
+                "Autotuning reference config failed while computing baseline",
+            ),
+        ):
+            search._prepare()
+
+        self.assertEqual(len(attempted), _MAX_REFERENCE_BASELINE_ATTEMPTS)
+        # Each attempt halves the previous one, starting from the reference
+        # config that the error message reports.
+        self.assertEqual(attempted[0], reference_block)
+        for previous, block in itertools.pairwise(attempted):
+            self.assertEqual(block, previous // 2)
+        # A retry is announced only when it actually runs.
+        retries = [
+            c for c in warn.call_args_list if "retrying the baseline" in str(c.args[0])
+        ]
+        self.assertEqual(len(retries), len(attempted) - 1)
+
+    def test_reference_baseline_raises_errors_shrinking_cannot_fix(self) -> None:
+        """Bugs and unrecoverable runtime errors are not retried.
+
+        A smaller config would fail the same way, so the error surfaces on the
+        reference config right away, as it did before the backoff existed.
+        """
+        for error in (
+            RuntimeError("unsupported op"),
+            RuntimeError("CUDA error: an illegal memory access was encountered"),
+        ):
+            with self.subTest(error=str(error)):
+                attempted: list[int] = []
+                search, _, reference_block = self._rejecting_baseline_search(
+                    lambda block, reference: True, attempted, error
+                )
+
+                with self.assertRaisesRegex(
+                    helion.exc.InvalidConfig,
+                    "Autotuning reference config failed while computing baseline",
+                ) as ctx:
+                    search._prepare()
+
+                self.assertEqual(attempted, [reference_block])
+                self.assertIs(ctx.exception.__cause__, error)
 
     def test_autotune_baseline_tolerance(self) -> None:
         cfg1 = helion.Config(block_sizes=[1], num_warps=4)
@@ -10045,12 +10442,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             use_isolated: bool = True,
             confirm_suspicious: bool = True,
             use_interleaved: bool = True,
+            candidate_private_args: bool = False,
         ) -> None:
             self.assertIn("Final verification", desc)
             self.assertEqual(target_ms, 5000.0)
             self.assertFalse(use_isolated)
             self.assertFalse(confirm_suspicious)
             self.assertTrue(use_interleaved)
+            self.assertFalse(candidate_private_args)
             for member in members:
                 member.perfs.append(10.0 if member is stable else 12.0)
 
@@ -10059,6 +10458,101 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             patch.object(search, "rebenchmark", side_effect=fake_rebenchmark),
         ):
             self.assertIs(search.final_rebenchmark_best(noisy), stable)
+
+    def test_finalize_keeps_measured_best_when_worker_is_unkillable(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        best = PopulationMember(
+            lambda: None, [9.0], (), helion.Config(num_warps=4), status="ok"
+        )
+        other = PopulationMember(
+            lambda: None, [11.0], (), helion.Config(num_warps=8), status="ok"
+        )
+        search.population = [other, best]
+        search._unkillable_configs = set()
+
+        with patch.object(
+            search,
+            "final_rebenchmark_best",
+            side_effect=BenchmarkWorkerUnkillable("worker remained alive"),
+        ):
+            self.assertEqual(search._finalize(), best.config)
+        self.assertIs(search.best, best)
+
+    def test_finalize_drops_the_candidate_whose_worker_could_not_be_reaped(
+        self,
+    ) -> None:
+        """The config under verification when the worker hung may be the one
+        that hung it: the fallback skips it, and raises when nothing is left."""
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        best = PopulationMember(
+            lambda: None, [9.0], (), helion.Config(num_warps=4), status="ok"
+        )
+        other = PopulationMember(
+            lambda: None, [11.0], (), helion.Config(num_warps=8), status="ok"
+        )
+        search.population = [other, best]
+        search._unkillable_configs = set()
+        error = BenchmarkWorkerUnkillable("worker remained alive")
+        error.fn_index = 1
+        search._record_unkillable([other, best], error)
+        self.assertEqual(search._unkillable_configs, {best.config})
+
+        with patch.object(search, "final_rebenchmark_best", side_effect=error):
+            self.assertEqual(search._finalize(), other.config)
+        self.assertIs(search.best, other)
+
+        search._record_unkillable([other, best], BenchmarkWorkerUnkillable("x"))
+        self.assertEqual(search._unkillable_configs, {best.config})
+        search._unkillable_configs.add(other.config)
+        with (
+            patch.object(search, "final_rebenchmark_best", side_effect=error),
+            self.assertRaises(BenchmarkWorkerUnkillable),
+        ):
+            search._finalize()
+
+    def test_autotune_keeps_selected_config_when_worker_cleanup_is_unkillable(
+        self,
+    ) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search.kernel = Mock()
+        search.kernel.format_kernel_decorator.return_value = "@helion.kernel(...)"
+        search.kernel.get_cached_path.return_value = None
+        search.args = ()
+        search._autotune_metrics = AutotuneMetrics()
+        search._search_space_tracker = None
+        search.benchmark_provider = Mock()
+        search.benchmark_provider.cleanup.side_effect = BenchmarkWorkerUnkillable(
+            "worker remained alive"
+        )
+        search._unkillable_configs = set()
+        selected = helion.Config(num_warps=4)
+
+        with (
+            patch.object(search, "_prepare"),
+            patch.object(search, "_autotune", return_value=selected),
+            patch.object(search, "_finalize_autotune_metrics"),
+        ):
+            self.assertEqual(search.autotune(), selected)
+        search.benchmark_provider.cleanup.assert_called_once()
+
+        # ... unless the selected config is the one whose worker hung
+        search._unkillable_configs = {selected}
+        with (
+            patch.object(search, "_prepare"),
+            patch.object(search, "_autotune", return_value=selected),
+            patch.object(search, "_finalize_autotune_metrics"),
+            self.assertRaises(BenchmarkWorkerUnkillable),
+        ):
+            search.autotune()
 
     def test_final_rebenchmark_rejects_all_failed_finalists(self) -> None:
         settings = Settings(
@@ -10231,7 +10725,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             use_isolated: bool = True,
             confirm_suspicious: bool = True,
             use_interleaved: bool = True,
+            candidate_private_args: bool = False,
         ) -> None:
+            self.assertFalse(candidate_private_args)
             for member in members:
                 member.perfs.append(10.04 if member is pinned else 10.0)
 
@@ -10271,7 +10767,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             use_isolated: bool = True,
             confirm_suspicious: bool = True,
             use_interleaved: bool = True,
+            candidate_private_args: bool = False,
         ) -> None:
+            self.assertFalse(candidate_private_args)
             for member in members:
                 member.perfs.append(10.04 if member is pinned else 10.0)
 
@@ -10332,12 +10830,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             use_isolated: bool = True,
             confirm_suspicious: bool = True,
             use_interleaved: bool = True,
+            candidate_private_args: bool = False,
         ) -> None:
             self.assertIn("Final verification", desc)
             self.assertEqual(target_ms, 5000.0)
             self.assertTrue(use_isolated)
             self.assertTrue(confirm_suspicious)
             self.assertFalse(use_interleaved)
+            self.assertTrue(candidate_private_args)
             for member in members:
                 member.perfs.append(9.5 if member is member_a else 10.0)
 
@@ -10561,6 +11061,190 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(member_b.perfs, [101.0, 52.0])
         self.assertEqual(clear.call_count, 2)
 
+    def test_rebenchmark_isolates_mutated_args_when_worker_unavailable(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        original = torch.zeros(1)
+        search.args = (original,)
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 100.0
+        benchmark_isolated = Mock(return_value=None)
+        search.benchmark_provider = SimpleNamespace(
+            mutated_arg_indices=[0],
+            benchmark_isolated=benchmark_isolated,
+        )
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        observed_pointers: dict[str, list[int]] = {"a": [], "b": []}
+
+        def fn_a(value: torch.Tensor) -> None:
+            observed_pointers["a"].append(value.data_ptr())
+            value.add_(1)
+
+        def fn_b(value: torch.Tensor) -> None:
+            observed_pointers["b"].append(value.data_ptr())
+            value.add_(1)
+
+        def steady_bench(
+            fn: Callable[[], object],
+            *,
+            warmup: int,
+            rep: int,
+            return_mode: str,
+            process_group_name: str | None = None,
+        ) -> float:
+            fn()
+            return 50.0
+
+        search.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(get_do_bench=lambda: steady_bench)
+        )
+        member_a = PopulationMember(fn_a, [100.0], (), helion.Config(num_warps=4))
+        member_b = PopulationMember(fn_b, [101.0], (), helion.Config(num_warps=8))
+
+        with patch(
+            "helion.autotuner.base_search._clone_args",
+            side_effect=lambda args, process_group_name, idx_to_clone: tuple(
+                value.clone()
+                if idx_to_clone is None or index in idx_to_clone
+                else value
+                for index, value in enumerate(args)
+            ),
+        ) as clone_args:
+            search.rebenchmark(
+                [member_a, member_b],
+                target_ms=1000.0,
+                use_isolated=True,
+                confirm_suspicious=False,
+                use_interleaved=False,
+                candidate_private_args=True,
+            )
+
+        benchmark_isolated.assert_called_once()
+        self.assertTrue(benchmark_isolated.call_args.kwargs["fresh_process"])
+        self.assertEqual(clone_args.call_count, 3)
+        self.assertTrue(
+            all(
+                call.kwargs["idx_to_clone"] is None
+                for call in clone_args.call_args_list
+            )
+        )
+        self.assertNotEqual(observed_pointers["a"], observed_pointers["b"])
+        self.assertNotEqual(observed_pointers["a"], [original.data_ptr()])
+        self.assertNotEqual(observed_pointers["b"], [original.data_ptr()])
+        self.assertTrue(torch.equal(original, torch.zeros_like(original)))
+
+    def test_benchmark_isolated_names_the_candidate_whose_worker_hung(self) -> None:
+        """A worker that cannot be reaped names the batch position of the
+        candidate it ran, whether it refused to die under that candidate or at
+        the fresh-process shutdown before the next one."""
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = settings
+        provider.log = Mock()
+        provider.mutated_arg_indices = []
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._subprocess_wrapper_unloadable = False
+        provider._subprocess_benchmark_enabled = lambda: True
+        provider._benchmark_worker = None
+        runs: list[object] = []
+
+        def hang_on_the_second(fn: object, *, warmup: int, rep: int) -> float:
+            runs.append(fn)
+            if len(runs) == 2:
+                raise BenchmarkWorkerUnkillable("worker remained alive")
+            return 1.0
+
+        provider._run_subprocess_benchmark_job = hang_on_the_second
+        fns = [object(), object(), object()]
+        with self.assertRaises(BenchmarkWorkerUnkillable) as caught:
+            provider.benchmark_isolated(fns, warmup=1, rep=1)
+        self.assertEqual(caught.exception.fn_index, 1)
+        self.assertEqual(runs, fns[:2])
+
+        # fresh processes: the worker that ran candidate 0 refuses to die when
+        # it is shut down ahead of candidate 1
+        runs.clear()
+        worker = Mock()
+        worker.shutdown.side_effect = BenchmarkWorkerUnkillable("worker remained alive")
+
+        def run_and_leave_a_worker(fn: object, *, warmup: int, rep: int) -> float:
+            runs.append(fn)
+            provider._benchmark_worker = worker
+            return 1.0
+
+        provider._run_subprocess_benchmark_job = run_and_leave_a_worker
+        with self.assertRaises(BenchmarkWorkerUnkillable) as caught:
+            provider.benchmark_isolated(fns, warmup=1, rep=1, fresh_process=True)
+        self.assertEqual(caught.exception.fn_index, 0)
+        self.assertEqual(runs, fns[:1])
+        self.assertIsNone(provider._benchmark_worker)
+
+    def test_rebenchmark_falls_back_when_isolated_wrapper_is_unloadable(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = settings
+        provider.log = Mock()
+        provider.mutated_arg_indices = []
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._subprocess_wrapper_unloadable = False
+        provider._subprocess_benchmark_enabled = lambda: True
+        isolated_calls = 0
+
+        def unloadable_wrapper(
+            _fn: object,
+            *,
+            warmup: int,
+            rep: int,
+        ) -> None:
+            nonlocal isolated_calls
+            isolated_calls += 1
+            provider._subprocess_wrapper_unloadable = True
+            return None
+
+        provider._run_subprocess_benchmark_job = unloadable_wrapper
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 100.0
+        search.benchmark_provider = provider
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        in_process_calls = 0
+
+        def steady_bench(
+            fn: Callable[[], object],
+            *,
+            warmup: int,
+            rep: int,
+            return_mode: str,
+            process_group_name: str | None = None,
+        ) -> float:
+            nonlocal in_process_calls
+            fn()
+            in_process_calls += 1
+            return 50.0 + in_process_calls
+
+        search.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(get_do_bench=lambda: steady_bench)
+        )
+        member_a = PopulationMember(lambda: None, [100.0], (), helion.Config())
+        member_b = PopulationMember(lambda: None, [101.0], (), helion.Config())
+
+        search.rebenchmark(
+            [member_a, member_b],
+            target_ms=1000.0,
+            use_isolated=True,
+            confirm_suspicious=False,
+            use_interleaved=False,
+        )
+
+        self.assertEqual(isolated_calls, 1)
+        self.assertEqual(in_process_calls, 2)
+        self.assertEqual(member_a.perfs, [100.0, 51.0])
+        self.assertEqual(member_b.perfs, [101.0, 52.0])
+
     def test_final_rebenchmark_respects_custom_benchmark_fn(
         self,
     ) -> None:
@@ -10640,7 +11324,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         reps: list[int] = []
 
         def benchmark_isolated(
-            fns: list[Callable[[], object]], *, warmup: int, rep: int, desc: str
+            fns: list[Callable[[], object]],
+            *,
+            warmup: int,
+            rep: int,
+            desc: str,
+            fresh_process: bool = False,
         ) -> list[float]:
             reps.append(rep)
             return [0.05 for _ in fns]
@@ -10891,7 +11580,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         members = [initial_fast_final_slow, middle, initial_slow_final_fast]
 
         def benchmark_isolated(
-            fns: list[Callable[[], object]], *, warmup: int, rep: int, desc: str
+            fns: list[Callable[[], object]],
+            *,
+            warmup: int,
+            rep: int,
+            desc: str,
+            fresh_process: bool = False,
         ) -> list[float]:
             self.assertEqual(len(fns), 3)
             return [10.0, 5.0, 0.5]
@@ -11424,18 +12118,32 @@ class TestCuteAutotuner(TestCase):
         # surface. ``cute_vector_widths`` is the per-axis vec width slot
         # registered for non-reduction tile blocks.
         # ``load_eviction_policies`` carries per-load-site L1 eviction
-        # hints (lowered on the vectorized load forms). The set still
-        # excludes Triton-style knobs that the CuTe path does not consume.
+        # hints (lowered on the vectorized load forms). ``flatten_loops``
+        # selects the flattened multi-dim tile form (flat base-pointer
+        # vectorization). ``cute_proven_bounds`` selects proof-based mask
+        # elimination. The set still excludes Triton-style knobs that
+        # the CuTe path does not consume.
+        # Resident packet controls are explicit CuTe config fields; unseeded
+        # configs retain their false-only search domains.
         self.assertEqual(
             flat_keys,
             {
                 "block_sizes",
                 "num_threads",
+                "flatten_loops",
                 "loop_orders",
                 "cute_vector_widths",
                 "cute_lane_layouts",
                 "cute_cluster_n",
                 "cute_min_blocks_per_mp",
+                "cute_proven_bounds",
+                "cute_packet_prefetch",
+                "cute_independent_reduction",
+                "cute_replicated_reduction",
+                "cute_vector_packet_unroll",
+                "cute_vloop_sink",
+                "cute_lane_unroll",
+                "cute_pdl",
                 "load_eviction_policies",
             },
         )
@@ -11454,11 +12162,20 @@ class TestCuteAutotuner(TestCase):
                 {
                     "block_sizes",
                     "num_threads",
+                    "flatten_loops",
                     "loop_orders",
                     "cute_vector_widths",
                     "cute_lane_layouts",
                     "cute_cluster_n",
                     "cute_min_blocks_per_mp",
+                    "cute_proven_bounds",
+                    "cute_packet_prefetch",
+                    "cute_independent_reduction",
+                    "cute_replicated_reduction",
+                    "cute_vector_packet_unroll",
+                    "cute_vloop_sink",
+                    "cute_lane_unroll",
+                    "cute_pdl",
                     "load_eviction_policies",
                 },
             )
@@ -11484,10 +12201,12 @@ class TestCuteAutotuner(TestCase):
                     block_sizes=[16, 64],
                     num_threads=[16, 64],
                     loop_orders=[[1, 0]],
+                    cute_proven_bounds=True,
                 )
             )
         )
         self.assertEqual(round_tripped.loop_orders, [[1, 0]])
+        self.assertTrue(round_tripped.config["cute_proven_bounds"])
 
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="tcgen05 requires CUDA capability >= 10.0"
@@ -12196,9 +12915,12 @@ class TestCuteAutotuner(TestCase):
         self.assertTrue(set(cute_flash.FLASH_CONFIG_KEYS).isdisjoint(mm_keys))
 
     def test_cute_flash_two_cta_uses_general_softmax_register_search(self) -> None:
+        from helion._compiler.cute.cute_flash import _FLASH_SOFTMAX_REGS_VALUES
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
         from helion._compiler.cute.cute_flash import flash_autotune_fragments
 
+        general = set(_FLASH_SOFTMAX_REGS_VALUES)
+        self.assertLessEqual({176, 184, 192, 200}, general)
         for num_kv in (512, 1536, 2048):
             with self.subTest(num_kv=num_kv):
                 fragment = flash_autotune_fragments(
@@ -12209,10 +12931,8 @@ class TestCuteAutotuner(TestCase):
                     standard_dense_output=True,
                     pipeline_family_override="fa4_2cta",
                 )[FLASH_SOFTMAX_REGS_KEY]
-                self.assertEqual(
-                    set(fragment.search_choices or ()), {176, 184, 192, 200}
-                )
-                self.assertLessEqual({176, 184, 192, 200}, set(fragment.choices))
+                self.assertEqual(set(fragment.search_choices or ()), general)
+                self.assertLessEqual(general, set(fragment.choices))
 
 
 @onlyBackends(["triton"])
@@ -12420,6 +13140,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         search.settings = settings
         search.config_spec = SimpleNamespace(  # type: ignore[assignment]
             compiler_seed_configs=[],
+            compiler_coverage_groups=(),
             compiler_seed_timeout_retry_repetitions=(
                 compiler_seed_timeout_retry_repetitions
             ),
@@ -12860,6 +13581,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
                     if name not in {"self", "kernel", "args"}
                 }
                 search = object.__new__(search_cls)
+                search.config_spec = _cute_flash_test_config_spec()
                 for name in parameters | inherited_fields:
                     setattr(search, name, 1)
                 if hasattr(search, "flash_structural_search"):
@@ -13652,6 +14374,322 @@ class TestAutotuneSeedConfigs(TestCase):
         self.assertIn(
             "Failed to transfer autotune seed config 1", search.log.call_args[0][0]
         )
+
+
+@skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
+@onlyBackends(["triton", "cute"])
+class TestSeedPopulationFallback(TestCase):
+    """A seed-only initial population recovers when every seed fails to compile.
+
+    Compiles and timings are stubbed: a no-op callable stands in for every
+    compiled config and every surviving config ties at 1.0 ms, so each search
+    runs end to end in a fraction of a second and only the fallback mechanics
+    are under test.
+    """
+
+    # initial_population (PatternSearch, LFBOTreeSearch) and 2x population_size
+    # (DifferentialEvolutionSearch) in _seed_only_searches.
+    FALLBACK_TARGET = 8
+
+    def _make_bound(self) -> tuple[object, tuple[torch.Tensor, torch.Tensor]]:
+        # The baseline must not depend on the stubbed compile_config.
+        @helion.kernel(
+            autotune_log_level=0,
+            autotune_precompile=None,
+            autotune_benchmark_subprocess=False,
+            autotune_baseline_fn=operator.add,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        return add.bind(args), args
+
+    def _seed_configs(self, search: PopulationBasedSearch) -> set[helion.Config]:
+        return {
+            search.config_gen.canonicalize_flat(flat)[1]
+            for flat in search._generate_initial_population_flat()
+        }
+
+    def _random_configs(
+        self, search: PopulationBasedSearch, count: int
+    ) -> list[helion.Config]:
+        return [
+            search.config_gen.unflatten(flat)
+            for flat in search._pad_initial_population_with_unique_random([], count)
+        ]
+
+    @staticmethod
+    def _stub_compile(
+        should_fail: Callable[[helion.Config], bool],
+    ) -> tuple[Callable[..., object], list[helion.Config]]:
+        # Replaces bound.compile_config; nothing is really compiled.
+        compiled: list[helion.Config] = []
+
+        def compile_config(config: helion.Config, *, allow_print: bool = True):
+            compiled.append(config)
+            if should_fail(config):
+                raise exc.BackendUnsupported("test", "seed config unsupported")
+            return lambda *args, **kwargs: None
+
+        return compile_config, compiled
+
+    def _run(
+        self,
+        search: PopulationBasedSearch,
+        bound: object,
+        should_fail: Callable[[set[helion.Config], helion.Config], bool],
+        batches: Mock | None = None,
+        *,
+        cached_seeds: int = 0,
+    ) -> tuple[helion.Config, set[helion.Config], list[helion.Config], Mock, Mock]:
+        # ``batches`` records benchmark_batch calls; callers expecting a raise
+        # pass their own so it outlives the patch context.  ``cached_seeds``
+        # stands in for best-config cache hits, which also join the seed set.
+        if batches is None:
+            batches = Mock(wraps=search.benchmark_batch)
+        log = Mock(wraps=search.log)
+        search._prepare()
+        with patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]):
+            if cached_seeds:
+                search.set_best_available_seed_configs(
+                    self._random_configs(search, cached_seeds)
+                )
+            seeds = self._seed_configs(search)
+            compile_config, compiled = self._stub_compile(
+                functools.partial(should_fail, seeds)
+            )
+            with (
+                patch.object(bound, "compile_config", side_effect=compile_config),
+                patch.object(
+                    search.benchmark_provider, "_benchmark_function", return_value=1.0
+                ),
+                patch.object(search, "benchmark_batch", batches),
+                patch.object(search, "log", log),
+            ):
+                best = search.autotune()
+        return best, seeds, compiled, batches, log
+
+    def _seed_only_searches(
+        self, bound: object, args: tuple[torch.Tensor, torch.Tensor]
+    ) -> list[PopulationBasedSearch]:
+        # Mirrors the quick effort profile: FROM_BEST_AVAILABLE without random
+        # padding, so the initial population is only seed/default configs.
+        kwargs = {
+            "initial_population_strategy": InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+            "best_available_pad_random": False,
+        }
+        return [
+            PatternSearch(
+                bound,
+                args,
+                initial_population=self.FALLBACK_TARGET,
+                copies=1,
+                max_generations=1,
+                **kwargs,
+            ),
+            LFBOTreeSearch(
+                bound,
+                args,
+                initial_population=self.FALLBACK_TARGET,
+                copies=1,
+                max_generations=1,
+                **kwargs,
+            ),
+            DifferentialEvolutionSearch(
+                bound,
+                args,
+                population_size=self.FALLBACK_TARGET // 2,
+                max_generations=2,
+                **kwargs,
+            ),
+        ]
+
+    def _assert_fell_back_to_random(
+        self,
+        best: helion.Config,
+        seeds: set[helion.Config],
+        compiled: list[helion.Config],
+        batches: Mock,
+        log: Mock,
+    ) -> None:
+        target = self.FALLBACK_TARGET
+        self.assertNotIn(best, seeds)
+        self.assertTrue(set(compiled) >= seeds)
+        self.assertGreaterEqual(batches.call_count, 2)
+        initial_call, fallback_call = batches.call_args_list[:2]
+        self.assertFalse(initial_call.kwargs["raise_if_no_viable_config"])
+        self.assertEqual(fallback_call.kwargs["desc"], "Random fallback population")
+        # The fallback holds exactly ``target`` new configs beyond the seeds,
+        # however many seeds there were.
+        fallback_configs = fallback_call.args[0]
+        self.assertEqual(len(fallback_configs), target)
+        self.assertEqual(len(set(fallback_configs)), target)
+        self.assertTrue(seeds.isdisjoint(fallback_configs))
+        warnings = [str(call.args[0]) for call in log.warning.call_args_list]
+        self.assertTrue(
+            any(
+                message.startswith(
+                    f"None of the {len(seeds)} seed/default/cache configs "
+                    "compiled or ran"
+                )
+                and message.endswith(f"continuing with {target} random configs.")
+                for message in warnings
+            ),
+            warnings,
+        )
+
+    def test_quick_profile_pads_seed_only_population(self) -> None:
+        profile = get_effort_profile("quick")
+        for search_config in (
+            profile.pattern_search,
+            profile.lfbo_pattern_search,
+            profile.differential_evolution,
+        ):
+            assert search_config is not None
+            self.assertEqual(
+                search_config.initial_population_strategy, "from_best_available"
+            )
+            self.assertFalse(search_config.best_available_pad_random)
+        spec = SimpleNamespace(cute_flash_search_enabled=False)
+        flash_spec = SimpleNamespace(cute_flash_search_enabled=True)
+        best_available = InitialPopulationStrategy.FROM_BEST_AVAILABLE
+        self.assertEqual(
+            random_fallback_population_target(best_available, False, spec, 30), 30
+        )
+        # Random padding, random populations, designed CuTe flash populations,
+        # and empty targets keep the immediate compile-error re-raise.
+        self.assertIsNone(
+            random_fallback_population_target(best_available, True, spec, 30)
+        )
+        self.assertIsNone(
+            random_fallback_population_target(
+                InitialPopulationStrategy.FROM_RANDOM, False, spec, 30
+            )
+        )
+        self.assertIsNone(
+            random_fallback_population_target(best_available, False, flash_spec, 30)
+        )
+        self.assertIsNone(
+            random_fallback_population_target(best_available, False, spec, 0)
+        )
+
+    def test_unsupported_seeds_fall_back_to_random_population(self) -> None:
+        bound, args = self._make_bound()
+        for search in self._seed_only_searches(bound, args):
+            with self.subTest(search=type(search).__name__):
+                best, seeds, compiled, batches, log = self._run(
+                    search, bound, operator.contains
+                )
+                self.assertGreater(len(set(compiled)), len(seeds))
+                self._assert_fell_back_to_random(best, seeds, compiled, batches, log)
+
+    def test_fallback_pads_past_cached_seeds(self) -> None:
+        # With at least FALLBACK_TARGET seeds (default plus cache hits) the
+        # fallback must still add FALLBACK_TARGET new random configs instead of
+        # padding only up to the target, which left nothing to benchmark.
+        bound, args = self._make_bound()
+        for search in self._seed_only_searches(bound, args):
+            with self.subTest(search=type(search).__name__):
+                best, seeds, compiled, batches, log = self._run(
+                    search,
+                    bound,
+                    operator.contains,
+                    cached_seeds=self.FALLBACK_TARGET + 2,
+                )
+                self.assertGreaterEqual(len(seeds), self.FALLBACK_TARGET)
+                self._assert_fell_back_to_random(best, seeds, compiled, batches, log)
+
+    def test_empty_fallback_reraises_compile_error(self) -> None:
+        bound, args = self._make_bound()
+        for search in self._seed_only_searches(bound, args):
+            with self.subTest(search=type(search).__name__):
+                batches = Mock(wraps=search.benchmark_batch)
+                # Every random draw is the default config, already a seed, so
+                # no fallback config survives deduplication.
+                with (
+                    patch.object(
+                        search.config_gen,
+                        "random_flat",
+                        return_value=search.config_gen.default_flat(),
+                    ),
+                    self.assertRaisesRegex(
+                        exc.BackendUnsupported, "seed config unsupported"
+                    ),
+                ):
+                    self._run(search, bound, lambda seeds, config: True, batches)
+                # Only the seed batch ran: its deferred compile error surfaced
+                # instead of an empty fallback batch followed by NoConfigFound.
+                self.assertEqual(batches.call_count, 1)
+                self.assertFalse(
+                    batches.call_args_list[0].kwargs["raise_if_no_viable_config"]
+                )
+
+    def test_fallback_population_failing_too_still_raises(self) -> None:
+        bound, args = self._make_bound()
+        for search in self._seed_only_searches(bound, args):
+            with self.subTest(search=type(search).__name__):
+                batches = Mock(wraps=search.benchmark_batch)
+                with self.assertRaisesRegex(
+                    exc.BackendUnsupported, "seed config unsupported"
+                ):
+                    self._run(search, bound, lambda seeds, config: True, batches)
+                # The fallback batch was attempted before giving up.
+                self.assertEqual(batches.call_count, 2)
+                self.assertEqual(
+                    batches.call_args_list[1].kwargs["desc"],
+                    "Random fallback population",
+                )
+
+    def test_random_populations_keep_raising_without_fallback(self) -> None:
+        bound, args = self._make_bound()
+        # Full effort: FROM_RANDOM, plus FROM_BEST_AVAILABLE with random padding.
+        searches = [
+            PatternSearch(
+                bound,
+                args,
+                initial_population=4,
+                copies=1,
+                max_generations=1,
+                initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
+            ),
+            PatternSearch(
+                bound,
+                args,
+                initial_population=4,
+                copies=1,
+                max_generations=1,
+                initial_population_strategy=InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+                best_available_pad_random=True,
+            ),
+            DifferentialEvolutionSearch(
+                bound,
+                args,
+                population_size=2,
+                max_generations=2,
+                initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
+            ),
+        ]
+        for search in searches:
+            with self.subTest(
+                search=type(search).__name__,
+                strategy=search.initial_population_strategy.name,  # pyrefly: ignore[missing-attribute]
+            ):
+                batches = Mock(wraps=search.benchmark_batch)
+                with self.assertRaisesRegex(
+                    exc.BackendUnsupported, "seed config unsupported"
+                ):
+                    self._run(search, bound, lambda seeds, config: True, batches)
+                self.assertEqual(batches.call_count, 1)
+                self.assertTrue(
+                    batches.call_args_list[0].kwargs["raise_if_no_viable_config"]
+                )
 
 
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
@@ -15647,8 +16685,6 @@ class TestSelectedSourceMetrics(TestCase):
         population_search: bool = True,
         source_tracking_enabled: bool = True,
     ) -> tuple[BaseSearch, helion.Config]:
-        from helion.autotuner.metrics import AutotuneMetrics
-
         config = helion.Config(block_sizes=[64])
         fn = SimpleNamespace(source_hash="selected-source")
         search_type = PopulationBasedSearch if population_search else BaseSearch

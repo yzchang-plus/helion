@@ -260,7 +260,7 @@ def _device_for_jax_export() -> torch.device:
     """
     if hasattr(torch, "tpu"):
         try:
-            if torch.tpu.is_available():
+            if torch.accelerator.is_available():
                 return torch.device("tpu", 0)
         except Exception:
             pass
@@ -304,6 +304,8 @@ def default_pallas_jax_launcher(
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
     _collective_id: int | None = None,
+    _use_low_level_scheduler: bool = False,
+    _grid_scalar_prefetch_arg_indices: list[int] | None = None,
     _uses_remote_copy: bool = False,
     **kwargs: object,
 ) -> object:
@@ -393,6 +395,8 @@ def default_pallas_jax_launcher(
         hbm_arg_indices=_hbm_arg_indices,
         smem_arg_indices=_smem_arg_indices,
         collective_id=_collective_id,
+        use_low_level_scheduler=_use_low_level_scheduler,
+        grid_scalar_prefetch_arg_indices=_grid_scalar_prefetch_arg_indices,
         interpret=interpret,
         compact=compact,
         orig_shapes=orig_shapes,

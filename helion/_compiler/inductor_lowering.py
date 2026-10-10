@@ -53,6 +53,8 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _symint_expr
 from .compile_environment import _symint_sympy_expr
+from .cute.cute_reshape import REBOUND_CHECK_TARGETS
+from .cute.cute_reshape import check_pointwise_rebound_block_ids
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -394,7 +396,13 @@ class InductorLowering(Lowering):
             if isinstance(fake_val := n.meta["val"], torch.Tensor):
                 # Don't expand scalars (0-D tensors) - let Triton handle broadcasting naturally
                 # Expanding scalars with [None, None] creates incorrect broadcast shapes
-                if fake_val.ndim < ndim and fake_val.ndim > 0:
+                # The expands_broadcast_dims() check lets FlyDSL skip the
+                # Triton-style [None, :] expand its per-thread vectors don't need.
+                if (
+                    fake_val.ndim < ndim
+                    and fake_val.ndim > 0
+                    and CompileEnvironment.current().backend.expands_broadcast_dims()
+                ):
                     expand = tile_strategy.broadcast_expand_dims(
                         tuple(fake_val.shape), output_shape
                     )
@@ -490,6 +498,14 @@ class FakeGraphLowering(GraphLowering):
 
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
+        if (
+            node.target is torch.ops.aten.clone.default
+            and CompileEnvironment.current().backend_name == "cute"
+        ):
+            from .cute.cute_reshape import codegen_cute_virtual_clone
+
+            if (result := codegen_cute_virtual_clone(ctx, node)) is not None:
+                return result
         return self.codegen_from_input_asts(ctx, node, self.input_asts(ctx, node))
 
     def codegen_from_input_asts(
@@ -826,6 +842,12 @@ class ReductionLowering(InductorLowering):
         mask_node_inputs(node, default)
 
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.completed_matmul_sum import completed_matmul_sum_input
+
+            completed = completed_matmul_sum_input(ctx, node)
+            if completed is not None:
+                return completed
         reduction = self.buffer.data
         assert isinstance(reduction, Reduction)
         indices = [sympy.Symbol(f"i{n}") for n in range(len(reduction.ranges))]
@@ -952,6 +974,7 @@ class ReductionLowering(InductorLowering):
 
             strategy = BlockReductionStrategy(state, self.block_index)
 
+        env.backend.validate_reduction_input(strategy.block_index, repr_input)
         result_ast = strategy.codegen_reduction(
             state,
             output_name,
@@ -1090,6 +1113,37 @@ class SympyExprLowering(Lowering):
         return None
 
 
+_PLAIN_TRUE_DIVISION_TARGETS: frozenset[object] = frozenset(
+    {
+        torch.ops.aten.div.Tensor,
+        torch.ops.aten.div.Scalar,
+        torch.ops.aten.true_divide.Tensor,
+        torch.ops.aten.true_divide.Scalar,
+    }
+)
+_MODE_DIVISION_TARGETS: frozenset[object] = frozenset(
+    {torch.ops.aten.div.Tensor_mode, torch.ops.aten.div.Scalar_mode}
+)
+
+
+def _is_plain_true_division(node: torch.fx.Node) -> bool:
+    """Whether ``node`` is a true division whose quotient is the node's result.
+
+    ``div(..., rounding_mode=None)`` counts; ``trunc``/``floor`` modes, floor
+    division and remainder lower their quotient into a rounding step inside the
+    same node, so an approximate quotient would change the integer result.
+    """
+    target = node.target
+    if target in _PLAIN_TRUE_DIVISION_TARGETS:
+        return True
+    if target in _MODE_DIVISION_TARGETS:
+        rounding_mode = node.kwargs.get("rounding_mode")
+        if rounding_mode is None and len(node.args) > 2:
+            rounding_mode = node.args[2]
+        return rounding_mode is None
+    return False
+
+
 class GenerateASTFromInductor(DefaultHandler):
     def __init__(
         self, cg: CodegenInterface, input_name_lookup: dict[str, ast.AST]
@@ -1104,6 +1158,13 @@ class GenerateASTFromInductor(DefaultHandler):
     def _cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
         backend = CompileEnvironment.current().backend
         return backend.cast_ast(x, target_dtype)
+
+    def _cast_scalar_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        # Cast a bare scalar (e.g. lifted from an index expr). Backends whose
+        # cast syntax needs a runtime object override cast_scalar_ast; the base
+        # default uses cast_ast.
+        backend = CompileEnvironment.current().backend
+        return backend.cast_scalar_ast(x, target_dtype)
 
     def _to_ast(self, x: object) -> ast.AST:
         if isinstance(x, ast.AST):
@@ -1195,7 +1256,10 @@ class GenerateASTFromInductor(DefaultHandler):
         # Triton sigmoid expects fp32/fp64 inputs; enforce fp32 compute, then cast back.
         inner_name = self._lift(self._create_cast_expr(x, torch.float32))
 
-        if CompileEnvironment.current().settings.fast_math:
+        env = CompileEnvironment.current()
+        if env.settings.fast_math and env.backend.name == "triton":
+            # libdevice's fast_dividef / fast_expf exist on the Triton backend
+            # only; TileIR shares the Triton codegen and keeps the exact form.
             result = expr_from_string(
                 f"fast_dividef(1.0, 1.0 + fast_expf(-{inner_name}))"
             )
@@ -1209,11 +1273,54 @@ class GenerateASTFromInductor(DefaultHandler):
             result = self._maybe_cast_to_expected_dtype(result)
         return self._lift(result)
 
+    def truediv(self, a: object, b: object) -> str:  # type: ignore[override]
+        """Divide; under ``fast_math`` the Triton backend takes the approximate divide.
+
+        Triton's ``/`` on fp32 is ``div.full.f32`` (2 ulp over the full range).
+        ``fast_dividef`` is ``div.approx.ftz.f32``: cheaper at the same 2 ulp,
+        but a subnormal divisor gives +-inf, a subnormal quotient flushes to
+        zero and a divisor above 2**126 gives 0, so it is only emitted when the
+        ``fast_math`` setting opts the kernel into approximations -- the same
+        contract the CuTe backend follows (IEEE divide by default, approximate
+        reciprocal multiply under the setting).  It is emitted only for the
+        plain true divisions (``aten.div`` without a rounding mode); a quotient
+        that feeds ``trunc``/``floor`` in the same node must be exact, so the
+        rounding-mode divisions, ``floor_divide`` and ``remainder`` keep the
+        default.  Like Triton's ``/``, the result stays fp32 (half-precision
+        and integer operands are promoted to fp32 first); the consumer casts.
+        TileIR shares the Triton codegen but has no libdevice ``fast_dividef``,
+        so it keeps the exact divide under the setting.
+        """
+        env = CompileEnvironment.current()
+        if env.backend.name != "triton" or not env.settings.fast_math:
+            return self._default("truediv", (a, b), {})
+        node = V.current_node
+        if node is None or not _is_plain_true_division(node):
+            return self._default("truediv", (a, b), {})
+        if self._expected_tensor_dtype() not in (
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+        ):
+            return self._default("truediv", (a, b), {})
+        return self._lift(
+            expr_from_string(
+                "fast_dividef({a}, {b})",
+                a=self._create_cast_expr(a, torch.float32),
+                b=self._create_cast_expr(b, torch.float32),
+            )
+        )
+
     def rsqrt(self, x: object) -> str:  # type: ignore[override]
         backend_name = CompileEnvironment.current().backend_name
         if backend_name == "cute":
+            suffix = (
+                ", fastmath=True"
+                if CompileEnvironment.current().settings.fast_math
+                else ""
+            )
             return self._lift(
-                expr_from_string("cute.math.rsqrt({x})", x=self._to_ast(x))
+                expr_from_string(f"cute.math.rsqrt({{x}}{suffix})", x=self._to_ast(x))
             )
         if backend_name == "pallas":
             return self._lift(expr_from_string("lax.rsqrt({x})", x=self._to_ast(x)))
@@ -1308,7 +1415,7 @@ class GenerateASTFromInductor(DefaultHandler):
         if name in self.cg.device_function._constexpr_args:
             return name
 
-        return self._lift(self._create_cast_expr(expr_from_string(name), dtype))
+        return self._lift(self._cast_scalar_ast(expr_from_string(name), dtype))
 
 
 def _unpack_opsvalue(value: object) -> str:
@@ -1479,7 +1586,19 @@ class GraphInterpreter(LoweringContext, Interpreter):
 
         return tuple(final_outputs)
 
+    def _record_final_codegen_result(self, node: Node, result: object) -> None:
+        """Expose normalized results to late CuTe rewrites without changing FX metadata."""
+
+        from .generate_ast import GenerateAST
+
+        if isinstance(self.cg, GenerateAST) and self.cg._track_statement_owners:
+            self.cg.record_codegen_result(node, result)
+
     def run_node(self, n: Node) -> object:
+        if self.cg.device_function.inband_polls:
+            from .triton.distributed_ops import flush_inband_polls
+
+            flush_inband_polls(self.cg, n)
         if n.op == "call_function":
             with (
                 self.cg.statement_owner_node(n),
@@ -1507,6 +1626,25 @@ class GraphInterpreter(LoweringContext, Interpreter):
                                 "deferred tcgen05 fragment epilogue escaped its "
                                 "committed store",
                             )
+                    # ``has_current``: test_cute_fx_replay replays ``run_node``
+                    # with no CompileEnvironment.
+                    if (
+                        CompileEnvironment.has_current()
+                        and CompileEnvironment.current().backend.name == "cute"
+                    ):
+                        # Local import: at module level, cute.repeated_block_ids
+                        # -> completed_matmul_sum -> device_ir -> ``from helion
+                        # import Config`` fails while helion/__init__ is still
+                        # importing (via language -> ... -> runtime.kernel ->
+                        # generate_ast -> this module).
+                        from .cute.repeated_block_ids import check_repeated_block_ids
+
+                        check_repeated_block_ids(self.cg, n)
+                        if (
+                            isinstance(n.meta["lowering"], PointwiseLowering)
+                            or n.target in REBOUND_CHECK_TARGETS
+                        ):
+                            check_pointwise_rebound_block_ids(self.cg, n)
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
                     n.meta["codegen"] = result
@@ -1518,11 +1656,15 @@ class GraphInterpreter(LoweringContext, Interpreter):
                             user for user in n.users if user.target == getitem
                         ]
                         if len(getitem_users) > 0:
-                            return self._collect_multi_outputs(n, result)
+                            result = self._collect_multi_outputs(n, result)
+                            self._record_final_codegen_result(n, result)
+                            return result
 
                     if result is None:
+                        self._record_final_codegen_result(n, None)
                         return None
                     if not isinstance(result, ast.AST):
+                        self._record_final_codegen_result(n, result)
                         return result
                     assert isinstance(result, ast.expr)
                     if len(n.users) > 0:
@@ -1550,9 +1692,11 @@ class GraphInterpreter(LoweringContext, Interpreter):
                                 self.cg.device_function.expr_to_var_info[expr] = (
                                     VarInfo(repr(result.value), n)
                                 )
+                        self._record_final_codegen_result(n, result)
                         return result
                     if not isinstance(result, (ast.Name, ast.Constant)):
                         self.cg.add_statement(create(ast.Expr, value=result))
+                    self._record_final_codegen_result(n, None)
                     return None
                 except exc.Base:
                     raise

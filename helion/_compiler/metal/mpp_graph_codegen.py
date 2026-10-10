@@ -22,11 +22,51 @@ if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
 
 
+#: Largest M/N accumulator-tile extent observed to produce correct MPP results.
+#: K is unaffected, verified up to 512.
+_MAX_MPP_TILE_EXTENT = 128
+
+
+@dataclasses.dataclass(frozen=True)
+class _MPPOperandLayout:
+    """How one MPP matmul operand occupies device memory.
+
+    MPP ``tensor_inline`` handles are packed by construction, so the physical
+    row width is derived from the operand's strides instead of assuming it:
+
+    - packed row-major (the common case): the handle covers the logical
+      ``(rows, cols)`` matrix exactly.
+    - transposed (column-major strides ``(1, rows)``): the handle covers the
+      storage as ``(rows, cols)`` and the descriptor's transpose flag tells
+      MPP to read it transposed.
+    - row-padded (strides ``(ld, 1)`` with ``ld >= cols``): the handle covers
+      the storage with row width ``ld``.  Our K-loop stays within the
+      logical range, but MPP's own edge masking follows the storage extents,
+      so the padded side needs tail-free tiles (checked at emission).
+
+    Metal binds each tensor argument at the view's first logical element, so a
+    storage offset is deliberately not part of this description.
+    """
+
+    transposed: bool
+    storage_row_width: int | torch.SymInt
+
+
 @dataclasses.dataclass(frozen=True)
 class MPPSetupParams:
     """Arguments for ``_metal_mpp_setup(...)`` consumed by the MSL walker.
 
     Field order is mirrored by ``msl_ast_walker._extract_mpp_setup_params``.
+
+    ``m_offset`` and ``n_offset`` identify generated variables that contain the
+    current M and N offsets in elements.  Although these fields store the
+    identifiers as strings, ``__str__`` does not quote them in the marker:
+
+    ``_metal_mpp_setup(..., offset_1, offset_2)``
+
+    The resulting AST therefore records reads of ``offset_1`` and ``offset_2``.
+    Dead-code elimination preserves their assignments, and the MSL walker can
+    use the same variables to derive the MPP tile coordinates.
     """
 
     lhs: str
@@ -43,6 +83,12 @@ class MPPSetupParams:
     bias: str | None
     bias_dtype: str | None
     fx_name: str | None
+    lhs_transposed: bool
+    rhs_transposed: bool
+    lhs_storage_row_width: int
+    rhs_storage_row_width: int
+    m_offset: str
+    n_offset: str
 
     def __str__(self) -> str:
         return (
@@ -51,7 +97,10 @@ class MPPSetupParams:
             f"{self.TILE_M}, {self.TILE_N}, {self.TILE_K}, {self.NUM_SG}, "
             f'"{self.in_dtype}", "{self.acc_dtype}", '
             f'"{self.bias or ""}", "{self.bias_dtype or ""}", '
-            f'"{self.fx_name or ""}")'
+            f'"{self.fx_name or ""}", '
+            f"{int(self.lhs_transposed)}, {int(self.rhs_transposed)}, "
+            f"{self.lhs_storage_row_width}, {self.rhs_storage_row_width}, "
+            f"{self.m_offset}, {self.n_offset})"
         )
 
 
@@ -96,8 +145,15 @@ def _resolve_grid_mn_axes(
     env: CompileEnvironment,
     m_size: int | torch.SymInt,
     n_size: int | torch.SymInt,
+    m_block_id: int | None,
+    n_block_id: int | None,
 ) -> tuple[_GridAxisInfo, _GridAxisInfo] | None:
-    """Resolve the root grid axes that correspond to matmul M and N."""
+    """Resolve the root grid axes that correspond to matmul M and N.
+
+    Prefer the block IDs carried by the matched load indices.  Extent-only
+    matching is a fallback for synthetic graphs: an unrelated root axis can
+    have the same extent as M or N and must not become the matmul tile axis.
+    """
     grid_state = codegen.current_grid_state
     if grid_state is None:
         return None
@@ -115,9 +171,15 @@ def _resolve_grid_mn_axes(
             offset_var=grid_state.strategy.offset_var(block_id),
             block_size=int(block_size) if isinstance(block_size, int) else None,
         )
-        if m_axis is None and env.known_equal(size, m_size):
+        if m_axis is None and (
+            block_id == m_block_id
+            or (m_block_id is None and env.known_equal(size, m_size))
+        ):
             m_axis = axis
-        elif n_axis is None and env.known_equal(size, n_size):
+        elif n_axis is None and (
+            block_id == n_block_id
+            or (n_block_id is None and env.known_equal(size, n_size))
+        ):
             n_axis = axis
     if m_axis is None or n_axis is None:
         return None
@@ -139,6 +201,10 @@ class MPPGraphInfo(NodeArgsGraphInfo):
     out_tensor: torch.Tensor | None = None
     out_dtype: torch.dtype | None = None
     needs_store_barrier: bool = False
+    lhs_layout: _MPPOperandLayout | None = None
+    rhs_layout: _MPPOperandLayout | None = None
+    m_block_id: int | None = None
+    n_block_id: int | None = None
 
     @property
     def name(self) -> str:
@@ -160,6 +226,10 @@ class MPPGraphInfo(NodeArgsGraphInfo):
             "out_tensor": self.out_tensor,
             "out_dtype": self.out_dtype,
             "needs_store_barrier": self.needs_store_barrier,
+            "lhs_layout": self.lhs_layout,
+            "rhs_layout": self.rhs_layout,
+            "m_block_id": self.m_block_id,
+            "n_block_id": self.n_block_id,
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
@@ -258,6 +328,63 @@ class MPPGraphInfo(NodeArgsGraphInfo):
             codegen.add_statement(_mpp_threadgroup_barrier_stmt())
         return []
 
+    @staticmethod
+    def _check_mpp_tile_extents(tile_m: int, tile_n: int) -> None:
+        """Reject accumulator tiles for which MPP silently miscomputes."""
+        for extent in (tile_m, tile_n):
+            if extent > _MAX_MPP_TILE_EXTENT:
+                raise exc.BackendUnsupported(
+                    "metal",
+                    f"MPP matmul tile extent {extent} (max "
+                    f"{_MAX_MPP_TILE_EXTENT}); mpp::tensor_ops::matmul2d "
+                    "returns silently wrong results for tiles this large",
+                )
+
+    def _check_mpp_operand_layout(
+        self,
+        tile_n: int,
+        tile_k: int,
+        *,
+        n: int,
+        k: int,
+        lhs_storage_row_width: int,
+        rhs_storage_row_width: int,
+    ) -> None:
+        """Reject row-padded operands whose tail MPP cannot mask correctly.
+
+        When padding makes an operand's storage row wider than its logical K/N
+        range, MPP's edge masking follows the storage width.  The corresponding
+        logical range must therefore be exactly divisible by its tile.
+        """
+        assert self.lhs_layout is not None
+        assert self.rhs_layout is not None
+        if (
+            not self.lhs_layout.transposed
+            and lhs_storage_row_width != k
+            and k % tile_k != 0
+        ):
+            raise exc.BackendUnsupported(
+                "metal",
+                "row-padded MPP lhs with storage row width "
+                f"{lhs_storage_row_width} for "
+                f"logical K={k}: MPP edge masking follows the storage "
+                "extents, so K must be an exact multiple of "
+                f"TILE_K ({tile_k})",
+            )
+        if (
+            not self.rhs_layout.transposed
+            and rhs_storage_row_width != n
+            and n % tile_n != 0
+        ):
+            raise exc.BackendUnsupported(
+                "metal",
+                "row-padded MPP rhs with storage row width "
+                f"{rhs_storage_row_width} for "
+                f"logical N={n}: MPP edge masking follows the storage "
+                "extents, so N must be an exact multiple of "
+                f"TILE_N ({tile_n})",
+            )
+
     def _emit_setup_and_k_loop(self, state: CodegenState) -> str:
         """Emit MPP setup plus the K-loop and return the setup variable name."""
         assert self.lhs_tensor is not None
@@ -296,6 +423,8 @@ class MPPGraphInfo(NodeArgsGraphInfo):
             env,
             self.lhs_tensor.shape[0],
             self.rhs_tensor.shape[1],
+            self.m_block_id,
+            self.n_block_id,
         )
         if axes is None:
             raise exc.BackendUnsupported("metal", "unable to resolve MPP M/N axes")
@@ -306,6 +435,23 @@ class MPPGraphInfo(NodeArgsGraphInfo):
         bk = env.block_sizes[self.k_block_id].from_config(df.config)
         if not isinstance(bk, int):
             raise exc.BackendUnsupported("metal", "dynamic MPP K block size")
+
+        m = int(env.size_hint(self.lhs_tensor.shape[0]))
+        n = int(env.size_hint(self.rhs_tensor.shape[1]))
+        k = int(env.size_hint(self.lhs_tensor.shape[1]))
+        assert self.lhs_layout is not None
+        assert self.rhs_layout is not None
+        lhs_storage_row_width = int(env.size_hint(self.lhs_layout.storage_row_width))
+        rhs_storage_row_width = int(env.size_hint(self.rhs_layout.storage_row_width))
+        self._check_mpp_tile_extents(m_axis.block_size, n_axis.block_size)
+        self._check_mpp_operand_layout(
+            n_axis.block_size,
+            bk,
+            n=n,
+            k=k,
+            lhs_storage_row_width=lhs_storage_row_width,
+            rhs_storage_row_width=rhs_storage_row_width,
+        )
 
         num_sg = df.config.num_warps if df.config.num_warps is not None else 4
         codegen.max_thread_block_dims[0] = max(
@@ -327,9 +473,9 @@ class MPPGraphInfo(NodeArgsGraphInfo):
         setup = MPPSetupParams(
             lhs=lhs_arg_name,
             rhs=rhs_arg_name,
-            M=int(env.size_hint(self.lhs_tensor.shape[0])),
-            N=int(env.size_hint(self.rhs_tensor.shape[1])),
-            K=int(env.size_hint(self.lhs_tensor.shape[1])),
+            M=m,
+            N=n,
+            K=k,
             TILE_M=m_axis.block_size,
             TILE_N=n_axis.block_size,
             TILE_K=bk,
@@ -339,6 +485,12 @@ class MPPGraphInfo(NodeArgsGraphInfo):
             bias=acc_arg_name or None,
             bias_dtype=acc_metal_dtype or None,
             fx_name=self.result_name,
+            lhs_transposed=self.lhs_layout.transposed,
+            rhs_transposed=self.rhs_layout.transposed,
+            lhs_storage_row_width=lhs_storage_row_width,
+            rhs_storage_row_width=rhs_storage_row_width,
+            m_offset=m_axis.offset_var,
+            n_offset=n_axis.offset_var,
         )
         setup_var = df.new_var("_mpp_setup")
         codegen.add_statement(statement_from_string(f"{setup_var} = {setup}"))

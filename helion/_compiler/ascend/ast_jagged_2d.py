@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from typing import cast
 
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -86,14 +87,14 @@ def _get_tile_loop_target(for_node: ast.For, func_name: str) -> str | None:
     return for_node.target.id
 
 
-def _rewrite_loop(outer_for: ast.For, info: dict) -> ast.For:
+def _rewrite_loop(outer_for: ast.For, info: dict) -> ast.stmt:
     """Rewrite the outer hl.tile + inner hl.jagged_tile to hl.grid + hl.tile + mask."""
     tile_b = info["tile_b_name"]
     tile_l = info["tile_l_name"]
     inner_for = info["inner_for"]
 
     # 1. Change outer iter: hl.tile(B) -> hl.grid(B)
-    new_outer_iter = _replace_call_func(outer_for.iter, "grid")
+    new_outer_iter = _replace_call_func(cast("ast.Call", outer_for.iter), "grid")
     # 2. Change outer target: tile_b -> b
     new_outer_target = ast.Name(id="b", ctx=ast.Store())
 
@@ -111,7 +112,7 @@ def _rewrite_loop(outer_for: ast.For, info: dict) -> ast.For:
     # 6. Rewrite: visit OUTER body first (populates _scalars from starts=...),
     #    THEN inner body (which uses starts[:, None] that needs scalar removal).
     rewriter = _JaggedBodyRewriter(tile_b, "b", tile_l)
-    new_outer_body = []
+    new_outer_body: list[ast.stmt] = []
     for stmt in outer_for.body:
         if stmt is inner_for:
             # Visit inner body now (scalars are populated from outer body above)
@@ -190,11 +191,10 @@ class _JaggedBodyRewriter(ast.NodeTransformer):
         return self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> ast.AST:
-        node = self.generic_visit(node)
+        self.generic_visit(node)
         # Track scalars: target = tensor[b] (scalar index) -> target is scalar
-        if (
-            isinstance(node.value, ast.Subscript)
-            and isinstance(node.value.slice, ast.Tuple)
+        if isinstance(node.value, ast.Subscript) and isinstance(
+            node.value.slice, ast.Tuple
         ):
             # multi-dim index, not scalar
             pass
@@ -207,7 +207,7 @@ class _JaggedBodyRewriter(ast.NodeTransformer):
         return node
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
-        node = self.generic_visit(node)
+        self.generic_visit(node)
         # hl.zeros / hl.full: remove the batch dim (old_batch -> b) from shape list
         if (
             isinstance(node.func, ast.Attribute)
@@ -218,7 +218,8 @@ class _JaggedBodyRewriter(ast.NodeTransformer):
             shape_list = node.args[0]
             # Remove elements that are Name("b") (the scalar batch, which was tile_b)
             shape_list.elts = [
-                e for e in shape_list.elts
+                e
+                for e in shape_list.elts
                 if not (isinstance(e, ast.Name) and e.id == self.new_batch)
             ]
         # Shift unsqueeze dim: removing batch dim (dim 0) shifts all dims down.
@@ -243,7 +244,7 @@ class _JaggedBodyRewriter(ast.NodeTransformer):
         return node
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
-        node = self.generic_visit(node)
+        self.generic_visit(node)
         sl = node.slice
         if not isinstance(sl, ast.Tuple):
             return node
@@ -273,7 +274,7 @@ class _JaggedBodyRewriter(ast.NodeTransformer):
         if has_mask:
             return node
         # 2D mask: _mask_l[:, None] broadcasts to match the load/store shape
-        mask_expr = expr_from_string("_mask_l[:, None]")
+        mask_expr = cast("ast.expr", expr_from_string("_mask_l[:, None]"))
         node.args.append(mask_expr)
         return node
 

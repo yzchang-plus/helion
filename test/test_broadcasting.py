@@ -11,10 +11,12 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import matchesBackends
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessBlockPtr
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -50,7 +52,19 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
     @skipIfRefEager("Config tests not applicable in ref eager mode")
     def test_broadcast_no_flatten(self):
         args = [torch.randn(512, 512, device=DEVICE), torch.randn(512, device=DEVICE)]
-        assert not broadcast_fn.bind(args).config_spec.flatten_loops
+        flatten_loops = broadcast_fn.bind(args).config_spec.flatten_loops
+        if matchesBackends(["cute"]):
+            # The cute per-thread scalar model recomputes per-dim index vars
+            # from the flat offset, so PURE pointwise kernels keep the
+            # flatten choice even with partial-block (broadcast) accesses
+            # (re-registered after device-IR analysis proves the pointwise
+            # fact) — and flattened codegen must stay correct.
+            assert flatten_loops
+            _check_broadcast_fn(block_sizes=[16, 8], flatten_loops=[True])
+        else:
+            # Vector-model backends cannot mix a flat [BS] value vector with
+            # a partial-block access, so the choice is disabled.
+            assert not flatten_loops
 
     def test_broadcast1(self):
         _check_broadcast_fn(
@@ -72,6 +86,7 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @skipUnlessBlockPtr("asserts tl.make_block_ptr in the generated code")
     def test_broadcast5(self):
         code = _check_broadcast_fn(
             block_sizes=[32, 32],
@@ -81,6 +96,7 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
             self.assertIn("tl.make_block_ptr", code)
 
     @skipIfTileIR("tt.make_tensor_ptr legalization not supported in pinned tileir")
+    @skipUnlessBlockPtr("asserts tl.make_block_ptr in the generated code")
     def test_broadcast6(self):
         code = _check_broadcast_fn(
             block_sizes=[128, 128],

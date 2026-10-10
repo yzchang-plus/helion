@@ -30,7 +30,7 @@ Number of Cooperative Thread Arrays (CTAs) in one Cooperative Grid Array (CGA). 
 - **Default Value**: 1
 
 ```python
-num_ctas=2  # Use 2 CTAs per CGA
+num_ctas = 2  # Use 2 CTAs per CGA
 ```
 
 ### occupancy
@@ -42,7 +42,7 @@ Controls the hardware utilization/occupancy for the kernel. This parameter is an
 - **Default Value**: 1
 
 ```python
-occupancy=2  # Target occupancy of 2
+occupancy = 2  # Target occupancy of 2
 ```
 
 ## Tuning Knob Modifications
@@ -84,6 +84,7 @@ import torch
 import helion
 import helion.language as hl
 
+
 @helion.kernel(
     autotune_effort="none",
     config=helion.Config(
@@ -97,6 +98,7 @@ def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.shape):
         result[tile] = x[tile] + y[tile]
     return result
+
 
 # Run the kernel
 x = torch.randn(128, 128, device="cuda", dtype=torch.float32)
@@ -136,6 +138,7 @@ configs = [
     helion.Config(block_sizes=[128, 128], num_ctas=2, occupancy=4),
     helion.Config(block_sizes=[128, 128], num_ctas=2, occupancy=8),
 ]
+
 
 @helion.kernel(configs=configs)
 def optimized_kernel(x: torch.Tensor) -> torch.Tensor:

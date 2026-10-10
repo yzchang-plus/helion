@@ -13,6 +13,7 @@ import helion
 from helion import _compat
 from helion import exc
 from helion._compat import get_tensor_descriptor_fn_name
+from helion._compat import supports_block_ptr
 from helion._compat import supports_tensor_descriptor
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
@@ -26,8 +27,10 @@ from helion._testing import skipIfCute
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessBlockPtr
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
@@ -683,9 +686,13 @@ class TestIndexing(RefEagerTestBase, TestCase):
         x = torch.randn(8, 4, 16, device=DEVICE)
         block_size = [4, 4, 8]
 
-        backends = ["block_ptr"]
+        backends = []
+        if supports_block_ptr():
+            backends.append("block_ptr")
         if supports_tensor_descriptor():
             backends.append("tensor_descriptor")
+        if not backends:
+            self.skipTest("needs block_ptr or tensor_descriptor indexing")
 
         mask_shapes = [
             (8, 4, 16),  # full size, no broadcast
@@ -755,9 +762,13 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         x = torch.randn([200], device=DEVICE)
 
-        backends = ["block_ptr"]
+        backends = []
+        if supports_block_ptr():
+            backends.append("block_ptr")
         if supports_tensor_descriptor():
             backends.append("tensor_descriptor")
+        if not backends:
+            self.skipTest("needs block_ptr or tensor_descriptor indexing")
 
         for indexing in backends:
             with self.subTest(indexing=indexing):
@@ -2408,6 +2419,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(o, torch_out, atol=1e-2, rtol=1e-2)
 
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @skipUnlessBlockPtr("asserts tl.make_block_ptr in the generated code")
     def test_per_load_indexing(self):
         @helion.kernel
         def multi_load_kernel(
@@ -2487,6 +2499,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("needs debugging")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @skipUnlessBlockPtr("asserts tl.make_block_ptr in the generated code")
     def test_per_load_and_store_indexing(self):
         """Test that both loads and stores can have independent indexing strategies."""
 
@@ -3255,6 +3268,56 @@ class TestIndexing(RefEagerTestBase, TestCase):
         y = torch.randn([2], device=DEVICE)
         torch.testing.assert_close(add_one(y), y + 1)
         self.assertEqual(len(add_one._bound_kernels), 1)
+
+    @onlyBackends(["triton"])
+    @skipIfRocm("ROCm exposes an unrelated cross-loop dependency in this codegen test")
+    @skipIfTileIR("TileIR does not support cross-loop persistent synchronization")
+    @skipIfXPU("XPU exposes an unrelated cross-loop dependency in this codegen test")
+    @skipIfRefEager("Test checks generated Triton code")
+    def test_dynamic_internal_strides_remain_literal(self):
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=False,
+            triton_do_not_specialize=True,
+        )
+        def two_stage(x: torch.Tensor) -> torch.Tensor:
+            rows = x.size(0)
+            tmp = torch.empty((rows, 32), dtype=x.dtype, device=x.device)
+            out = torch.empty_like(tmp)
+            for tile_m, tile_n in hl.tile([rows, 32], block_size=[1, 32]):
+                tmp[tile_m, tile_n] = x[tile_m, tile_n]
+            for tile_m, tile_n in hl.tile([rows, 32], block_size=[1, 32]):
+                out[tile_m, tile_n] = tmp[tile_m, tile_n] + 1
+            return out
+
+        x = torch.randn([2, 32], device=DEVICE)
+        code, result = code_and_output(two_stage, (x,))
+        torch.testing.assert_close(result, x + 1)
+        # User-input layout remains generic, while compiler-owned contiguous
+        # layouts must not pollute Triton's do-not-specialize set.
+        self.assertIn("'x_stride_0'", code)
+        self.assertNotIn("'tmp_stride_", code)
+        self.assertNotIn("'out_stride_", code)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Test checks generated Triton code")
+    def test_symbolic_internal_stride_remains_runtime(self):
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=False,
+            triton_do_not_specialize=True,
+        )
+        def transpose_copy(x: torch.Tensor) -> torch.Tensor:
+            rows = x.size(0)
+            out = torch.empty((32, rows), dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([rows, 32], block_size=[1, 32]):
+                out[tile_n, tile_m] = x[tile_m, tile_n].T
+            return out
+
+        x = torch.randn([2, 32], device=DEVICE)
+        code, result = code_and_output(transpose_copy, (x,))
+        torch.testing.assert_close(result, x.T)
+        self.assertIn("'out_stride_0'", code)
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Test checks generated Triton code")

@@ -7,6 +7,7 @@ import importlib
 import inspect
 import io
 import logging
+import math
 import operator
 import os
 from pathlib import Path
@@ -34,7 +35,10 @@ from ._compat import get_mtia_tunable_fragments
 from ._compat import get_tensor_descriptor_fn_name
 from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
+from ._compat import supports_block_ptr
+from ._compat import supports_host_tensor_descriptor
 from ._compat import supports_tensor_descriptor
+from ._compat import target_device_capability
 from ._dist_utils import is_master_rank
 from ._dist_utils import sync_object as sync_object
 from ._utils import counters
@@ -392,22 +396,15 @@ def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() != "tileir", reason)
 
 
-CUTE_MIN_CUDA_VERSION = "13"
-
-
 @functools.cache
 def _has_cute_dsl() -> bool:
-    try:
-        import cutlass.cute as _cute  # noqa: F401
-    except ImportError:
-        return False
-    from ._compat import requires_cuda_version
+    from ._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 
-    return requires_cuda_version(CUTE_MIN_CUDA_VERSION)
+    return _cute_backend_requirement_error() is None
 
 
 def skipUnlessCuteAvailable(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test unless CUTLASS CuTe Python DSL is importable and CUDA >= 13."""
+    """Skip unless every validated CuTe backend requirement is available."""
     return skipIfFn(lambda: not _has_cute_dsl(), reason)
 
 
@@ -456,9 +453,10 @@ def default_cute_mma_support(
 def patch_cute_mma_support(
     support: SimpleNamespace | None = None,
 ) -> Generator[SimpleNamespace, None, None]:
-    """Patch both ``get_cute_mma_support`` bindings.
+    """Patch the support function and its compiler-module bindings.
 
-    ``cute_mma`` re-binds the symbol from ``mma_support`` at import time.
+    Import consumers before patching so first use cannot leave a mock bound
+    in a newly imported module after this context exits.
     """
     if support is None:
         support = default_cute_mma_support()
@@ -524,6 +522,31 @@ def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: not is_cuda() or not supports_tensor_descriptor(), reason)
 
 
+def skipUnlessBlockPtr(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless the installed Triton still supports block pointers.
+
+    Triton >= 3.9 removed ``tl.make_block_ptr`` (triton-lang/triton#10833);
+    tests that pin ``indexing="block_ptr"`` and check the generated code have
+    nothing to check there.  Other backends keep running them as numerics
+    checks.
+    """
+    return skipIfFn(
+        lambda: matchesBackends(["triton"]) and not supports_block_ptr(), reason
+    )
+
+
+def skipUnlessHostTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless Triton's host tensor descriptor API is supported."""
+    return skipIfFn(
+        lambda: (
+            not is_cuda()
+            or not supports_host_tensor_descriptor()
+            or (target_device_capability() or (0, 0)) < (9, 0)
+        ),
+        reason,
+    )
+
+
 def skipUnlessTf32Supported(
     reason: str = "TF32 not supported on this GPU",
 ) -> Callable[[Callable], Callable]:
@@ -573,7 +596,7 @@ def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
         try:
             from jax.experimental import pallas  # noqa: F401
 
-            return hasattr(torch, "tpu") and torch.tpu.is_available()
+            return hasattr(torch, "tpu") and torch.accelerator.is_available()
         except Exception:
             return False
 
@@ -1209,6 +1232,7 @@ def run_example(
     max_mismatch_pct: float | None = None,
     max_mismatched_abs_diff: float | None = None,
     bwd: bool = False,
+    bwd_relative_l2: float | None = None,
     trace_path: str | None = None,
     process_group_name: str | None = None,
     interleaved: bool = True,
@@ -1231,6 +1255,13 @@ def run_example(
         max_mismatched_abs_diff: If set with max_mismatch_pct, bound the largest
             absolute difference among mismatched elements.
         bwd: Whether to also test backward pass (default: False)
+        bwd_relative_l2: If set, judge each gradient by relative L2 error
+            (see :func:`assert_relative_l2_close`) instead of the elementwise
+            ``rtol``/``atol`` check. Use this for backward passes of chained
+            half-precision matmuls, where a forward intermediate rounded to
+            half precision after an fp32 accumulation differs from the
+            reference by one ulp in a few elements and a full-row reduction
+            spreads each such flip across a whole gradient row.
         trace_path: if not None, do profiling and save trace to this path
     """
     if hasattr(torch, "npu") and torch.npu.is_available():
@@ -1369,13 +1400,19 @@ def run_example(
 
                     if baseline_grad is not None:
                         assert tensor.grad is not None
-                        torch.testing.assert_close(
-                            tensor.grad.to(torch.float32),
-                            baseline_grad.to(torch.float32),
-                            rtol=rtol,
-                            atol=atol,
-                            msg=f"BWD: Gradient mismatch for tensor {i} with shape {tensor.shape} in {name}",
-                        )
+                        msg = f"BWD: Gradient mismatch for tensor {i} with shape {tensor.shape} in {name}"
+                        if bwd_relative_l2 is not None:
+                            assert_relative_l2_close(
+                                tensor.grad, baseline_grad, bwd_relative_l2, msg=msg
+                            )
+                        else:
+                            torch.testing.assert_close(
+                                tensor.grad.to(torch.float32),
+                                baseline_grad.to(torch.float32),
+                                rtol=rtol,
+                                atol=atol,
+                                msg=msg,
+                            )
 
                 # Clear gradients for next test
                 for t in grad_tensors:
@@ -1928,6 +1965,31 @@ class TestCase(unittest.TestCase):
             sys.stdout, sys.stderr = old_stdout, old_stderr
 
 
+def assert_relative_l2_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    max_relative_l2: float,
+    *,
+    msg: str = "",
+) -> None:
+    """Assert ``||actual - expected|| / ||expected|| <= max_relative_l2``.
+
+    Unlike an elementwise check this tolerates a handful of large per-element
+    deviations as long as they are small relative to the whole tensor, which is
+    the signature of accumulation-order noise amplified by a reduction (e.g. a
+    one-ulp flip in a forward intermediate shifting an entire gradient row).
+    """
+    assert actual.shape == expected.shape, (actual.shape, expected.shape)
+    expected_f32 = expected.to(torch.float32)
+    diff = (actual.to(torch.float32) - expected_f32).norm().item()
+    relative_l2 = diff / max(expected_f32.norm().item(), 1e-8)
+    # ``<=`` rather than ``not >`` so a NaN error also fails.
+    assert relative_l2 <= max_relative_l2, (
+        f"{msg or 'Tensors are not close'}: relative L2 error {relative_l2:.3e} "
+        f"exceeds {max_relative_l2:.3e}"
+    )
+
+
 def assert_close_with_mismatch_tolerance(
     actual: object,
     expected: object,
@@ -1983,12 +2045,27 @@ def assert_close_with_mismatch_tolerance(
         ):
             raise
 
+    # torch.isclose requires matching dtypes; compare in the promoted one so a
+    # dtype mismatch is still judged numerically rather than raising a
+    # RuntimeError, which the autotuner's accuracy check would not catch.
+    dtype = torch.promote_types(actual.dtype, expected.dtype)
+    actual, expected = actual.to(dtype), expected.to(dtype)
     abs_diff = (actual - expected).abs()
     total = actual.numel()
 
-    # Use the same mismatch definition as torch.testing.assert_close:
-    # an element is mismatched when |actual - expected| > atol + rtol * |expected|
-    mismatch_mask = abs_diff > atol + rtol * expected.abs()
+    # Same elementwise contract as torch.testing.assert_close: mismatched when
+    # |actual - expected| > atol + rtol * |expected|, and infinities match only
+    # when equal (so e.g. -inf padding agrees exactly on both sides). NaNs are
+    # tolerated only when both sides are NaN.
+    mismatch_mask = ~torch.isclose(
+        actual, expected, rtol=rtol, atol=atol, equal_nan=True
+    )
+    # A NaN difference comes from inf - inf or a NaN operand. Where isclose
+    # accepted the pair (matching infinities or NaNs) it contributes nothing,
+    # so it cannot poison the max() in the bounds below; where it did not (a
+    # one-sided NaN or inf) it is an infinite miss that those bounds reject.
+    nan_diff = torch.where(mismatch_mask, math.inf, 0.0)
+    abs_diff = torch.where(abs_diff.isnan(), nan_diff, abs_diff)
     mismatched = mismatch_mask.sum().item()
     mismatch_pct = mismatched / total if total > 0 else 0.0
 
@@ -2014,6 +2091,7 @@ def assert_close_with_mismatch_tolerance(
 
     if max_rel_diff is not None:
         rel_diff = abs_diff / expected.abs().clamp(min=1e-6)
+        rel_diff = torch.where(rel_diff.isnan(), nan_diff, rel_diff)
         worst_rel = rel_diff.max().item()
         if worst_rel > max_rel_diff:
             raise AssertionError(

@@ -47,9 +47,7 @@ def _import_mamba() -> Callable[..., torch.Tensor] | None:
         if m not in sys.modules:
             sys.modules[m] = types.ModuleType(m)
     try:
-        from mamba_ssm.ops.triton.ssd_combined import (  # pyrefly: ignore[missing-import]
-            mamba_chunk_scan_combined,
-        )
+        from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined  # pyrefly: ignore[missing-import]
     except ImportError:
         warnings.warn(
             "mamba_ssm not installed, skipping mamba comparisons", stacklevel=2

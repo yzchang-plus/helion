@@ -133,6 +133,7 @@ import torch
 import helion
 import helion.language as hl
 
+
 @helion.kernel(autotune_effort="none")
 def test_kernel(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
@@ -140,7 +141,8 @@ def test_kernel(x: torch.Tensor) -> torch.Tensor:
         out[tile] = x[tile] * 2
     return out
 
-x = torch.randn(100, device='cuda')
+
+x = torch.randn(100, device="cuda")
 result = test_kernel(x)
 torch.testing.assert_close(result, x * 2)
 print("Verification successful!")

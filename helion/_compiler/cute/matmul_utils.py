@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+import enum
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -10,6 +11,13 @@ import sympy
 import torch
 from torch.fx.node import Node
 
+from ... import exc
+from ...language._tracing_ops import _for_loop
+from ...language._tracing_ops import _for_loop_step
+from ...language._tracing_ops import _if
+from ...language._tracing_ops import _while_loop
+from ...language.atomic_ops import ATOMIC_OPS
+from ...language.atomic_ops import atomic_add
 from ...language.memory_ops import load
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -21,10 +29,45 @@ from .indexing import CutePackedTerms
 from .indexing import match_cute_stack_reshape_rhs
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Mapping
 
+    from ...autotuner.config_spec import MatmulFact
     from ..aten_lowering import LoweringContext
+    from ..device_ir import DeviceIR
+    from ..device_ir import GraphInfo
     from ..helper_function import CodegenInterface
+
+
+def cute_matmul_root_placements(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> tuple[tuple[MatmulFact, tuple[int, ...]], ...]:
+    """Return proven contraction/root pairs for the active device regions.
+
+    A fissioned DeviceIR retains kernel-wide facts but owns only a subset of
+    root grids. Match those roots by the recorded graph attribution, never by
+    the order of parallel matmul and grid lists. Callers supply their own dtype,
+    layout, and shared-knob eligibility restrictions.
+    """
+    spec = env.config_spec
+    if len(spec.matmul_facts) == 1 and len(device_ir.grid_block_ids) == 1:
+        return ((spec.matmul_facts[0], tuple(device_ir.grid_block_ids[0])),)
+    matmul = spec.kernel_matmul_fact
+    grid = spec.kernel_grid_fact
+    if matmul is None or grid is None or not matmul.attribution_complete:
+        return ()
+    active_roots = {tuple(root) for root in device_ir.grid_block_ids}
+    if not active_roots.issubset(grid.grid_groups):
+        return ()
+    placed = []
+    for resolved in matmul.matmuls:
+        root = grid.group_for_graph(resolved.site.graph_id)
+        if not root:
+            return ()
+        if root in active_roots:
+            placed.append((resolved.fact, root))
+    return tuple(placed)
 
 
 @dataclass(frozen=True)
@@ -442,6 +485,219 @@ def cute_outer_accumulates_result(
     return cute_outer_accumulator_node(fx_node, is_acc_none=is_acc_none) is not None
 
 
+# Pure dtype / layout changes and lane-invariant scaling between a matmul and
+# the ``hl.atomic_add`` that consumes it.  Each is linear in the matmul result,
+# so adding the per-K-lane partial products separately gives the same total.
+_CUTE_ATOMIC_LINEAR_PASSTHROUGH_TARGETS = frozenset(
+    {
+        torch.ops.aten.clone.default,
+        torch.ops.aten.detach.default,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.squeeze.dim,
+        torch.ops.aten.squeeze.default,
+        torch.ops.aten.t.default,
+        torch.ops.aten.transpose.int,
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.view.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.expand.default,
+    }
+)
+_CUTE_ATOMIC_LINEAR_SCALE_TARGETS = frozenset(
+    {
+        torch.ops.aten.mul.Tensor,
+        torch.ops.aten.mul.Scalar,
+        torch.ops.aten.div.Tensor,
+        torch.ops.aten.div.Scalar,
+    }
+)
+# Device IR control flow: ``(graph id argument, subgraph argument list)``
+# positions whose list entries line up with the subgraph's placeholders.
+_CUTE_SUBGRAPH_ARG_SLOTS: dict[object, tuple[tuple[int, int], ...]] = {
+    _for_loop: ((0, 3),),
+    _for_loop_step: ((0, 3),),
+    _while_loop: ((0, 2), (1, 2)),
+    _if: ((1, 3), (2, 4)),
+}
+
+
+class CuteAtomicLaneRoute(enum.Enum):
+    """How a matmul whose K axis is split across lanes reaches ``hl.atomic_*``."""
+
+    NONE = "none"
+    """No atomic consumes the result inside the K lane loop: keep the running sum."""
+    PER_LANE = "per_lane"
+    """Each K lane's partial product sum is atomically added on its own."""
+    OWNED = "owned"
+    """Complete the K sum with the owned product-sum marker before the atomic."""
+
+
+def cute_atomic_consumer_lane_route(
+    fx_node: torch.fx.Node | None,
+    *,
+    is_acc_none: bool,
+    get_graph: Callable[[int], GraphInfo],
+) -> CuteAtomicLaneRoute:
+    """Pick how a lane-split matmul result that reaches ``hl.atomic_*`` lowers.
+
+    Only meaningful when the matmul's K axis really is split across a serial
+    lane loop: the per-thread ``dot_acc`` running sum then exposes a prefix
+    of the contraction to every lane iteration, and every consumer inside the
+    lane loop (the matmul's own graph plus the loop and branch subgraphs
+    nested in it, reached through ``get_graph``) sees that prefix.  A
+    thread-mapped K axis is complete at every thread and needs none of this,
+    so callers decide after resolving the lane variable.
+
+    ``PER_LANE``: ``hl.atomic_add`` is the only consumer of a bare fp32/fp64
+    matmul result, separated from it by nothing but linear, lane-invariant
+    transforms (views, widening float casts, multiplication or division by a
+    Python number).  Each lane's partial sum is then atomically added on its
+    own.
+
+    ``OWNED``: the same chain, but the matmul result is half precision, so
+    every per-lane partial would be rounded before its add.  The owned
+    product-sum marker completes the K sum first (or its lane scheduler
+    declines the lowering).
+
+    Any other route to an atomic op (a second user, a tensor or
+    kernel-argument scale, a non-linear op, a second matmul fed by the
+    prefix, ``atomic_max`` and friends, a loop-carried accumulator, or an
+    atomic inside a nested loop or branch) cannot be split per lane, and the
+    running sum is wrong for it too, so it is rejected loudly.  A result that
+    only leaves the K loop through the loop's outputs is complete there and
+    is not followed.
+    """
+    if fx_node is None:
+        return CuteAtomicLaneRoute.NONE
+    if is_acc_none and _linear_atomic_add_consumer(fx_node) is not None:
+        val = fx_node.meta["val"]
+        assert isinstance(val, torch.Tensor)
+        # Per-lane partials are exact for integer results and carry one fp32
+        # rounding each; half-precision results would stack one rounding per
+        # K lane, so they take the owned product-sum route instead.
+        if val.dtype in (torch.float32, torch.float64) or not val.is_floating_point():
+            return CuteAtomicLaneRoute.PER_LANE
+        return CuteAtomicLaneRoute.OWNED
+    if _reaches_atomic_value(fx_node, set(), get_graph):
+        raise exc.BackendUnsupported(
+            "cute",
+            "hl.atomic_* consumes a matmul result whose K axis is split across "
+            "lanes through a chain the scalar fallback cannot split per lane "
+            "(shared result, non-linear op, second matmul, tensor scale, "
+            "loop-carried accumulator, or an atomic in a nested loop or branch)",
+        )
+    return CuteAtomicLaneRoute.NONE
+
+
+def _atomic_value_argument(user: torch.fx.Node) -> object:
+    # ``hl.atomic_add(target, index, value, sem=...)``: the value is the third
+    # positional argument.  ``atomic_cas`` puts ``expected`` there instead,
+    # so this helper is only for ``atomic_add``.
+    assert user.target is atomic_add
+    if "value" in user.kwargs:
+        return user.kwargs["value"]
+    return user.args[2] if len(user.args) > 2 else None
+
+
+def cute_per_lane_atomic_consumer(fx_node: torch.fx.Node) -> torch.fx.Node:
+    """The ``hl.atomic_add`` node a ``PER_LANE``-routed matmul's partials reach."""
+    consumer = _linear_atomic_add_consumer(fx_node)
+    assert consumer is not None
+    return consumer
+
+
+def _linear_atomic_add_consumer(fx_node: torch.fx.Node) -> torch.fx.Node | None:
+    """The ``hl.atomic_add`` whose value is *fx_node* through linear ops alone, or None."""
+    node = fx_node
+    while True:
+        users = [user for user in node.users if isinstance(user, torch.fx.Node)]
+        if len(users) != 1:
+            return None
+        (user,) = users
+        if user.op != "call_function":
+            return None
+        if user.target is atomic_add:
+            return user if _atomic_value_argument(user) is node else None
+        if user.target is torch.ops.prims.convert_element_type.default:
+            # Each lane's partial is cast before its atomic add, so only a
+            # cast that keeps every fp32 partial exact may stay in the chain.
+            if user.args[1] not in (torch.float32, torch.float64):
+                return None
+            node = user
+            continue
+        if user.target in _CUTE_ATOMIC_LINEAR_PASSTHROUGH_TARGETS:
+            node = user
+            continue
+        if user.target in _CUTE_ATOMIC_LINEAR_SCALE_TARGETS and len(user.args) == 2:
+            lhs, rhs = user.args
+            other = rhs if lhs is node else lhs
+            is_division = user.target in (
+                torch.ops.aten.div.Tensor,
+                torch.ops.aten.div.Scalar,
+            )
+            if is_division and lhs is not node:
+                return None
+            if not isinstance(other, (int, float)) or isinstance(other, bool):
+                return None
+            node = user
+            continue
+        return None
+
+
+def _subgraph_placeholders(
+    user: torch.fx.Node,
+    node: torch.fx.Node,
+    get_graph: Callable[[int], GraphInfo],
+) -> Iterator[torch.fx.Node]:
+    """Yield the subgraph placeholders that *user* binds to *node*."""
+    for graph_id_index, args_index in _CUTE_SUBGRAPH_ARG_SLOTS[user.target]:
+        graph_id = user.args[graph_id_index]
+        outer_args = user.args[args_index]
+        assert isinstance(graph_id, int)
+        assert isinstance(outer_args, (list, tuple))
+        placeholders = get_graph(graph_id).graph.find_nodes(op="placeholder")
+        for placeholder, outer_arg in zip(placeholders, outer_args, strict=True):
+            if outer_arg is node:
+                yield placeholder
+
+
+def _reaches_atomic_value(
+    node: torch.fx.Node,
+    visited: set[torch.fx.Node],
+    get_graph: Callable[[int], GraphInfo],
+) -> bool:
+    """Whether *node* flows into an atomic op inside the K lane loop.
+
+    Every op of the graph propagates the per-lane prefix of a running sum,
+    including a second matmul fed by it, so the walk follows all users and
+    descends into the loop and branch subgraphs that take *node* as an
+    argument; every value such a subgraph returns counts as tainted too.  The
+    walk does not climb out through a graph's outputs: the running sum is
+    only used when the K lane loop is the innermost open scope, so the only
+    outputs the matmul's own graph can reach are the K loop's, and a value
+    that leaves the K loop is complete once the loop has finished.
+    """
+    if node in visited:
+        return False
+    visited.add(node)
+    for user in node.users:
+        if not isinstance(user, torch.fx.Node) or user.op != "call_function":
+            continue
+        if user.target in ATOMIC_OPS:
+            # ``user`` reads ``node`` in some argument (value, expected or an
+            # index), and every one of them is wrong for a prefix.
+            return True
+        if user.target in _CUTE_SUBGRAPH_ARG_SLOTS and any(
+            _reaches_atomic_value(placeholder, visited, get_graph)
+            for placeholder in _subgraph_placeholders(user, node, get_graph)
+        ):
+            return True
+        if _reaches_atomic_value(user, visited, get_graph):
+            return True
+    return False
+
+
 def cute_outer_accumulator_node(
     fx_node: torch.fx.Node | None,
     *,
@@ -590,6 +846,8 @@ def cute_resolve_active_matmul_k_block_id(
     lhs_k_size: int | torch.SymInt,
     rhs_k_size: int | torch.SymInt,
     rhs_n_size: int | torch.SymInt,
+    *,
+    lhs_m_size: int | torch.SymInt | None = None,
 ) -> int | None:
     env = CompileEnvironment.current()
     canonical_block_id = getattr(env, "canonical_block_id", lambda block_id: block_id)
@@ -599,11 +857,19 @@ def cute_resolve_active_matmul_k_block_id(
         return None
     if canonical_block_id(lhs_k_block_id) != canonical_block_id(rhs_k_block_id):
         return None
-    rhs_n_block_id = cute_resolve_active_block_id(cg, rhs_n_size)
-    if rhs_n_block_id is not None and canonical_block_id(
-        rhs_n_block_id
-    ) == canonical_block_id(lhs_k_block_id):
-        return None
+    # K must be a block of its own: a free (M or N) axis bound to the same
+    # block would make the cross-thread K reduction sum the free axis too
+    # (one lane coordinate per block id), broadcasting one value per row.
+    k_canonical = canonical_block_id(lhs_k_block_id)
+    for free_size in (rhs_n_size, lhs_m_size):
+        if free_size is None:
+            continue
+        free_block_id = cute_resolve_active_block_id(cg, free_size)
+        if (
+            free_block_id is not None
+            and canonical_block_id(free_block_id) == k_canonical
+        ):
+            return None
     return lhs_k_block_id
 
 
@@ -967,9 +1233,10 @@ class CuteFoldLoad:
     The contraction (K) axis is always the load's last dimension and
     ``free_sizes`` are the symbolic sizes of the load's leading dimensions in
     storage order. ``scale`` folds in any scalar multipliers seen on the way to
-    the load. A ``permute`` that only swaps the trailing two dims (turning a
-    ``[..., n, k]`` load into the ``[..., k, n]`` view a bmm contracts) is a
-    no-op for the underlying load, so it is accepted and ignored.
+    the load. Any ``permute`` chain is accepted as long as the matmul's
+    contraction axis maps back to the load's trailing dimension: the fold
+    re-reads each free dimension through its own block index variable, so the
+    order the operand presents those free dimensions in is irrelevant.
     """
 
     load_node: torch.fx.Node
@@ -982,14 +1249,17 @@ class CuteFoldLoad:
 def _cute_trace_matmul_operand_load(
     cg: CodegenInterface,
     node: torch.fx.Node,
+    *,
+    contraction_dim: int,
 ) -> CuteFoldLoad | None:
     """Trace a matmul operand back to a single direct ``load``.
 
-    Follows ``mul``-by-scalar (scaling), a trailing-dim ``permute`` (the
-    transpose a bmm contracts over), element-type conversions and
+    ``contraction_dim`` is the operand's K axis (``-1`` for the lhs, ``-2`` for
+    the rhs). Follows ``mul``-by-scalar (scaling), ``permute`` (tracking which
+    source dim the contraction axis comes from), element-type conversions and
     ``_new_var``/placeholder pass-throughs, crossing subgraph boundaries via
     ``placeholder_to_outer_arg``. Returns None when the operand is not a simple
-    scaled/transposed direct load whose contraction axis is the load's trailing
+    scaled/permuted direct load whose contraction axis is the load's trailing
     dimension.
     """
     from ...language._tracing_ops import _new_var
@@ -1001,6 +1271,11 @@ def _cute_trace_matmul_operand_load(
                 return graph_info
         return None
 
+    operand_val = node.meta.get("val")
+    if not isinstance(operand_val, torch.Tensor) or operand_val.ndim < 2:
+        return None
+    # Source dim of the operand's contraction axis, updated through permutes.
+    k_dim = contraction_dim % operand_val.ndim
     scale = 1.0
     current: object = node
     seen: set[int] = set()
@@ -1018,6 +1293,11 @@ def _cute_trace_matmul_operand_load(
             ):
                 return None
             if val.ndim < 2 or val.ndim != source_val.ndim:
+                return None
+            # ``load_expr`` walks the free dims in storage order and reads K
+            # along the tensor's last stride, so K must be the load's trailing
+            # dim.
+            if k_dim != val.ndim - 1:
                 return None
             return CuteFoldLoad(
                 load_node=current,
@@ -1040,14 +1320,13 @@ def _cute_trace_matmul_operand_load(
         if target is torch.ops.aten.permute.default and len(current.args) == 2:
             order = current.args[1]
             ndim = current.meta["val"].ndim
-            if not isinstance(order, (list, tuple)):
+            if not isinstance(order, (list, tuple)) or len(order) != ndim:
                 return None
-            normalized = [o % ndim for o in order]
-            # Only a trailing-dim swap (the bmm's K/N transpose) leaves the
-            # underlying load's storage order — and thus its trailing K axis —
-            # untouched. Anything else would move the contraction axis.
-            if normalized != [*range(ndim - 2), ndim - 1, ndim - 2]:
-                return None
+            # Output dim ``i`` of a permute is input dim ``order[i]``: follow
+            # the contraction axis back to the permute's source. Free dims may
+            # land anywhere (e.g. ``q[tile, :, :].transpose(0, 1)``) since the
+            # fold indexes each by its own block variable.
+            k_dim = order[k_dim] % ndim
             current = current.args[0]
             continue
         if target is torch.ops.prims.convert_element_type.default or target is _new_var:
@@ -1063,6 +1342,24 @@ def _cute_trace_matmul_operand_load(
     return None
 
 
+def cute_has_synthetic_lane_k(
+    cg: CodegenInterface,
+    k_block_id: int | None,
+) -> bool:
+    """Whether K is split across a lane loop, independent of a static numel."""
+    if k_block_id is None:
+        return False
+    cg_any = cast("Any", cg)
+    loops = cg_any.active_device_loops.get(k_block_id)
+    loop_state = loops[-1] if loops else None
+    strategy = getattr(loop_state, "strategy", None)
+    if strategy is None:
+        return False
+    lane_var = getattr(strategy, "_synthetic_cute_lane_var", None)
+    lane_extent = getattr(strategy, "_synthetic_cute_lane_extent", 1)
+    return lane_var is not None and isinstance(lane_extent, int) and lane_extent > 1
+
+
 def cute_synthetic_lane_k_extent(
     cg: CodegenInterface,
     k_block_id: int | None,
@@ -1074,19 +1371,14 @@ def cute_synthetic_lane_k_extent(
     A cross-thread warp reduction over such a K only covers the live-thread
     fraction of K, so a matmul that reduces over it must instead fold the full
     extent itself (see ``emit_cute_synthetic_lane_fold_mm``).
+
+    ``None`` can also mean that the numel is dynamic. Call
+    ``cute_has_synthetic_lane_k`` when deciding whether a scalar reduction is
+    safe, rather than treating an unknown extent as absence of a lane loop.
     """
-    if k_block_id is None:
+    if not cute_has_synthetic_lane_k(cg, k_block_id):
         return None
-    cg_any = cast("Any", cg)
-    loops = cg_any.active_device_loops.get(k_block_id)
-    loop_state = loops[-1] if loops else None
-    strategy = getattr(loop_state, "strategy", None)
-    if strategy is None:
-        return None
-    lane_var = getattr(strategy, "_synthetic_cute_lane_var", None)
-    lane_extent = getattr(strategy, "_synthetic_cute_lane_extent", 1)
-    if lane_var is None or not isinstance(lane_extent, int) or lane_extent <= 1:
-        return None
+    assert k_block_id is not None
     env = CompileEnvironment.current()
     numel = env.block_sizes[k_block_id].numel
     return _cute_static_int_extent(numel)
@@ -1097,6 +1389,7 @@ def emit_cute_synthetic_lane_fold_mm(
     lhs_node: torch.fx.Node,
     rhs_node: torch.fx.Node,
     *,
+    k_block_id: int,
     k_extent: int,
     acc: ast.AST | None,
     out_dtype: torch.dtype | None,
@@ -1112,16 +1405,23 @@ def emit_cute_synthetic_lane_fold_mm(
     self-contained serial loop over the full K extent that re-reads both
     operands directly from their tensors, so each (free-dim) thread computes the
     complete dot product. Returns None when either operand is not a simple
-    scaled/transposed direct load that can be re-read this way.
+    scaled/permuted direct load that can be re-read this way.
     """
     cg = ctx.cg
-    lhs_fold = _cute_trace_matmul_operand_load(cg, lhs_node)
-    rhs_fold = _cute_trace_matmul_operand_load(cg, rhs_node)
+    lhs_fold = _cute_trace_matmul_operand_load(cg, lhs_node, contraction_dim=-1)
+    rhs_fold = _cute_trace_matmul_operand_load(cg, rhs_node, contraction_dim=-2)
     if lhs_fold is None or rhs_fold is None:
         return None
-    if _cute_static_int_extent(lhs_fold.k_size) != k_extent:
-        return None
-    if _cute_static_int_extent(rhs_fold.k_size) != k_extent:
+
+    def k_size_matches(fold: CuteFoldLoad) -> bool:
+        static_k = _cute_static_int_extent(fold.k_size)
+        if static_k is not None:
+            return static_k == k_extent
+        # A full-slice load over the rdim may carry the reduction block's size
+        # symbol rather than the static dim; it must then be the K block.
+        return cute_resolve_active_block_id(cg, fold.k_size) == k_block_id
+
+    if not (k_size_matches(lhs_fold) and k_size_matches(rhs_fold)):
         return None
 
     def free_index_and_mask(
@@ -1226,13 +1526,13 @@ def _cute_active_mask_var(cg: CodegenInterface, block_id: int) -> str | None:
 
 def cute_lower_rhs_for_matmul(
     env: Mapping[torch.fx.Node, object],
-    lhs: ast.AST | CutePackedAffineLoad,
+    lhs: ast.AST | CutePackedAffineLoad | CutePackedTerms,
     rhs_node: torch.fx.Node,
-    rhs_fallback: ast.AST,
+    rhs_fallback: ast.AST | CutePackedTerms,
 ) -> tuple[ast.AST | CutePackedTerms, tuple[tuple[torch.fx.Node, ...], int] | None]:
     rhs: ast.AST | CutePackedTerms = rhs_fallback
     packed_rhs = None
-    if isinstance(lhs, CutePackedAffineLoad):
+    if isinstance(lhs, (CutePackedAffineLoad, CutePackedTerms)):
         packed_rhs = match_cute_stack_reshape_rhs(rhs_node)
         if packed_rhs is not None:
             packed_nodes, _ = packed_rhs

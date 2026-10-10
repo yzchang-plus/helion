@@ -30,9 +30,10 @@ The simplest way to launch autotuning straight through the kernel call:
 ```python
 import torch, helion
 
+
 @helion.kernel()
-def my_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    ...
+def my_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor: ...
+
 
 example_inputs = (
     torch.randn(1048576, device="cuda"),
@@ -55,23 +56,23 @@ a list of representative shapes, for example:
 
 ```python
 datasets = {
-  "s": (
-      torch.randn(2**16, device="cuda"),
-      torch.randn(2**16, device="cuda"),
-  ),
-  "m": (
-      torch.randn(2**20, device="cuda"),
-      torch.randn(2**20, device="cuda"),
-  ),
-  "l": (
-      torch.randn(2**24, device="cuda"),
-      torch.randn(2**24, device="cuda"),
-  ),
+    "s": (
+        torch.randn(2**16, device="cuda"),
+        torch.randn(2**16, device="cuda"),
+    ),
+    "m": (
+        torch.randn(2**20, device="cuda"),
+        torch.randn(2**20, device="cuda"),
+    ),
+    "l": (
+        torch.randn(2**24, device="cuda"),
+        torch.randn(2**24, device="cuda"),
+    ),
 }
 
 for tag, args in datasets.items():
-  config = my_kernel.autotune(args)
-  config.save(f"configs/my_kernel_{tag}.json")
+    config = my_kernel.autotune(args)
+    config.save(f"configs/my_kernel_{tag}.json")
 ```
 
 ### Direct Control Over Autotuners
@@ -89,8 +90,8 @@ tuner = LFBOTreeSearch(
     example_inputs,
     # Double the defaults to explore more candidates:
     initial_population=200,  # Default is 100.
-    copies=10,               # Default is 5.
-    max_generations=40,      # Default is 20.
+    copies=10,  # Default is 5.
+    max_generations=40,  # Default is 20.
 )
 best_config = tuner.autotune()
 best_config.save("configs/my_kernel.json")
@@ -125,8 +126,7 @@ Set the effort via the decorator or an environment variable:
 
 ```python
 @helion.kernel(autotune_effort="quick")
-def my_kernel(x: torch.Tensor) -> torch.Tensor:
-    ...
+def my_kernel(x: torch.Tensor) -> torch.Tensor: ...
 ```
 
 ```bash
@@ -199,8 +199,7 @@ export HELION_AUTOTUNE_BUDGET_SECONDS=300
 
 ```python
 @helion.kernel(autotune_budget_seconds=300)
-def my_kernel(x: torch.Tensor) -> torch.Tensor:
-    ...
+def my_kernel(x: torch.Tensor) -> torch.Tensor: ...
 ```
 
 The budget is checked between generations and during the finishing
@@ -292,8 +291,7 @@ Or via decorator:
     autotune_log_search_space_verbose=True,
     autotune_log_search_space_path="/tmp/analysis.json",
 )
-def my_kernel(x: torch.Tensor) -> torch.Tensor:
-    ...
+def my_kernel(x: torch.Tensor) -> torch.Tensor: ...
 ```
 
 ### Use Cases
@@ -328,6 +326,7 @@ Implement `RemoteCacheBackend` somewhere on your import path:
 
 ```python
 from helion.autotuner.remote_cache import RemoteCacheBackend
+
 
 class MyBackend(RemoteCacheBackend):
     def get(self, key: str) -> str | None: ...
@@ -390,9 +389,9 @@ If one configuration wins for every production call, bake it into the decorator:
 ```python
 best = helion.Config.load("configs/my_kernel.json")
 
+
 @helion.kernel(config=best)
-def my_kernel(x, y):
-    ...
+def my_kernel(x, y): ...
 ```
 
 The supplied `config` applies to **all** argument shapes, dtypes, and
@@ -413,9 +412,9 @@ candidate_configs = [
     helion.Config.load("configs/my_kernel_large.json"),
 ]
 
+
 @helion.kernel(configs=candidate_configs, static_shapes=True)
-def my_kernel(x, y):
-    ...
+def my_kernel(x, y): ...
 ```
 
 Helion performs a lightweight benchmark (similar to Triton’s autotune)
@@ -451,8 +450,7 @@ As an example, you could trigger re-tuning with power-of-two bucketing:
     key=lambda x, y: helion.next_power_of_2(x.numel()),
     static_shapes=False,
 )
-def my_kernel(x, y):
-    ...
+def my_kernel(x, y): ...
 ```
 
 See {doc}`api/kernel` for the full decorator reference.
@@ -481,6 +479,7 @@ import torch
 import helion
 import helion.language as hl
 
+
 @helion.kernel(static_shapes=False)
 def rms_norm_fwd(
     x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5
@@ -497,12 +496,19 @@ def rms_norm_fwd(
         out[tile_m, :] = (normalized * weight[:].to(torch.float32)).to(out.dtype)
     return out
 
+
 # Every call specializes on n - different hidden sizes = different cache entries
 weight_4096 = torch.randn([4096], device="cuda")
 weight_2048 = torch.randn([2048], device="cuda")
-result1 = rms_norm_fwd(torch.randn([2048, 4096], device="cuda"), weight_4096)  # compiles for n=4096
-result2 = rms_norm_fwd(torch.randn([1024, 4096], device="cuda"), weight_4096)  # reuses n=4096
-result3 = rms_norm_fwd(torch.randn([2048, 2048], device="cuda"), weight_2048)  # compiles for n=2048
+result1 = rms_norm_fwd(
+    torch.randn([2048, 4096], device="cuda"), weight_4096
+)  # compiles for n=4096
+result2 = rms_norm_fwd(
+    torch.randn([1024, 4096], device="cuda"), weight_4096
+)  # reuses n=4096
+result3 = rms_norm_fwd(
+    torch.randn([2048, 2048], device="cuda"), weight_2048
+)  # compiles for n=2048
 ```
 
 Use `hl.specialize()` when a dimension is performance-critical and you want
@@ -532,6 +538,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         out[tile_m, tile_n] = acc.to(x.dtype)
     return out
 
+
 # Dynamic call - all dimensions remain symbolic
 x_dyn = torch.randn([m, k], device="cuda", dtype=torch.float16)
 y_dyn = torch.randn([k, n], device="cuda", dtype=torch.float16)
@@ -541,7 +548,7 @@ result = matmul(x_dyn, y_dyn)
 x_opt = torch.randn([64, 128], device="cuda", dtype=torch.float16)
 y_opt = torch.randn([128, 56], device="cuda", dtype=torch.float16)
 torch._dynamo.mark_static(x_opt, [0, -1])  # specialize dims 0 and -1 (M and K)
-torch._dynamo.mark_static(y_opt, 1)        # specialize dim 1 (N)
+torch._dynamo.mark_static(y_opt, 1)  # specialize dim 1 (N)
 result = matmul(x_opt, y_opt)  # generates code with 64, 128, 56 as constants
 ```
 
@@ -563,6 +570,7 @@ def fn(x: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size()):
         out[tile] = x[tile] * 2
     return out
+
 
 # mark_static on dim 1 combines with hl.specialize on dim 0
 x = torch.randn([320, 640], device="cuda")
@@ -594,6 +602,7 @@ large_cfg = helion.Config.load("configs/my_kernel_large.json")
 
 small_run = bound.compile_config(small_cfg)  # Returns a callable
 large_run = bound.compile_config(large_cfg)
+
 
 def routed_my_kernel(x, y):
     runner = small_run if x.numel() <= 2**16 else large_run
@@ -786,6 +795,7 @@ objects.  For a kernel `foo` it exposes two top-level functions:
 def key_foo(*args) -> int:
     """Decision-tree-derived config index for the given args."""
     ...
+
 
 def autotune_foo(*args) -> dict:
     """Return the config dict for the given args."""
