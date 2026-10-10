@@ -3,9 +3,10 @@
 # 用户执行; 所有输出追加到 npu_sweep.log; per-op 日志 /tmp/npu_dev_sweep/<op>.log
 # 用法: bash npu_sweep.sh
 set -u
-cd /workspace/work/helion || exit 1
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$SCRIPT_DIR" || exit 1
 
-LOG=/workspace/work/helion/npu_sweep.log
+LOG="$SCRIPT_DIR/npu_sweep.log"
 exec >> "$LOG" 2>&1
 echo "=== $(date '+%F %T') npu_sweep start (branch: $(git rev-parse --abbrev-ref HEAD), head: $(git rev-parse --short HEAD)) ==="
 
