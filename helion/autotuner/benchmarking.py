@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import functools
 import glob
 import logging
 import math
@@ -19,6 +18,7 @@ from typing import cast
 
 import torch
 
+from .._compat import safe_clear_cache
 from ..runtime.settings import _env_get_bool
 from ..runtime.settings import is_pallas_interpret
 from .progress_bar import iter_with_progress
@@ -274,7 +274,6 @@ def compute_repeat(
     from triton import runtime
 
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
-    cache = runtime.driver.active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
 
     # Warm the pipeline once before collecting timing samples.
     fn()
@@ -285,7 +284,7 @@ def compute_repeat(
     end_event = di.Event(enable_timing=True)
     start_event.record()
     for _ in range(estimate_runs):
-        runtime.driver.active.clear_cache(cache)  # type: ignore[attr-defined]
+        safe_clear_cache()
         benchmark_function()
     end_event.record()
     di.synchronize()
@@ -385,10 +384,9 @@ def interleaved_bench(
     # warmup
     for fn in fns:
         fn()
-    clear_cache = functools.partial(
-        runtime.driver.active.clear_cache,  # type: ignore[attr-defined]
-        runtime.driver.active.get_empty_cache_for_benchmark(),  # type: ignore[attr-defined]
-    )
+    # Not every Triton driver exposes the L2-flush primitive; this is a no-op
+    # on those (see _compat.safe_clear_cache).
+    clear_cache = safe_clear_cache
     clear_cache()
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
     if max_total_ms is not None:
@@ -903,14 +901,13 @@ def do_bench(
         else _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
     )
 
-    cache = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
     calls = 1
     flush_replay: Callable[[], None] | None = None
     if benchmark_function is not fn:
         # The first L2 flush and the first replay of a fresh graph pay their
         # one-time costs; keep those out of the estimate that sizes the
         # repetitions and the batch.
-        runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+        safe_clear_cache()
         benchmark_function()
         di.synchronize()
 
@@ -921,7 +918,7 @@ def do_bench(
             batch_end = di.Event(enable_timing=True)
             batch_start.record()
             for _ in range(count):
-                runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+                safe_clear_cache()
                 benchmark_function()
             batch_end.record()
             di.synchronize()
@@ -945,7 +942,7 @@ def do_bench(
         end_event = di.Event(enable_timing=True)
         start_event.record()
         for _ in range(5):
-            runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+            safe_clear_cache()
             benchmark_function()
         end_event.record()
         di.synchronize()
@@ -969,7 +966,7 @@ def do_bench(
             estimate_ms = (
                 _single_replay_estimate_us(
                     benchmark_function,
-                    functools.partial(runtime.driver.active.clear_cache, cache),  # pyrefly: ignore
+                    safe_clear_cache,
                     di,
                     samples=1,
                 )
@@ -982,7 +979,7 @@ def do_bench(
     # includes the L2 flush).  The flush-only graph is timed every few samples
     # so the subtraction never spans a clock or thermal drift.
     if benchmark_function is not fn:
-        clear_cache = functools.partial(runtime.driver.active.clear_cache, cache)  # pyrefly: ignore
+        clear_cache = safe_clear_cache
         calls = sync_object(
             _batched_replay_calls(
                 _single_replay_estimate_us(benchmark_function, clear_cache, di)
@@ -1017,8 +1014,9 @@ def do_bench(
             for x in grad_to_none:
                 x.grad = None
         if flush_replay is None:
-            # we clear the L2 cache before each run
-            runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+            # we clear the L2 cache before each run (where the driver
+            # supports it)
+            safe_clear_cache()
         elif i % _BATCHED_FLUSH_EVERY == 0:
             # the batched graph flushes before every call it holds; time the
             # matching flush-only graph next to the samples it corrects

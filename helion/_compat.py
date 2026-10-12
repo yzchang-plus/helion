@@ -576,9 +576,7 @@ def supports_mtia_tunables() -> bool:
 @functools.cache
 def _supports_mtia_tunables() -> bool:
     try:
-        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
-            supports_mtia_tunables as _fb_supports_mtia,
-        )
+        from .fb.mtia_tunables import supports_mtia_tunables as _fb_supports_mtia  # pyrefly: ignore [missing-import]
 
         return _fb_supports_mtia()
     except ImportError:
@@ -640,6 +638,29 @@ def _supports_maxnreg() -> bool:
         and torch.version.xpu is None
         and torch.cuda.is_available()
     )
+
+
+def safe_clear_cache() -> None:
+    """Clear the benchmark cache when the active Triton driver supports it.
+
+    The CUDA driver exposes ``clear_cache``/``get_empty_cache_for_benchmark``
+    for L2 flushes between timed runs; out-of-tree Triton drivers for other
+    targets may not. Benchmarking must not crash there, so a driver without
+    the primitive is a silent no-op (the flush is skipped and timing simply
+    measures a warmer L2).
+    """
+    try:
+        from triton import runtime
+
+        driver = runtime.driver.active
+        if hasattr(driver, "clear_cache") and hasattr(
+            driver, "get_empty_cache_for_benchmark"
+        ):
+            cache = driver.get_empty_cache_for_benchmark()
+            driver.clear_cache(cache)
+    except Exception:
+        # Ignore driver introspection/clear failures during benchmarking.
+        pass
 
 
 def fp8_block_ptr_padding_broken() -> bool:
