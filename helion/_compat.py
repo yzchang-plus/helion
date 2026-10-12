@@ -8,6 +8,7 @@ import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import Protocol
 from typing import cast
 
 from packaging import version
@@ -576,7 +577,9 @@ def supports_mtia_tunables() -> bool:
 @functools.cache
 def _supports_mtia_tunables() -> bool:
     try:
-        from .fb.mtia_tunables import supports_mtia_tunables as _fb_supports_mtia  # pyrefly: ignore [missing-import]
+        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
+            supports_mtia_tunables as _fb_supports_mtia,
+        )
 
         return _fb_supports_mtia()
     except ImportError:
@@ -640,27 +643,60 @@ def _supports_maxnreg() -> bool:
     )
 
 
+class _BenchmarkCacheDriver(Protocol):
+    """Structural type of a triton driver with the L2-flush primitives."""
+
+    def clear_cache(self, cache: object) -> None: ...
+
+    def get_empty_cache_for_benchmark(self) -> object: ...
+
+
+# (driver, buffer) pair so the flush buffer is allocated once per driver
+# instead of on every timed iteration. Identity-compared rather than dict-keyed
+# because driver objects (and test doubles) may be unhashable.
+_flush_cache_state: list[tuple[object, object]] = []
+
+
+def _driver_flush_cache(driver: object) -> object:
+    """Allocate the flush buffer once per driver, not per timed iteration.
+
+    ``get_empty_cache_for_benchmark()`` allocates a large buffer; allocating it
+    on every call would pay the first allocation inside a timed estimate loop.
+    The buffer stays alive for the process lifetime (it is only used for
+    benchmarking anyway), and a driver switch re-allocates.
+    """
+    if not _flush_cache_state or _flush_cache_state[0][0] is not driver:
+        # The runtime driver object (triton's LazyProxy or a test double)
+        # forwards attribute access; the Protocol is the structural contract.
+        cache_driver = cast("_BenchmarkCacheDriver", driver)
+        _flush_cache_state[:] = [(driver, cache_driver.get_empty_cache_for_benchmark())]
+    return _flush_cache_state[0][1]
+
+
 def safe_clear_cache() -> None:
     """Clear the benchmark cache when the active Triton driver supports it.
 
     The CUDA driver exposes ``clear_cache``/``get_empty_cache_for_benchmark``
     for L2 flushes between timed runs; out-of-tree Triton drivers for other
-    targets may not. Benchmarking must not crash there, so a driver without
-    the primitive is a silent no-op (the flush is skipped and timing simply
-    measures a warmer L2).
+    targets may not. A driver without the primitive — or an environment whose
+    active driver cannot be resolved at all (CPU-only, or several competing
+    accelerators) — makes this a silent no-op, so timing simply measures a
+    warmer L2. Failures of the flush itself (e.g. an OOM allocating the flush
+    buffer) are not hidden; they propagate to the caller.
     """
     try:
         from triton import runtime
 
         driver = runtime.driver.active
-        if hasattr(driver, "clear_cache") and hasattr(
+        if not hasattr(driver, "clear_cache") or not hasattr(
             driver, "get_empty_cache_for_benchmark"
         ):
-            cache = driver.get_empty_cache_for_benchmark()
-            driver.clear_cache(cache)
-    except Exception:
-        # Ignore driver introspection/clear failures during benchmarking.
-        pass
+            return
+    except (ImportError, AttributeError, RuntimeError):
+        # Triton missing, or its driver cannot be resolved: benchmarking
+        # proceeds without the L2 flush.
+        return
+    driver.clear_cache(_driver_flush_cache(driver))
 
 
 def fp8_block_ptr_padding_broken() -> bool:

@@ -980,6 +980,30 @@ class _PointerLoadContiguity:
         return None
 
 
+def _clamps_masked_offsets(indexing: SubscriptIndexing) -> bool:
+    """Whether the backend requires masked-out offsets clamped to 0."""
+    return indexing.has_mask() and (
+        CompileEnvironment.current().backend.clamp_masked_pointer_offsets()
+    )
+
+
+def _clamped_offset_expr(indexing: SubscriptIndexing, offset: ast.AST) -> ast.AST:
+    """Clamp masked-out pointer offsets to 0 when the backend requires it.
+
+    Some hardware DMA paths require non-negative pointer offsets even for
+    masked-out elements (see ``Backend.clamp_masked_pointer_offsets``). Only
+    the pointer indexing strategy goes through here; block-ptr and tensor
+    descriptor strategies are unaffected.
+    """
+    if not _clamps_masked_offsets(indexing):
+        return offset
+    return expr_from_string(
+        "tl.where({mask}, {off}, 0)",
+        mask=indexing.mask_expr,
+        off=offset,
+    )
+
+
 class PointerIndexingStrategy(IndexingStrategy):
     """Generate the original pointer math to load/store from tensors"""
 
@@ -1020,8 +1044,13 @@ class PointerIndexingStrategy(IndexingStrategy):
             contiguity = _PointerLoadContiguity(state, fake_tensor, subscript).derive()
         except Exception:
             contiguity = None
-        if contiguity is not None:
+        clamped = _clamps_masked_offsets(indexing)
+        if clamped:
+            offset_ast = _clamped_offset_expr(indexing, offset_ast)
+        if contiguity is not None and not clamped:
             # Triton propagates the hint from ``index``, but not ``index * 1``.
+            # Skipped when clamping: ``tl.where`` breaks the value contiguity
+            # the hint would assert.
             inner_ast = offset_ast
             if (
                 isinstance(inner_ast, ast.BinOp)
@@ -1033,14 +1062,6 @@ class PointerIndexingStrategy(IndexingStrategy):
             offset_ast = expr_from_string(
                 f"tl.max_contiguous({{off}}, {contiguity!r})", off=inner_ast
             )
-        if indexing.has_mask():
-            backend = CompileEnvironment.current().backend
-            if backend.clamp_masked_pointer_offsets():
-                offset_ast = expr_from_string(
-                    "tl.where({mask}, {off}, 0)",
-                    mask=indexing.mask_expr,
-                    off=offset_ast,
-                )
         extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
         extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
         load_placeholders: dict[str, ast.AST] = {
@@ -1119,12 +1140,7 @@ class PointerIndexingStrategy(IndexingStrategy):
             shape_str = state.tile_strategy.shape_str(output_size)
             broadcast = backend.broadcast_to_expr("{offset}", shape_str)
             offset_expr = expr_from_string(broadcast, offset=offset_expr)
-        if indexing.has_mask() and backend.clamp_masked_pointer_offsets():
-            offset_expr = expr_from_string(
-                "tl.where({mask}, {off}, 0)",
-                mask=indexing.mask_expr,
-                off=offset_expr,
-            )
+        offset_expr = _clamped_offset_expr(indexing, offset_expr)
 
         extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
         store_placeholders: dict[str, ast.AST] = {
@@ -1152,14 +1168,7 @@ class PointerIndexingStrategy(IndexingStrategy):
             state, fake_tensor, subscript, for_store=True
         )
         name = state.device_function.tensor_arg(fake_tensor).name
-        offset_expr = indexing.index_expr
-        backend = CompileEnvironment.current().backend
-        if indexing.has_mask() and backend.clamp_masked_pointer_offsets():
-            offset_expr = expr_from_string(
-                "tl.where({mask}, {off}, 0)",
-                mask=indexing.mask_expr,
-                off=offset_expr,
-            )
+        offset_expr = _clamped_offset_expr(indexing, indexing.index_expr)
         return expr_from_string(
             f"tl.{op}({name} + {{offset}}, {{value}}, mask={{mask}}, sem={{sem}})",
             offset=offset_expr,

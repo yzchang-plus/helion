@@ -586,7 +586,10 @@ class Backend(abc.ABC):
         Some hardware DMA paths require non-negative pointer offsets even for
         masked-out elements; when True, codegen wraps the offset in
         ``tl.where(mask, offset, 0)`` so masked-out elements access
-        ``ptr + 0`` (the loaded/stored value is discarded anyway).
+        ``ptr + 0`` (the loaded/stored value is discarded anyway). Only the
+        pointer indexing strategy honors this; block-ptr and tensor
+        descriptor strategies are unaffected, so a backend that enables it
+        should also exclude those indexing modes from its search space.
         """
         return False
 
@@ -1579,6 +1582,10 @@ class Backend(abc.ABC):
             "tf32": "tf32",
             "tf32x3": "tf32x3",
             "ieee": "ieee",
+            # Forwarded verbatim: stock CUDA triton rejects it loudly at
+            # compile time, while out-of-tree drivers (e.g. Ascend) that
+            # declare "hf32" in allowed_dot_input_precisions honor it.
+            "hf32": "hf32",
         }
         return triton_precision_by_dot_precision.get(precision, "")
 

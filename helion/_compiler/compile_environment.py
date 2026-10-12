@@ -444,11 +444,16 @@ class CompileEnvironment:
         self.process_group_name = None
         backend_name = settings.backend
         # Device routing: when the backend is the default ('triton', i.e. the
-        # user did not set HELION_BACKEND) and it does not declare the active
-        # device type while another registered backend does, use that backend
-        # instead.  An explicit HELION_BACKEND=<name> (including
-        # HELION_BACKEND=triton) is always honored unchanged.
-        if backend_name == "triton" and not os.environ.get("HELION_BACKEND"):
+        # user set neither a backend kwarg nor HELION_BACKEND) and it does not
+        # declare the active device type while another registered backend
+        # does, use that backend instead.  An explicit choice — a
+        # Settings/kernel backend kwarg (including backend='triton') or
+        # HELION_BACKEND=<name> — is always honored unchanged.
+        if (
+            backend_name == "triton"
+            and not settings._backend_explicit
+            and not os.environ.get("HELION_BACKEND")
+        ):
             routed = find_backend_for_device(device.type)
             if routed not in (None, backend_name):
                 log.info(

@@ -192,9 +192,8 @@ def statements_from_string(template: str, **placeholders: ast.AST) -> list[ast.s
     """
     Create a list of AST statements from a template string with placeholders.
 
-    Like :func:`statement_from_string` but parses a *block* of statements
-    (e.g. a ``for`` loop with its indented body, or several statements) and
-    returns the list of statements.
+    Parses a *block* of statements (e.g. a ``for`` loop with its indented
+    body, or several statements) and returns the list of statements.
 
     Uses {placeholder} syntax to mark placeholders that should be replaced with AST nodes.
     This supports two common patterns:
@@ -272,21 +271,10 @@ def statements_from_string(template: str, **placeholders: ast.AST) -> list[ast.s
 
 def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
     """
-    Create an AST statement from a template string with placeholders.
+    Create a single AST statement from a template string with placeholders.
 
-    Uses {placeholder} syntax to mark placeholders that should be replaced with AST nodes.
-    This supports two common patterns:
-
-    1. Regular strings - placeholders use single braces:
-        expr_from_string("tl.load({ptr} + {offset}, {mask})",
-                        ptr=ptr_ast, offset=offset_ast, mask=mask_ast)
-
-    2. f-strings - placeholders use double braces (which become single braces):
-        name = "my_tensor"
-        expr_from_string(f"tl.load({name} + {{offset}}, {{mask}})",
-                        offset=offset_ast, mask=mask_ast)
-        # In the f-string, {name} is interpolated to "my_tensor",
-        # while {{offset}} becomes {offset} for placeholder replacement
+    Like :func:`statements_from_string` but for exactly one statement; see
+    that function for the {placeholder} syntax and f-string escaping rules.
     """
     (statement,) = statements_from_string(template, **placeholders)
     return statement

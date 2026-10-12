@@ -8193,6 +8193,9 @@ class TileStrategy:
                 # pipeline within the number of complete unrolled iterations;
                 # using only the final tile's remainder would collapse every
                 # exactly divisible reduction to one stage.
+                # A backend that defers num_warps (None) takes the
+                # conservative multi-warp path below; that is safe, it just
+                # forgoes this one-warp pipelining refinement.
                 loop_iterations = int(math.ceil(loop_numel / block_size))
                 unrolled_iterations = int(
                     math.ceil(loop_iterations / range_unroll_factor)

@@ -81,6 +81,12 @@ def _make_l2_cache_clearer() -> Callable[[], None]:
     from triton import runtime
 
     active = runtime.driver.active  # type: ignore[attr-defined]
+    if not hasattr(active, "clear_cache") or not hasattr(
+        active, "get_empty_cache_for_benchmark"
+    ):
+        # Out-of-tree triton drivers may lack the cache-clear primitive; skip
+        # the flush there (same contract as safe_clear_cache()).
+        return lambda: None
     cache = active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
 
     def clear() -> None:
