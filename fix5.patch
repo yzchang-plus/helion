@@ -1,0 +1,322 @@
+root@node73-144:/home/cyz/helion# cat backend-generic-mechanisms-fixes-round5.patch
+diff --git a/helion/_compat.py b/helion/_compat.py
+index 4fecb48f..e598c33a 100644
+--- a/helion/_compat.py
++++ b/helion/_compat.py
+@@ -722,6 +722,26 @@ def make_cache_clearer(driver: object) -> Callable[[], None] | None:
+     return clear
+ 
+ 
++def active_cache_clearer() -> Callable[[], None] | None:
++    """Resolve the active Triton driver and bind a cache clearer to it.
++
++    The single driver-resolution gate for the L2 flush: an environment whose
++    active driver cannot be resolved at all (no Triton, CPU-only, or several
++    competing accelerators) yields None, as does a driver without the flush
++    primitives — so both the event benches (via safe_clear_cache) and the
++    generic wall-clock benches flush on one capability contract.
++    """
++    try:
++        from triton import runtime
++
++        driver = runtime.driver.active
++    except (ImportError, AttributeError, RuntimeError):
++        # Triton missing, or its driver cannot be resolved: benchmarking
++        # proceeds without the L2 flush.
++        return None
++    return make_cache_clearer(driver)
++
++
+ def safe_clear_cache() -> None:
+     """Clear the benchmark cache when the active Triton driver supports it.
+ 
+@@ -733,15 +753,7 @@ def safe_clear_cache() -> None:
+     warmer L2. Failures of the flush itself (e.g. an OOM allocating the flush
+     buffer) are not hidden; they propagate to the caller.
+     """
+-    try:
+-        from triton import runtime
+-
+-        driver = runtime.driver.active
+-    except (ImportError, AttributeError, RuntimeError):
+-        # Triton missing, or its driver cannot be resolved: benchmarking
+-        # proceeds without the L2 flush.
+-        return
+-    clearer = make_cache_clearer(driver)
++    clearer = active_cache_clearer()
+     if clearer is not None:
+         clearer()
+ 
+diff --git a/helion/_compiler/cute/cute_mma.py b/helion/_compiler/cute/cute_mma.py
+index 63767c8e..88d0c188 100644
+--- a/helion/_compiler/cute/cute_mma.py
++++ b/helion/_compiler/cute/cute_mma.py
+@@ -8637,13 +8637,17 @@ def _emit_mma_pipeline(
+     # This is the kernel-wide contract ProgramID consumes. Today the TMA
+     # producer flag is the master predicate for all three role-local loops.
+     tcgen05_use_role_local_persistent_body = tcgen05_use_role_local_tma_producer
++    if df.config.num_stages is None:
++        raise exc.InvalidConfig(
++            "the cute backend requires an explicit num_stages "
++            "(num_stages=None deferral is only supported by backends "
++            "that defer to the triton driver)"
++        )
+     tcgen05_ab_stage_count_value = _tcgen05_config_int(
+         df.config,
+         "tcgen05_ab_stages",
+-        # CuTe configs always pin num_stages; a config that defers (None)
+-        # fails loudly at the arithmetic below rather than silently
+-        # miscompiling.
+-        _tcgen05_ab_stage_count(cast("int", df.config.num_stages)),
++        # CuTe configs always pin num_stages.
++        _tcgen05_ab_stage_count(df.config.num_stages),
+     )
+     tcgen05_c_stage_count_value = _tcgen05_config_int(
+         df.config, "tcgen05_c_stages", _tcgen05_c_stage_count(bn)
+diff --git a/helion/_compiler/metal/backend.py b/helion/_compiler/metal/backend.py
+index 9cda4f3e..10853022 100644
+--- a/helion/_compiler/metal/backend.py
++++ b/helion/_compiler/metal/backend.py
+@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
+ from typing import Any
+ from typing import ClassVar
+ from typing import Sequence
+-from typing import cast
+ 
+ import torch
+ 
+@@ -889,9 +888,13 @@ class MetalBackend(Backend):
+         # simdgroup has 32 threads.  tid[0] must be large enough for both
+         # MPP's cooperative operation and any scalar indexing on the first
+         # root axis.
+-        # Metal configs always pin num_warps; deferral (None) is not a Metal
+-        # concept, and a pinned None raises TypeError loudly here.
+-        mpp_threads = cast("int", config.num_warps) * 32
++        if config.num_warps is None:
++            raise exc.InvalidConfig(
++                "the metal backend requires an explicit num_warps "
++                "(num_warps=None deferral is only supported by backends "
++                "that defer to the triton driver)"
++            )
++        mpp_threads = config.num_warps * 32
+         used_threads = max(mpp_threads, first_axis_threads)
+         changed = False
+ 
+diff --git a/helion/autotuner/benchmarking.py b/helion/autotuner/benchmarking.py
+index b5a7afd5..25dedcf3 100644
+--- a/helion/autotuner/benchmarking.py
++++ b/helion/autotuner/benchmarking.py
+@@ -18,7 +18,7 @@ from typing import cast
+ 
+ import torch
+ 
+-from .._compat import make_cache_clearer
++from .._compat import active_cache_clearer
+ from .._compat import safe_clear_cache
+ from ..runtime.settings import _env_get_bool
+ from ..runtime.settings import is_pallas_interpret
+@@ -74,18 +74,15 @@ def _make_l2_cache_clearer() -> Callable[[], None]:
+     clears L2 by default) actually measure. Flushing L2 between timed calls
+     makes the autotune regime match the deployment regime.
+ 
+-    Uses Triton's CUDA-only cache-clear primitive. Returns a no-op when not on
+-    CUDA (e.g. TPU/Pallas backends that also use the generic bench).
++    Flushes purely on driver capability (see active_cache_clearer): the
++    primitive ships with triton's CUDA driver, and out-of-tree drivers that
++    implement it get the same flush as the event benches. ROCm keeps its
++    historical exclusion; environments without a resolvable flush-capable
++    driver (e.g. TPU/Pallas boxes) get a no-op.
+     """
+-    if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
++    if getattr(torch.version, "hip", None) is not None:
+         return lambda: None
+-    from triton import runtime
+-
+-    active = runtime.driver.active  # type: ignore[attr-defined]
+-    # Shared probe/buffer with safe_clear_cache() (see make_cache_clearer):
+-    # one capability contract, one eagerly-allocated buffer. Out-of-tree
+-    # triton drivers without the primitive get the same no-op.
+-    clearer = make_cache_clearer(active)
++    clearer = active_cache_clearer()
+     if clearer is None:
+         return lambda: None
+     return clearer
+diff --git a/helion/autotuner/config_spec.py b/helion/autotuner/config_spec.py
+index d823b33c..3e25f796 100644
+--- a/helion/autotuner/config_spec.py
++++ b/helion/autotuner/config_spec.py
+@@ -1603,6 +1603,11 @@ class ConfigSpec:
+     def _should_keep_epilogue_subtile_for_autotune(self) -> bool:
+         if self.epilogue_subtile_autotune_choices is None:
+             return False
++        # Subtiled stores are forced onto tensor descriptors below; a
++        # clamp-masked-offset backend cannot guarantee masked accesses there,
++        # so it does not get the epilogue-subtile search space at all.
++        if self.backend.clamp_masked_pointer_offsets():
++            return False
+         return supports_tensor_descriptor()
+ 
+     def fix_epilogue_subtile_store_indexing(self, config: dict[str, object]) -> None:
+@@ -1610,6 +1615,8 @@ class ConfigSpec:
+         if (
+             not self.epilogue_subtile_candidate_enabled
+             or "epilogue_subtile" not in config
++            # Clamp-masked-offset backends keep pointer stores (see above).
++            or self.backend.clamp_masked_pointer_offsets()
+         ):
+             return
+         indexing = config.get("indexing")
+@@ -1668,6 +1675,12 @@ class ConfigSpec:
+             self.epilogue_subtile_autotune_choices = EPILOGUE_SUBTILE_DEFAULT_CHOICES
+ 
+     def valid_indexing_types(self) -> tuple[IndexingLiteral, ...]:
++        # Clamp-masked-offset backends only guarantee masked accesses on the
++        # pointer strategy; restrict the search space here so the flag's
++        # contract holds by construction instead of relying on backend
++        # authors to also override the other capability hooks.
++        if self.backend.clamp_masked_pointer_offsets():
++            return ("pointer",)
+         if supports_tensor_descriptor():
+             return ("pointer", "tensor_descriptor")
+         if not self.backend.supports_block_ptr_indexing():
+@@ -1676,6 +1689,8 @@ class ConfigSpec:
+ 
+     def valid_atomic_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+         """Atomic ops only support pointer and tensor_descriptor (no block_ptr)."""
++        if self.backend.clamp_masked_pointer_offsets():
++            return ("pointer",)
+         if supports_tensor_descriptor():
+             return ("pointer", "tensor_descriptor")
+         return ("pointer",)
+diff --git a/test/test_codegen_comments.py b/test/test_codegen_comments.py
+index 63a73e2f..cc7dc3f6 100644
+--- a/test/test_codegen_comments.py
++++ b/test/test_codegen_comments.py
+@@ -3,11 +3,36 @@ from __future__ import annotations
+ import ast
+ 
+ from helion._compiler.ast_extension import create
++from helion._compiler.ast_extension import expr_from_string
+ from helion._compiler.ast_extension import statement_from_string
++from helion._compiler.ast_extension import statements_from_string
+ from helion._compiler.ast_extension import unparse
+ from helion._compiler.source_location import SourceLocation
+ 
+ 
++def test_statements_from_string_parses_statement_blocks() -> None:
++    stmts = statements_from_string("x = 1\ny = x + 1\nif y:\n    z = 2")
++    assert isinstance(stmts[0], ast.Assign)
++    assert isinstance(stmts[1], ast.Assign)
++    assert isinstance(stmts[2], ast.If)
++
++    # Placeholders are replaced in every statement of the block.
++    placeholder = expr_from_string("q")
++    stmts = statements_from_string("a = {v}\nb = a", v=placeholder)
++    assert isinstance(stmts[0].value, ast.Name)
++    assert stmts[0].value.id == "q"
++
++    # The single-statement variant enforces its exactly-one contract:
++    # a two-statement block does not unpack.
++    try:
++        statement_from_string("x = 1\ny = 2")
++    except ValueError:
++        pass
++    else:
++        msg = "expected the exactly-one contract to reject a block"
++        raise AssertionError(msg)
++
++
+ def test_unparse_inserts_source_location_comments(tmp_path) -> None:
+     src_file = tmp_path / "snippet.py"
+     src_lines = ["x = 1\n", "y = x + 1\n"]
+diff --git a/test/test_config_api.py b/test/test_config_api.py
+index cc32dcfe..a364b189 100644
+--- a/test/test_config_api.py
++++ b/test/test_config_api.py
+@@ -25,6 +25,8 @@ from helion._compiler.autotuner_heuristics.cute import (
+ )
+ from helion._compiler.backend import PallasBackend
+ from helion._compiler.backend import TritonBackend
++from helion._compiler.backend_registry import _REGISTRY
++from helion._compiler.backend_registry import register_compiler_backend
+ from helion._compiler.compile_environment import CompileEnvironment
+ from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
+ from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
+@@ -867,6 +869,13 @@ class TestConfigAPI(TestCase):
+ 
+         self.assertEqual(backend.effective_num_warps(config), 4)
+ 
++    def test_hf32_dot_precision_is_forwarded_verbatim(self) -> None:
++        # 'hf32' is honored only by out-of-tree triton drivers that accept the
++        # value; the base mapping forwards it verbatim so stock CUDA triton
++        # fails loudly instead of silently dropping the setting.
++        helion.Settings(dot_precision="hf32")
++        self.assertEqual(TritonBackend().map_dot_precision("hf32"), "hf32")
++
+     def test_explicit_none_defers_num_warps_and_num_stages(self) -> None:
+         # An explicit None defers the choice to the backend's driver; it must
+         # survive the constructor and the to_json/from_json round-trip the
+@@ -1376,6 +1385,39 @@ class TestSettingsEnv(TestCase):
+         )
+ 
+ 
++@onlyBackends(["triton"])
++class TestDeviceRouting(TestCase):
++    def test_routing_swaps_only_the_implicit_default_backend(self) -> None:
++        class _MetaTritonBackend(TritonBackend):
++            @property
++            def name(self) -> str:
++                return "_test_meta_routing"
++
++            device_types = frozenset({"meta"})
++
++        register_compiler_backend(_MetaTritonBackend)
++        try:
++            # Implicit default 'triton' + a registered backend declaring the
++            # device type: the code generator is routed while settings.backend
++            # keeps the user-facing 'triton'.
++            env = CompileEnvironment(torch.device("meta"), helion.Settings())
++            self.assertEqual(env.backend.name, "_test_meta_routing")
++            self.assertEqual(env.settings.backend, "triton")
++
++            # An explicit backend choice suppresses routing...
++            env = CompileEnvironment(
++                torch.device("meta"), helion.Settings(backend="triton")
++            )
++            self.assertEqual(env.backend.name, "triton")
++
++            # ...and so does HELION_BACKEND.
++            with patch.dict(os.environ, {"HELION_BACKEND": "triton"}, clear=False):
++                env = CompileEnvironment(torch.device("meta"), helion.Settings())
++            self.assertEqual(env.backend.name, "triton")
++        finally:
++            _REGISTRY.pop("_test_meta_routing", None)
++
++
+ @onlyBackends(["triton", "cute"])
+ class TestFormatKernelDecorator(TestCase):
+     def test_format_kernel_decorator_includes_index_dtype(self) -> None:
+diff --git a/test/test_l2_cache_flush.py b/test/test_l2_cache_flush.py
+index 4f7f96ce..a8c0f769 100644
+--- a/test/test_l2_cache_flush.py
++++ b/test/test_l2_cache_flush.py
+@@ -34,8 +34,10 @@ class _FakeDriver:
+ class TestMakeCacheClearer(unittest.TestCase):
+     def setUp(self) -> None:
+         # Module-level (driver, device, buffer) slot shared with
+-        # safe_clear_cache(); isolate each test from prior allocations.
++        # safe_clear_cache(); isolate each test from prior allocations and
++        # clear the fake driver/buffer again when the tests finish.
+         _flush_cache_state.clear()
++        self.addCleanup(_flush_cache_state.clear)
+ 
+     def test_driver_without_primitives_yields_none(self) -> None:
+         self.assertIsNone(make_cache_clearer(SimpleNamespace()))
+@@ -70,6 +72,7 @@ class TestMakeCacheClearer(unittest.TestCase):
+ class TestSafeClearCache(unittest.TestCase):
+     def setUp(self) -> None:
+         _flush_cache_state.clear()
++        self.addCleanup(_flush_cache_state.clear)
+ 
+     def test_noop_when_driver_lacks_primitives(self) -> None:
+         # A resolvable driver without the flush primitives (common for

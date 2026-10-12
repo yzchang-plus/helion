@@ -1,0 +1,372 @@
+diff --git a/helion/_compat.py b/helion/_compat.py
+index 523bf8d1..48029341 100644
+--- a/helion/_compat.py
++++ b/helion/_compat.py
+@@ -656,11 +656,12 @@ class _BenchmarkCacheDriver(Protocol):
+     def get_empty_cache_for_benchmark(self) -> object: ...
+ 
+ 
+-# (driver, device, buffer) triple so the flush buffer is allocated once per
+-# (driver, device) instead of on every timed iteration. The driver is
+-# identity-compared rather than dict-keyed (driver objects and test doubles
+-# may be unhashable), and the buffer is reallocated on device change because
+-# ``get_empty_cache_for_benchmark()`` allocates on the current device.
++# Most-recent (driver, device, buffer) slot, not a cache. The driver is
++# identity-compared (test doubles may be unhashable); the buffer is
++# reallocated on device change (get_empty_cache_for_benchmark() allocates on
++# the current device). Unsynchronized by design — assumes one benchmarking
++# writer per process; a second writer could free the buffer while a captured
++# flush-only CUDA graph still references it.
+ _flush_cache_state: list[tuple[object, object, object]] = []
+ 
+ 
+@@ -681,9 +682,8 @@ def _driver_flush_cache(driver: object) -> object:
+     ``get_empty_cache_for_benchmark()`` allocates a large buffer on the current
+     device; allocating it on every call would pay the first allocation inside
+     a timed estimate loop, and a single buffer shared across devices would
+-    flush the wrong one. The buffer stays alive for the process lifetime (it
+-    is only used for benchmarking anyway); switching drivers or devices
+-    reallocates.
++    flush the wrong one. The buffer stays alive until the slot is reassigned;
++    switching drivers or devices reallocates (see ``_flush_cache_state``).
+     """
+     device = _current_flush_device(driver)
+     if (
+diff --git a/helion/_compiler/ast_extension.py b/helion/_compiler/ast_extension.py
+index 4ed4adec..a1b01424 100644
+--- a/helion/_compiler/ast_extension.py
++++ b/helion/_compiler/ast_extension.py
+@@ -187,6 +187,9 @@ def statements_from_string(template: str, **placeholders: ast.AST) -> list[ast.s
+     Parses a *block* of statements (e.g. a ``for`` loop with its indented
+     body, or several statements) and returns the list of statements.
+ 
++    Deliberate API surface for out-of-tree backend code generators emitting
++    multi-statement blocks; in-tree codegen uses ``statement_from_string``.
++
+     Uses {placeholder} syntax to mark placeholders that should be replaced with AST nodes.
+     This supports two common patterns:
+ 
+diff --git a/helion/_compiler/backend.py b/helion/_compiler/backend.py
+index 3b7f839a..195b2d1a 100644
+--- a/helion/_compiler/backend.py
++++ b/helion/_compiler/backend.py
+@@ -508,6 +508,15 @@ class Backend(abc.ABC):
+         """
+         return True
+ 
++    def supports_num_threads_deferral(self) -> bool:
++        """Whether num_warps/num_stages may be None (deferred to the driver).
++
++        Backends that do not resolve these through the triton driver override
++        this to False; normalization then rejects a deferred None uniformly
++        instead of letting some consumer silently ignore it.
++        """
++        return True
++
+     def launches_surplus_tile_threads(self) -> bool:
+         """Whether an axis may be launched wider than the tile it indexes."""
+         return False
+diff --git a/helion/_compiler/cute/backend.py b/helion/_compiler/cute/backend.py
+index 275fb620..70d9c895 100644
+--- a/helion/_compiler/cute/backend.py
++++ b/helion/_compiler/cute/backend.py
+@@ -1282,6 +1282,11 @@ class CuteBackend(Backend):
+     def name(self) -> str:
+         return "cute"
+ 
++    def supports_num_threads_deferral(self) -> bool:
++        # CuTe pins both: pipeline depth is structural, num_warps is a
++        # constexpr kernel parameter.
++        return False
++
+     @property
+     def supports_eager_prepared_call(self) -> bool:
+         return True
+diff --git a/helion/_compiler/cute/cute_mma.py b/helion/_compiler/cute/cute_mma.py
+index 88d0c188..a597d6c1 100644
+--- a/helion/_compiler/cute/cute_mma.py
++++ b/helion/_compiler/cute/cute_mma.py
+@@ -8638,6 +8638,8 @@ def _emit_mma_pipeline(
+     # producer flag is the master predicate for all three role-local loops.
+     tcgen05_use_role_local_persistent_body = tcgen05_use_role_local_tma_producer
+     if df.config.num_stages is None:
++        # Backstop: normalize() rejects this first via
++        # supports_num_threads_deferral().
+         raise exc.InvalidConfig(
+             "the cute backend requires an explicit num_stages "
+             "(num_stages=None deferral is only supported by backends "
+diff --git a/helion/_compiler/device_function.py b/helion/_compiler/device_function.py
+index bf4f6bb4..adfabc9e 100644
+--- a/helion/_compiler/device_function.py
++++ b/helion/_compiler/device_function.py
+@@ -283,7 +283,7 @@ def _is_inlined_constexpr(arg: object) -> bool:
+ 
+     The function-def, call-site, and outlined-helper code paths must agree on
+     this predicate or kernels fail at launch with missing-argument errors
+-    (the failure mode test_inline_constexpr_hook.py guards against).
++    (the failure mode the inline-constexpr hook tests guard against).
+     """
+     return (
+         CompileEnvironment.current().backend.inline_constexpr_at_module_level()
+diff --git a/helion/_compiler/indexing_strategy.py b/helion/_compiler/indexing_strategy.py
+index 71c08280..629ffbc8 100644
+--- a/helion/_compiler/indexing_strategy.py
++++ b/helion/_compiler/indexing_strategy.py
+@@ -915,6 +915,11 @@ def _clamped_offset_expr(indexing: SubscriptIndexing, offset: ast.AST) -> ast.AS
+     masked-out elements (see ``Backend.clamp_masked_pointer_offsets``). The
+     pointer and stack indexing strategies go through here; block-ptr and
+     tensor descriptor strategies are unaffected.
++
++    The stack strategy clamps with the subscript mask alone while its
++    load/store mask additionally conjoins the dev-ptr extent mask; lanes
++    excluded only by the latter still carry in-extent, hence non-negative,
++    offsets, so the DMA contract holds without clamping them.
+     """
+     if not _clamps_masked_offsets(indexing):
+         return offset
+diff --git a/helion/_compiler/metal/backend.py b/helion/_compiler/metal/backend.py
+index 10853022..c3153077 100644
+--- a/helion/_compiler/metal/backend.py
++++ b/helion/_compiler/metal/backend.py
+@@ -97,6 +97,11 @@ class MetalBackend(Backend):
+     def constexpr_type(self) -> str:
+         return "int"
+ 
++    def supports_num_threads_deferral(self) -> bool:
++        # Metal derives its threadgroup size from num_warps; there is no
++        # driver default to defer to.
++        return False
++
+     @property
+     def default_launcher_name(self) -> str:
+         return "_default_metal_launcher"
+@@ -889,6 +894,8 @@ class MetalBackend(Backend):
+         # MPP's cooperative operation and any scalar indexing on the first
+         # root axis.
+         if config.num_warps is None:
++            # Backstop: normalize() rejects this first via
++            # supports_num_threads_deferral().
+             raise exc.InvalidConfig(
+                 "the metal backend requires an explicit num_warps "
+                 "(num_warps=None deferral is only supported by backends "
+diff --git a/helion/_compiler/triton/backend.py b/helion/_compiler/triton/backend.py
+index f519a8c5..f998c722 100644
+--- a/helion/_compiler/triton/backend.py
++++ b/helion/_compiler/triton/backend.py
+@@ -637,6 +637,10 @@ class TritonBackend(Backend):
+ class TileIRBackend(TritonBackend):
+     """TileIR code generation backend (extends Triton)."""
+ 
++    # Experimental and ENABLE_TILE-gated: claim no device types so routing
++    # never dispatches to it; only an explicit backend="tileir" reaches it.
++    device_types = frozenset()
++
+     @property
+     def name(self) -> str:
+         return "tileir"
+diff --git a/helion/autotuner/config_spec.py b/helion/autotuner/config_spec.py
+index daa491e1..c269072f 100644
+--- a/helion/autotuner/config_spec.py
++++ b/helion/autotuner/config_spec.py
+@@ -4567,6 +4567,23 @@ class ConfigSpec:
+             config.setdefault("num_warps", DEFAULT_NUM_WARPS)
+         if self.supports_config_key("num_stages"):
+             config.setdefault("num_stages", self._default_num_stages())
++        if not self.backend.supports_num_threads_deferral():
++            # Reject a deferred None uniformly at the config boundary; autotune
++            # generation passes _fix_invalid and gets the default instead.
++            for name, default in (
++                ("num_warps", DEFAULT_NUM_WARPS),
++                ("num_stages", self._default_num_stages()),
++            ):
++                if self.supports_config_key(name) and config.get(name) is None:
++                    if _fix_invalid:
++                        config[name] = default
++                    else:
++                        raise InvalidConfig(
++                            f"the {self.backend_name!r} backend requires an "
++                            f"explicit {name} ({name}=None deferral is only "
++                            "supported by backends that defer to the triton "
++                            "driver)"
++                        )
+         if self.supports_config_key("host_tensor_descriptors"):
+             value = config.setdefault("host_tensor_descriptors", False)
+             if type(value) is not bool:
+diff --git a/helion/runtime/triton/launcher.py b/helion/runtime/triton/launcher.py
+index 6459b234..dbc69cbf 100644
+--- a/helion/runtime/triton/launcher.py
++++ b/helion/runtime/triton/launcher.py
+@@ -541,7 +541,12 @@ def _validate_resident_program_capacity(
+         raise RuntimeError("cross-loop residency checks require a CUDA tensor")
+ 
+     if num_warps is None:
+-        raise RuntimeError("cross-loop residency checks require an explicit num_warps")
++        # The prefix lets the runtime wrapper convert this to InvalidConfig,
++        # like the capacity error below.
++        raise RuntimeError(
++            "Cross-loop scheduling requires an explicit num_warps "
++            "(num_warps=None defers to the driver and has no residency answer)"
++        )
+ 
+     if compiled_kernel is None:
+         raise RuntimeError("unable to compile cross-loop scheduled kernel")
+diff --git a/test/test_codegen_comments.py b/test/test_codegen_comments.py
+index cc7dc3f6..25b45823 100644
+--- a/test/test_codegen_comments.py
++++ b/test/test_codegen_comments.py
+@@ -2,6 +2,8 @@ from __future__ import annotations
+ 
+ import ast
+ 
++import pytest
++
+ from helion._compiler.ast_extension import create
+ from helion._compiler.ast_extension import expr_from_string
+ from helion._compiler.ast_extension import statement_from_string
+@@ -24,13 +26,8 @@ def test_statements_from_string_parses_statement_blocks() -> None:
+ 
+     # The single-statement variant enforces its exactly-one contract:
+     # a two-statement block does not unpack.
+-    try:
++    with pytest.raises(ValueError):
+         statement_from_string("x = 1\ny = 2")
+-    except ValueError:
+-        pass
+-    else:
+-        msg = "expected the exactly-one contract to reject a block"
+-        raise AssertionError(msg)
+ 
+ 
+ def test_unparse_inserts_source_location_comments(tmp_path) -> None:
+diff --git a/test/test_config_api.py b/test/test_config_api.py
+index 62ac3c5c..7ee09e47 100644
+--- a/test/test_config_api.py
++++ b/test/test_config_api.py
+@@ -20,12 +20,14 @@ import torch
+ 
+ import helion
+ from helion import exc
++from helion._compiler import backend_registry
+ from helion._compiler.autotuner_heuristics.cute import (
+     _tcgen05_grouped_worklist_seed_family,
+ )
+ from helion._compiler.backend import PallasBackend
+ from helion._compiler.backend import TritonBackend
+ from helion._compiler.backend_registry import _REGISTRY
++from helion._compiler.backend_registry import find_backend_for_device
+ from helion._compiler.backend_registry import register_compiler_backend
+ from helion._compiler.compile_environment import CompileEnvironment
+ from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
+@@ -91,6 +93,7 @@ from helion.autotuner.config_fragment import BooleanFragment
+ from helion.autotuner.config_fragment import EnumFragment
+ from helion.autotuner.config_fragment import ListOf
+ from helion.autotuner.config_fragment import PowerOfTwoFragment
++from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
+ from helion.autotuner.config_spec import ConfigSpec
+ from helion.autotuner.config_spec import LoopOrderSpec
+ from helion.autotuner.config_spec import MatmulFact
+@@ -873,7 +876,7 @@ class TestConfigAPI(TestCase):
+         # 'hf32' is honored only by out-of-tree triton drivers that accept the
+         # value; the base mapping forwards it verbatim so stock CUDA triton
+         # fails loudly instead of silently dropping the setting.
+-        helion.Settings(dot_precision="hf32")
++        helion.Settings(dot_precision="hf32")  # acceptance only: no validation here
+         self.assertEqual(TritonBackend().map_dot_precision("hf32"), "hf32")
+ 
+     def test_explicit_none_defers_num_warps_and_num_stages(self) -> None:
+@@ -1413,12 +1416,19 @@ class TestDeviceRouting(TestCase):
+ 
+             device_types = frozenset({"meta"})
+ 
++        # register_compiler_backend also discards triton/tileir from
++        # _REPAIRED_CODEGEN_NAMES (the subclass shares triton's codegen_name);
++        # restore both alongside the registry entry.
++        saved_repaired_names = backend_registry._REPAIRED_CODEGEN_NAMES
+         register_compiler_backend(_MetaTritonBackend)
+         # Pin the environment so the implicit cases below are genuine: a
+         # HELION_BACKEND set in the outer environment (e.g. someone running
+         # the suite as `HELION_BACKEND=triton pytest`) would suppress routing.
+         saved_backend_env = os.environ.pop("HELION_BACKEND", None)
+         try:
++            # A device type no registered backend declares does not route...
++            self.assertIsNone(find_backend_for_device("cpu"))
++
+             # Implicit default 'triton' + a registered backend declaring the
+             # device type: the code generator is routed while settings.backend
+             # keeps the user-facing 'triton'.
+@@ -1440,6 +1450,7 @@ class TestDeviceRouting(TestCase):
+             if saved_backend_env is not None:
+                 os.environ["HELION_BACKEND"] = saved_backend_env
+             _REGISTRY.pop("_test_meta_routing", None)
++            backend_registry._REPAIRED_CODEGEN_NAMES = saved_repaired_names
+ 
+ 
+ @onlyBackends(["triton"])
+@@ -1494,6 +1505,45 @@ class TestClampBackendIndexingContract(TestCase):
+         self.assertIn("tensor_descriptor", config.config["indexing"])
+ 
+ 
++@onlyBackends(["triton"])
++class TestDeferredNumThreadsContract(TestCase):
++    def test_non_deferring_backend_rejects_deferred_num_threads(self) -> None:
++        # A non-deferring backend must reject a deferred None at the config
++        # boundary, not just in whichever consumer does arithmetic on it.
++
++        @helion.kernel(static_shapes=True)
++        def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
++            out = torch.empty((a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
++            for m, n in hl.tile((a.size(0), b.size(1))):
++                out[m, n] = a[m, :] @ b[:, n]
++            return out
++
++        a = torch.randn((128, 16), dtype=torch.float16)
++        b = torch.randn((32, 16), dtype=torch.float16).T
++        bound = matmul.bind((a, b))
++
++        with patch.object(
++            TritonBackend, "supports_num_threads_deferral", return_value=False
++        ):
++            # An explicit None is rejected at normalization...
++            with self.assertRaisesRegex(
++                exc.InvalidConfig, "requires an explicit num_warps"
++            ):
++                bound.config_spec.normalize(
++                    helion.Config(block_sizes=[128, 32], num_warps=None)
++                )
++
++            # ...and autotune config generation fills the default instead.
++            fixed = helion.Config(block_sizes=[128, 32], num_warps=None)
++            bound.config_spec.normalize(fixed, _fix_invalid=True)
++            self.assertEqual(fixed.config["num_warps"], DEFAULT_NUM_WARPS)
++
++        # Deferring backends (the default) still accept a deferred None.
++        config = helion.Config(block_sizes=[128, 32], num_warps=None)
++        bound.config_spec.normalize(config)
++        self.assertIsNone(config.config["num_warps"])
++
++
+ @onlyBackends(["triton", "cute"])
+ class TestFormatKernelDecorator(TestCase):
+     def test_format_kernel_decorator_includes_index_dtype(self) -> None:
+diff --git a/test/test_l2_cache_flush.py b/test/test_l2_cache_flush.py
+index 5579e725..1b7fb5f4 100644
+--- a/test/test_l2_cache_flush.py
++++ b/test/test_l2_cache_flush.py
+@@ -64,6 +64,17 @@ class TestSafeClearCache(unittest.TestCase):
+         _flush_cache_state.clear()
+         self.addCleanup(_flush_cache_state.clear)
+ 
++    def test_buffer_is_reallocated_on_device_change(self) -> None:
++        driver = _FakeDriver()
++        clearer = make_cache_clearer(driver)
++        assert clearer is not None
++        first = driver.allocated[0]
++        driver.device = "gpu1"
++        clearer()
++        self.assertEqual(len(driver.allocated), 2)
++        self.assertIsNot(driver.allocated[1], first)
++        self.assertIs(driver.flushed[-1], driver.allocated[1])
++
+     def test_noop_when_driver_resolution_raises(self) -> None:
+         # triton's driver.active is a LazyProxy: resolution happens on the
+         # first attribute access, so the capability probes can raise

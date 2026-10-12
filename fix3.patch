@@ -1,0 +1,539 @@
+root@node73-144:/home/cyz/helion# cat backend-generic-mechanisms-fixes-round3.patch
+diff --git a/helion/_compat.py b/helion/_compat.py
+index a202f910..4fecb48f 100644
+--- a/helion/_compat.py
++++ b/helion/_compat.py
+@@ -664,6 +664,17 @@ class _BenchmarkCacheDriver(Protocol):
+ _flush_cache_state: list[tuple[object, object, object]] = []
+ 
+ 
++def _current_flush_device(driver: object) -> object:
++    # Prefer the driver's own notion of the current device: it tracks
++    # non-CUDA accelerators too, while torch's CUDA query is unavailable on
++    # CUDA-less machines and would collapse the per-(driver, device) keying
++    # to a single slot.
++    get_current_device = getattr(driver, "get_current_device", None)
++    if get_current_device is not None:
++        return get_current_device()
++    return torch.cuda.current_device() if torch.cuda.is_available() else None
++
++
+ def _driver_flush_cache(driver: object) -> object:
+     """Allocate the flush buffer once per (driver, device), not per iteration.
+ 
+@@ -674,7 +685,7 @@ def _driver_flush_cache(driver: object) -> object:
+     is only used for benchmarking anyway); switching drivers or devices
+     reallocates.
+     """
+-    device = torch.cuda.current_device() if torch.cuda.is_available() else None
++    device = _current_flush_device(driver)
+     if (
+         not _flush_cache_state
+         or _flush_cache_state[0][0] is not driver
+@@ -689,6 +700,28 @@ def _driver_flush_cache(driver: object) -> object:
+     return _flush_cache_state[0][2]
+ 
+ 
++def make_cache_clearer(driver: object) -> Callable[[], None] | None:
++    """Bind an L2-flush callable to ``driver``, or return None without the primitives.
++
++    This is the single driver-capability probe for the L2 flush: both
++    ``safe_clear_cache()`` and the autotuner's benchmark paths go through it,
++    so a driver is judged by one contract. The flush buffer is allocated
++    eagerly (at binding time, before any timed loop) through the shared
++    per-(driver, device) slot, so the first flush never pays the allocation
++    inside a timed window and all callers share one buffer.
++    """
++    if not hasattr(driver, "clear_cache") or not hasattr(
++        driver, "get_empty_cache_for_benchmark"
++    ):
++        return None
++    _driver_flush_cache(driver)
++
++    def clear() -> None:
++        cast("_BenchmarkCacheDriver", driver).clear_cache(_driver_flush_cache(driver))
++
++    return clear
++
++
+ def safe_clear_cache() -> None:
+     """Clear the benchmark cache when the active Triton driver supports it.
+ 
+@@ -704,15 +737,13 @@ def safe_clear_cache() -> None:
+         from triton import runtime
+ 
+         driver = runtime.driver.active
+-        if not hasattr(driver, "clear_cache") or not hasattr(
+-            driver, "get_empty_cache_for_benchmark"
+-        ):
+-            return
+     except (ImportError, AttributeError, RuntimeError):
+         # Triton missing, or its driver cannot be resolved: benchmarking
+         # proceeds without the L2 flush.
+         return
+-    driver.clear_cache(_driver_flush_cache(driver))
++    clearer = make_cache_clearer(driver)
++    if clearer is not None:
++        clearer()
+ 
+ 
+ def fp8_block_ptr_padding_broken() -> bool:
+diff --git a/helion/_compiler/device_function.py b/helion/_compiler/device_function.py
+index 633bb47d..e8e8fde3 100644
+--- a/helion/_compiler/device_function.py
++++ b/helion/_compiler/device_function.py
+@@ -2186,8 +2186,14 @@ class DeviceFunction:
+         tensor_host_args: list[str] = []
+         arg_objects: list[Argument] = []
+         for arg in self.sorted_args():
+-            # Skip constexpr args that are inlined at module level
+-            if isinstance(arg, ConstExprArg) and _is_literal_constexpr(arg):
++            # Skip constexpr args that are inlined at module level — but only
++            # when the backend actually inlines them; otherwise they stay
++            # kernel parameters (codegen_function_def) and must be passed.
++            if (
++                backend.inline_constexpr_at_module_level()
++                and isinstance(arg, ConstExprArg)
++                and _is_literal_constexpr(arg)
++            ):
+                 continue
+             if isinstance(arg, ConstExprArg) and arg.name in self._constexpr_host_defs:
+                 host_arg = arg.name
+@@ -2349,12 +2355,18 @@ class DeviceFunction:
+             self.triton_outlined_helper_constexprs[name] = int(
+                 environment.block_sizes[block_id].from_config_assert(self.config)
+             )
++        # Literal constexpr args are satisfied by the module-level constants
++        # that codegen_function_def inlines — but only when the backend inlines
++        # them; otherwise they must stay helper parameters so the call site
++        # passes them from the kernel's scope.
+         argument_names = [
+             argument.name
+             for argument in self.arguments
+             if argument.name in reads
+             and not (
+-                isinstance(argument, ConstExprArg) and _is_literal_constexpr(argument)
++                environment.backend.inline_constexpr_at_module_level()
++                and isinstance(argument, ConstExprArg)
++                and _is_literal_constexpr(argument)
+             )
+         ]
+         argument_names.extend(
+diff --git a/helion/autotuner/benchmarking.py b/helion/autotuner/benchmarking.py
+index acf2d111..b5a7afd5 100644
+--- a/helion/autotuner/benchmarking.py
++++ b/helion/autotuner/benchmarking.py
+@@ -18,7 +18,7 @@ from typing import cast
+ 
+ import torch
+ 
+-from .._compat import _driver_flush_cache
++from .._compat import make_cache_clearer
+ from .._compat import safe_clear_cache
+ from ..runtime.settings import _env_get_bool
+ from ..runtime.settings import is_pallas_interpret
+@@ -82,21 +82,13 @@ def _make_l2_cache_clearer() -> Callable[[], None]:
+     from triton import runtime
+ 
+     active = runtime.driver.active  # type: ignore[attr-defined]
+-    if not hasattr(active, "clear_cache") or not hasattr(
+-        active, "get_empty_cache_for_benchmark"
+-    ):
+-        # Out-of-tree triton drivers may lack the cache-clear primitive; skip
+-        # the flush there (same contract as safe_clear_cache()).
++    # Shared probe/buffer with safe_clear_cache() (see make_cache_clearer):
++    # one capability contract, one eagerly-allocated buffer. Out-of-tree
++    # triton drivers without the primitive get the same no-op.
++    clearer = make_cache_clearer(active)
++    if clearer is None:
+         return lambda: None
+-    # Allocate eagerly (before any timed loop) through the shared per-(driver,
+-    # device) cache so this path and safe_clear_cache() use one buffer instead
+-    # of keeping two ~256MB allocations alive.
+-    _driver_flush_cache(active)
+-
+-    def clear() -> None:
+-        active.clear_cache(_driver_flush_cache(active))  # type: ignore[attr-defined]
+-
+-    return clear
++    return clearer
+ 
+ 
+ def _cudagraph_unavailable_reason() -> str | None:
+diff --git a/helion/runtime/config.py b/helion/runtime/config.py
+index 2831ea4b..8b7e3950 100644
+--- a/helion/runtime/config.py
++++ b/helion/runtime/config.py
+@@ -31,6 +31,12 @@ CuteHostPairedSumLiteral = Literal["off", "mapped", "narrow"]
+ NumSmMultiplierLiteral = int
+ MaxnregLiteral = int | None
+ 
++# Constructor sentinel distinguishing "not passed" from an explicit None for
++# num_warps/num_stages: None there defers the choice to the backend's driver,
++# while every other core property treats an omitted/None argument as "unset".
++# Mirrors _TARGET_DEVICE_CAPABILITY_UNSET in autotuner/config_spec.py.
++_NUM_THREADS_UNSET = object()
++
+ 
+ class Config(Mapping[str, object]):
+     config: dict[str, object]
+@@ -76,8 +82,8 @@ class Config(Mapping[str, object]):
+         cute_packet_prefetch: int | None = None,
+         cute_reduction_pipeline_depth: int | None = None,
+         cute_host_paired_sum: CuteHostPairedSumLiteral | None = None,
+-        num_warps: int | None = None,
+-        num_stages: int | None = None,
++        num_warps: int | object | None = _NUM_THREADS_UNSET,
++        num_stages: int | object | None = _NUM_THREADS_UNSET,
+         pid_type: PidTypeLiteral | None = None,
+         cross_loop_pipeline: CrossLoopPipelineLiteral | None = None,
+         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
+@@ -261,7 +267,14 @@ class Config(Mapping[str, object]):
+             "xcd_remap": xcd_remap,
+         }
+         for key, value in core_props.items():
+-            if value is not None:
++            # For num_warps/num_stages an explicit None (deferral to the
++            # backend's driver) is kept in the config dict so it survives
++            # to_json/from_json round-trips through the autotune caches;
++            # _NUM_THREADS_UNSET (argument not given) falls through to the
++            # property defaults like every other core property.
++            if value is _NUM_THREADS_UNSET:
++                continue
++            if value is not None or key in ("num_warps", "num_stages"):
+                 self.config[key] = value
+         self.config.update(kwargs)
+ 
+diff --git a/helion/runtime/settings.py b/helion/runtime/settings.py
+index 38161297..39bcf12d 100644
+--- a/helion/runtime/settings.py
++++ b/helion/runtime/settings.py
+@@ -994,6 +994,11 @@ class Settings(_Settings):
+ 
+     def __setattr__(self, name: str, value: object) -> None:
+         super().__setattr__(name, value)
++        if name == "backend" and "_backend_explicit" in self.__dict__:
++            # Direct assignment is an explicit user choice (the initial
++            # dataclass write precedes creation of the flag; copy() fixes up
++            # the replace()-based path separately).
++            self._backend_explicit = True
+         if (
+             name in CUTE_STRUCTURAL_SETTINGS
+             and "_cute_structural_origins" in self.__dict__
+diff --git a/test/test_backend_registry.py b/test/test_backend_registry.py
+index 361cbda2..18d1381c 100644
+--- a/test/test_backend_registry.py
++++ b/test/test_backend_registry.py
+@@ -13,6 +13,7 @@ from helion._compiler.aten_lowering import AtenLowering
+ from helion._compiler.backend import Backend
+ from helion._compiler.backend_registry import _REGISTRY
+ from helion._compiler.backend_registry import all_reserved_launch_param_names
++from helion._compiler.backend_registry import find_backend_for_device
+ from helion._compiler.backend_registry import get_backend_class
+ from helion._compiler.backend_registry import list_backends
+ from helion._compiler.backend_registry import register_compiler_backend
+@@ -95,6 +96,47 @@ class TestBackendRegistry(unittest.TestCase):
+         finally:
+             _REGISTRY.pop("_test_custom", None)
+ 
++    def test_find_backend_for_device_routes_declared_types(self) -> None:
++        class _RoutedBackend(Backend):
++            @property
++            def name(self) -> str:
++                return "_test_routed"
++
++            device_types = ("helion_test_device",)
++
++            def dtype_str(self, dtype: object) -> str:
++                return ""
++
++            def acc_type(self, dtype: object) -> str:
++                return ""
++
++            @property
++            def default_launcher_name(self) -> str:
++                return ""
++
++            @property
++            def constexpr_type(self) -> str:
++                return ""
++
++            @property
++            def function_decorator(self) -> str:
++                return ""
++
++            @property
++            def library_imports(self) -> dict[str, str]:
++                return {}
++
++        register_compiler_backend(_RoutedBackend)
++        try:
++            # A backend only participates in routing when it declares the
++            # device type; backends without a declaration never match.
++            self.assertEqual(
++                find_backend_for_device("helion_test_device"), "_test_routed"
++            )
++            self.assertIsNone(find_backend_for_device("cpu"))
++        finally:
++            _REGISTRY.pop("_test_routed", None)
++
+     def test_all_reserved_launch_param_names_is_union(self) -> None:
+         result = all_reserved_launch_param_names()
+         self.assertIsInstance(result, frozenset)
+diff --git a/test/test_config_api.py b/test/test_config_api.py
+index 94d0753d..cc32dcfe 100644
+--- a/test/test_config_api.py
++++ b/test/test_config_api.py
+@@ -867,6 +867,26 @@ class TestConfigAPI(TestCase):
+ 
+         self.assertEqual(backend.effective_num_warps(config), 4)
+ 
++    def test_explicit_none_defers_num_warps_and_num_stages(self) -> None:
++        # An explicit None defers the choice to the backend's driver; it must
++        # survive the constructor and the to_json/from_json round-trip the
++        # autotune caches use (a dropped null would silently become the
++        # default and change behavior on cache reload).
++        config = helion.Config(num_warps=None, num_stages=None)
++        self.assertIsNone(config.num_warps)
++        self.assertIsNone(config.num_stages)
++        reloaded = helion.Config.from_json(config.to_json())
++        self.assertIsNone(reloaded.num_warps)
++        self.assertIsNone(reloaded.num_stages)
++
++        # Absence (argument not given) still falls back to the defaults.
++        from helion.autotuner.config_spec import DEFAULT_NUM_STAGES
++        from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
++
++        default_config = helion.Config()
++        self.assertEqual(default_config.num_warps, DEFAULT_NUM_WARPS)
++        self.assertEqual(default_config.num_stages, DEFAULT_NUM_STAGES)
++
+     def test_mapping_behavior_len_iter_dict_roundtrip(self) -> None:
+         data = {
+             "block_sizes": [64, 32],
+@@ -975,6 +995,24 @@ class TestConfigAPI(TestCase):
+ 
+ @onlyBackends(["triton", "cute"])
+ class TestSettingsEnv(TestCase):
++    def test_backend_explicit_semantics_across_construction_paths(self) -> None:
++        # Only a genuine user choice marks the backend explicit: a keyword,
++        # or a direct assignment after construction. A plain default-constructed
++        # Settings (and copies of it) stays implicit so device routing may
++        # pick a backend that declares the active device type.
++        self.assertFalse(helion.Settings()._backend_explicit)
++        self.assertTrue(helion.Settings(backend="triton")._backend_explicit)
++
++        assigned = helion.Settings()
++        assigned.backend = "triton"
++        self.assertTrue(assigned._backend_explicit)
++
++        # copy() goes through dataclasses.replace, which feeds every field
++        # back through __init__; only an overridden "backend" is explicit.
++        self.assertFalse(helion.Settings().copy()._backend_explicit)
++        self.assertTrue(helion.Settings(backend="triton").copy()._backend_explicit)
++        self.assertTrue(helion.Settings().copy(backend="triton")._backend_explicit)
++
+     def test_persistent_reserved_sms_env_var(self) -> None:
+         with patch.dict(
+             os.environ,
+diff --git a/test/test_inline_constexpr_hook.py b/test/test_inline_constexpr_hook.py
+new file mode 100644
+index 00000000..e8b142f9
+--- /dev/null
++++ b/test/test_inline_constexpr_hook.py
+@@ -0,0 +1,83 @@
++from __future__ import annotations
++
++import ast
++import unittest
++from unittest.mock import patch
++
++import torch
++
++import helion
++import helion.language as hl
++from helion.runtime.config import Config
++
++
++@helion.kernel(config=Config(block_sizes=[16]))
++def _add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
++    result = torch.empty_like(x)
++    for tile in hl.tile(x.shape):
++        result[tile] = x[tile] + y[tile]
++    return result
++
++
++def _kernel_def(code: str) -> ast.FunctionDef:
++    return next(
++        node
++        for node in ast.walk(ast.parse(code))
++        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion")
++    )
++
++
++def _launcher_call(code: str) -> ast.Call:
++    return next(
++        node
++        for node in ast.walk(ast.parse(code))
++        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_launcher"
++    )
++
++
++def _passed_names(call: ast.Call) -> list[str]:
++    return [arg.id for arg in call.args if isinstance(arg, ast.Name)]
++
++
++class TestInlineConstexprHookGating(unittest.TestCase):
++    """inline_constexpr_at_module_level() must gate def and call sides together.
++
++    A backend that opts out keeps literal constexpr args as kernel parameters,
++    so the launcher call must pass them positionally — otherwise the kernel
++    fails at launch with a missing-argument error (the parameter has no
++    default). Pure codegen: bind on CPU tensors and inspect to_code() output.
++    """
++
++    def test_hook_off_keeps_constexpr_params_and_passes_them(self) -> None:
++        x = torch.randn(32)
++        y = torch.randn(32)
++        bound = _add_kernel.bind((x, y))
++        backend_cls = type(bound.env.backend)
++        with patch.object(
++            backend_cls, "inline_constexpr_at_module_level", return_value=False
++        ):
++            code = bound.to_code(Config(block_sizes=[16]))
++
++        # Def side: _BLOCK_SIZE_0 stays a kernel parameter instead of a
++        # module-level tl.constexpr assignment.
++        self.assertNotIn("_BLOCK_SIZE_0 = tl.constexpr(", code)
++        self.assertIn("_BLOCK_SIZE_0", [arg.arg for arg in _kernel_def(code).args.args])
++        # Call side: the launcher call passes it positionally.
++        self.assertIn("_BLOCK_SIZE_0", _passed_names(_launcher_call(code)))
++
++    def test_hook_on_inlines_constexpr_at_module_level(self) -> None:
++        x = torch.randn(32)
++        y = torch.randn(32)
++        bound = _add_kernel.bind((x, y))
++        code = bound.to_code(Config(block_sizes=[16]))
++
++        # Def side inlines; call side does not pass it.
++        self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(", code)
++        self.assertNotIn(
++            "_BLOCK_SIZE_0", [arg.arg for arg in _kernel_def(code).args.args]
++        )
++        self.assertNotIn("_BLOCK_SIZE_0", _passed_names(_launcher_call(code)))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/test_l2_cache_flush.py b/test/test_l2_cache_flush.py
+new file mode 100644
+index 00000000..eba82bdc
+--- /dev/null
++++ b/test/test_l2_cache_flush.py
+@@ -0,0 +1,106 @@
++from __future__ import annotations
++
++import sys
++from types import ModuleType
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++from helion._compat import _flush_cache_state
++from helion._compat import make_cache_clearer
++from helion._compat import safe_clear_cache
++
++
++class _FakeDriver:
++    """Test double for a triton driver with the L2-flush primitives."""
++
++    def __init__(self) -> None:
++        self.device: object = "gpu0"
++        self.allocated: list[object] = []
++        self.flushed: list[object] = []
++
++    def get_current_device(self) -> object:
++        return self.device
++
++    def get_empty_cache_for_benchmark(self) -> object:
++        buffer = object()
++        self.allocated.append(buffer)
++        return buffer
++
++    def clear_cache(self, cache: object) -> None:
++        self.flushed.append(cache)
++
++
++class TestMakeCacheClearer(unittest.TestCase):
++    def setUp(self) -> None:
++        # Module-level (driver, device, buffer) slot shared with
++        # safe_clear_cache(); isolate each test from prior allocations.
++        _flush_cache_state.clear()
++
++    def test_driver_without_primitives_yields_none(self) -> None:
++        self.assertIsNone(make_cache_clearer(SimpleNamespace()))
++        self.assertIsNone(
++            make_cache_clearer(SimpleNamespace(clear_cache=lambda cache: None))
++        )
++
++    def test_clearer_allocates_eagerly_and_reuses_one_buffer(self) -> None:
++        driver = _FakeDriver()
++        clearer = make_cache_clearer(driver)
++        self.assertIsNotNone(clearer)
++        # The buffer is allocated at binding time, before any timed loop.
++        self.assertEqual(len(driver.allocated), 1)
++        assert clearer is not None
++        clearer()
++        clearer()
++        self.assertEqual(driver.flushed.count(driver.allocated[0]), 2)
++        self.assertEqual(len(driver.allocated), 1)
++
++    def test_buffer_is_reallocated_on_device_change(self) -> None:
++        driver = _FakeDriver()
++        clearer = make_cache_clearer(driver)
++        assert clearer is not None
++        first = driver.allocated[0]
++        driver.device = "gpu1"
++        clearer()
++        self.assertEqual(len(driver.allocated), 2)
++        self.assertIsNot(driver.allocated[1], first)
++        self.assertIs(driver.flushed[-1], driver.allocated[1])
++
++
++class TestSafeClearCache(unittest.TestCase):
++    def setUp(self) -> None:
++        _flush_cache_state.clear()
++
++    def test_noop_when_driver_lacks_primitives(self) -> None:
++        # A resolvable driver without the flush primitives (e.g. the
++        # triton-ascend driver on this NPU box) must be a silent no-op.
++        runtime = ModuleType("triton.runtime")
++        runtime.driver = SimpleNamespace(  # type: ignore[attr-defined]
++            active=SimpleNamespace(get_empty_cache_for_benchmark=lambda: object())
++        )
++        triton_module = ModuleType("triton")
++        triton_module.runtime = runtime  # type: ignore[attr-defined]
++        with patch.dict(
++            sys.modules, {"triton": triton_module, "triton.runtime": runtime}
++        ):
++            safe_clear_cache()  # must not raise
++
++    def test_flushes_through_the_shared_buffer(self) -> None:
++        driver = _FakeDriver()
++        runtime = ModuleType("triton.runtime")
++        runtime.driver = SimpleNamespace(active=driver)  # type: ignore[attr-defined]
++        triton_module = ModuleType("triton")
++        triton_module.runtime = runtime  # type: ignore[attr-defined]
++        with patch.dict(
++            sys.modules, {"triton": triton_module, "triton.runtime": runtime}
++        ):
++            safe_clear_cache()
++            safe_clear_cache()
++        # One shared buffer for both flushes (and shared with any
++        # _make_l2_cache_clearer() user on the same driver/device).
++        self.assertEqual(len(driver.allocated), 1)
++        self.assertEqual(driver.flushed, [driver.allocated[0]] * 2)
++
++
++if __name__ == "__main__":
++    unittest.main()

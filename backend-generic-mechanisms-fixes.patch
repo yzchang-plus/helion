@@ -1,0 +1,399 @@
+diff --git a/helion/_compat.py b/helion/_compat.py
+index 23091958..9d5b60e2 100644
+--- a/helion/_compat.py
++++ b/helion/_compat.py
+@@ -8,6 +8,7 @@ import re
+ from typing import TYPE_CHECKING
+ from typing import Any
+ from typing import Callable
++from typing import Protocol
+ from typing import cast
+ 
+ from packaging import version
+@@ -569,7 +570,9 @@ def supports_mtia_tunables() -> bool:
+ @functools.cache
+ def _supports_mtia_tunables() -> bool:
+     try:
+-        from .fb.mtia_tunables import supports_mtia_tunables as _fb_supports_mtia  # pyrefly: ignore [missing-import]
++        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
++            supports_mtia_tunables as _fb_supports_mtia,
++        )
+ 
+         return _fb_supports_mtia()
+     except ImportError:
+@@ -645,27 +648,60 @@ def _supports_maxnreg() -> bool:
+     )
+ 
+ 
++class _BenchmarkCacheDriver(Protocol):
++    """Structural type of a triton driver with the L2-flush primitives."""
++
++    def clear_cache(self, cache: object) -> None: ...
++
++    def get_empty_cache_for_benchmark(self) -> object: ...
++
++
++# (driver, buffer) pair so the flush buffer is allocated once per driver
++# instead of on every timed iteration. Identity-compared rather than dict-keyed
++# because driver objects (and test doubles) may be unhashable.
++_flush_cache_state: list[tuple[object, object]] = []
++
++
++def _driver_flush_cache(driver: object) -> object:
++    """Allocate the flush buffer once per driver, not per timed iteration.
++
++    ``get_empty_cache_for_benchmark()`` allocates a large buffer; allocating it
++    on every call would pay the first allocation inside a timed estimate loop.
++    The buffer stays alive for the process lifetime (it is only used for
++    benchmarking anyway), and a driver switch re-allocates.
++    """
++    if not _flush_cache_state or _flush_cache_state[0][0] is not driver:
++        # The runtime driver object (triton's LazyProxy or a test double)
++        # forwards attribute access; the Protocol is the structural contract.
++        cache_driver = cast("_BenchmarkCacheDriver", driver)
++        _flush_cache_state[:] = [(driver, cache_driver.get_empty_cache_for_benchmark())]
++    return _flush_cache_state[0][1]
++
++
+ def safe_clear_cache() -> None:
+     """Clear the benchmark cache when the active Triton driver supports it.
+ 
+     The CUDA driver exposes ``clear_cache``/``get_empty_cache_for_benchmark``
+     for L2 flushes between timed runs; out-of-tree Triton drivers for other
+-    targets may not. Benchmarking must not crash there, so a driver without
+-    the primitive is a silent no-op (the flush is skipped and timing simply
+-    measures a warmer L2).
++    targets may not. A driver without the primitive — or an environment whose
++    active driver cannot be resolved at all (CPU-only, or several competing
++    accelerators) — makes this a silent no-op, so timing simply measures a
++    warmer L2. Failures of the flush itself (e.g. an OOM allocating the flush
++    buffer) are not hidden; they propagate to the caller.
+     """
+     try:
+         from triton import runtime
+ 
+         driver = runtime.driver.active
+-        if hasattr(driver, "clear_cache") and hasattr(
++        if not hasattr(driver, "clear_cache") or not hasattr(
+             driver, "get_empty_cache_for_benchmark"
+         ):
+-            cache = driver.get_empty_cache_for_benchmark()
+-            driver.clear_cache(cache)
+-    except Exception:
+-        # Ignore driver introspection/clear failures during benchmarking.
+-        pass
++            return
++    except (ImportError, AttributeError, RuntimeError):
++        # Triton missing, or its driver cannot be resolved: benchmarking
++        # proceeds without the L2 flush.
++        return
++    driver.clear_cache(_driver_flush_cache(driver))
+ 
+ 
+ def fp8_block_ptr_padding_broken() -> bool:
+diff --git a/helion/_compiler/ast_extension.py b/helion/_compiler/ast_extension.py
+index 07e86f50..4ed4adec 100644
+--- a/helion/_compiler/ast_extension.py
++++ b/helion/_compiler/ast_extension.py
+@@ -184,9 +184,8 @@ def statements_from_string(template: str, **placeholders: ast.AST) -> list[ast.s
+     """
+     Create a list of AST statements from a template string with placeholders.
+ 
+-    Like :func:`statement_from_string` but parses a *block* of statements
+-    (e.g. a ``for`` loop with its indented body, or several statements) and
+-    returns the list of statements.
++    Parses a *block* of statements (e.g. a ``for`` loop with its indented
++    body, or several statements) and returns the list of statements.
+ 
+     Uses {placeholder} syntax to mark placeholders that should be replaced with AST nodes.
+     This supports two common patterns:
+@@ -264,21 +263,10 @@ def statements_from_string(template: str, **placeholders: ast.AST) -> list[ast.s
+ 
+ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
+     """
+-    Create an AST statement from a template string with placeholders.
++    Create a single AST statement from a template string with placeholders.
+ 
+-    Uses {placeholder} syntax to mark placeholders that should be replaced with AST nodes.
+-    This supports two common patterns:
+-
+-    1. Regular strings - placeholders use single braces:
+-        expr_from_string("tl.load({ptr} + {offset}, {mask})",
+-                        ptr=ptr_ast, offset=offset_ast, mask=mask_ast)
+-
+-    2. f-strings - placeholders use double braces (which become single braces):
+-        name = "my_tensor"
+-        expr_from_string(f"tl.load({name} + {{offset}}, {{mask}})",
+-                        offset=offset_ast, mask=mask_ast)
+-        # In the f-string, {name} is interpolated to "my_tensor",
+-        # while {{offset}} becomes {offset} for placeholder replacement
++    Like :func:`statements_from_string` but for exactly one statement; see
++    that function for the {placeholder} syntax and f-string escaping rules.
+     """
+     (statement,) = statements_from_string(template, **placeholders)
+     return statement
+diff --git a/helion/_compiler/backend.py b/helion/_compiler/backend.py
+index 1844de84..fb3e8d34 100644
+--- a/helion/_compiler/backend.py
++++ b/helion/_compiler/backend.py
+@@ -492,7 +492,10 @@ class Backend(abc.ABC):
+         Some hardware DMA paths require non-negative pointer offsets even for
+         masked-out elements; when True, codegen wraps the offset in
+         ``tl.where(mask, offset, 0)`` so masked-out elements access
+-        ``ptr + 0`` (the loaded/stored value is discarded anyway).
++        ``ptr + 0`` (the loaded/stored value is discarded anyway). Only the
++        pointer indexing strategy honors this; block-ptr and tensor
++        descriptor strategies are unaffected, so a backend that enables it
++        should also exclude those indexing modes from its search space.
+         """
+         return False
+ 
+@@ -1428,6 +1431,10 @@ class Backend(abc.ABC):
+             "tf32": "tf32",
+             "tf32x3": "tf32x3",
+             "ieee": "ieee",
++            # Forwarded verbatim: stock CUDA triton rejects it loudly at
++            # compile time, while out-of-tree drivers (e.g. Ascend) that
++            # declare "hf32" in allowed_dot_input_precisions honor it.
++            "hf32": "hf32",
+         }
+         return triton_precision_by_dot_precision.get(precision, "")
+ 
+diff --git a/helion/_compiler/compile_environment.py b/helion/_compiler/compile_environment.py
+index 8f9b7b6d..f1ed3ee4 100644
+--- a/helion/_compiler/compile_environment.py
++++ b/helion/_compiler/compile_environment.py
+@@ -416,11 +416,16 @@ class CompileEnvironment:
+         self.process_group_name = None
+         backend_name = settings.backend
+         # Device routing: when the backend is the default ('triton', i.e. the
+-        # user did not set HELION_BACKEND) and it does not declare the active
+-        # device type while another registered backend does, use that backend
+-        # instead.  An explicit HELION_BACKEND=<name> (including
+-        # HELION_BACKEND=triton) is always honored unchanged.
+-        if backend_name == "triton" and not os.environ.get("HELION_BACKEND"):
++        # user set neither a backend kwarg nor HELION_BACKEND) and it does not
++        # declare the active device type while another registered backend
++        # does, use that backend instead.  An explicit choice — a
++        # Settings/kernel backend kwarg (including backend='triton') or
++        # HELION_BACKEND=<name> — is always honored unchanged.
++        if (
++            backend_name == "triton"
++            and not settings._backend_explicit
++            and not os.environ.get("HELION_BACKEND")
++        ):
+             routed = find_backend_for_device(device.type)
+             if routed not in (None, backend_name):
+                 log.info(
+diff --git a/helion/_compiler/indexing_strategy.py b/helion/_compiler/indexing_strategy.py
+index eab7a9b1..d5e72c35 100644
+--- a/helion/_compiler/indexing_strategy.py
++++ b/helion/_compiler/indexing_strategy.py
+@@ -901,6 +901,30 @@ class _PointerLoadContiguity:
+         return None
+ 
+ 
++def _clamps_masked_offsets(indexing: SubscriptIndexing) -> bool:
++    """Whether the backend requires masked-out offsets clamped to 0."""
++    return indexing.has_mask() and (
++        CompileEnvironment.current().backend.clamp_masked_pointer_offsets()
++    )
++
++
++def _clamped_offset_expr(indexing: SubscriptIndexing, offset: ast.AST) -> ast.AST:
++    """Clamp masked-out pointer offsets to 0 when the backend requires it.
++
++    Some hardware DMA paths require non-negative pointer offsets even for
++    masked-out elements (see ``Backend.clamp_masked_pointer_offsets``). Only
++    the pointer indexing strategy goes through here; block-ptr and tensor
++    descriptor strategies are unaffected.
++    """
++    if not _clamps_masked_offsets(indexing):
++        return offset
++    return expr_from_string(
++        "tl.where({mask}, {off}, 0)",
++        mask=indexing.mask_expr,
++        off=offset,
++    )
++
++
+ class PointerIndexingStrategy(IndexingStrategy):
+     """Generate the original pointer math to load/store from tensors"""
+ 
+@@ -941,8 +965,13 @@ class PointerIndexingStrategy(IndexingStrategy):
+             contiguity = _PointerLoadContiguity(state, fake_tensor, subscript).derive()
+         except Exception:
+             contiguity = None
+-        if contiguity is not None:
++        clamped = _clamps_masked_offsets(indexing)
++        if clamped:
++            offset_ast = _clamped_offset_expr(indexing, offset_ast)
++        if contiguity is not None and not clamped:
+             # Triton propagates the hint from ``index``, but not ``index * 1``.
++            # Skipped when clamping: ``tl.where`` breaks the value contiguity
++            # the hint would assert.
+             inner_ast = offset_ast
+             if (
+                 isinstance(inner_ast, ast.BinOp)
+@@ -954,14 +983,6 @@ class PointerIndexingStrategy(IndexingStrategy):
+             offset_ast = expr_from_string(
+                 f"tl.max_contiguous({{off}}, {contiguity!r})", off=inner_ast
+             )
+-        if indexing.has_mask():
+-            backend = CompileEnvironment.current().backend
+-            if backend.clamp_masked_pointer_offsets():
+-                offset_ast = expr_from_string(
+-                    "tl.where({mask}, {off}, 0)",
+-                    mask=indexing.mask_expr,
+-                    off=offset_ast,
+-                )
+         extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
+         extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
+         load_placeholders: dict[str, ast.AST] = {
+@@ -1026,12 +1047,7 @@ class PointerIndexingStrategy(IndexingStrategy):
+             shape_str = state.tile_strategy.shape_str(output_size)
+             broadcast = backend.broadcast_to_expr("{offset}", shape_str)
+             offset_expr = expr_from_string(broadcast, offset=offset_expr)
+-        if indexing.has_mask() and backend.clamp_masked_pointer_offsets():
+-            offset_expr = expr_from_string(
+-                "tl.where({mask}, {off}, 0)",
+-                mask=indexing.mask_expr,
+-                off=offset_expr,
+-            )
++        offset_expr = _clamped_offset_expr(indexing, offset_expr)
+ 
+         extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
+         store_placeholders: dict[str, ast.AST] = {
+@@ -1058,13 +1074,7 @@ class PointerIndexingStrategy(IndexingStrategy):
+         indexing = SubscriptIndexing.create(state, fake_tensor, subscript)
+         name = state.device_function.tensor_arg(fake_tensor).name
+         offset_expr = indexing.index_expr
+-        backend = CompileEnvironment.current().backend
+-        if indexing.has_mask() and backend.clamp_masked_pointer_offsets():
+-            offset_expr = expr_from_string(
+-                "tl.where({mask}, {off}, 0)",
+-                mask=indexing.mask_expr,
+-                off=offset_expr,
+-            )
++        offset_expr = _clamped_offset_expr(indexing, offset_expr)
+         return expr_from_string(
+             f"tl.{op}({name} + {{offset}}, {{value}}, mask={{mask}}, sem={{sem}})",
+             offset=offset_expr,
+diff --git a/helion/_compiler/tile_strategy.py b/helion/_compiler/tile_strategy.py
+index ddc581d4..c084d2d7 100644
+--- a/helion/_compiler/tile_strategy.py
++++ b/helion/_compiler/tile_strategy.py
+@@ -7388,6 +7388,9 @@ class TileStrategy:
+                 # pipeline within the number of complete unrolled iterations;
+                 # using only the final tile's remainder would collapse every
+                 # exactly divisible reduction to one stage.
++                # A backend that defers num_warps (None) takes the
++                # conservative multi-warp path below; that is safe, it just
++                # forgoes this one-warp pipelining refinement.
+                 loop_iterations = int(math.ceil(loop_numel / block_size))
+                 unrolled_iterations = int(
+                     math.ceil(loop_iterations / range_unroll_factor)
+diff --git a/helion/autotuner/benchmarking.py b/helion/autotuner/benchmarking.py
+index 899aefa7..757121d2 100644
+--- a/helion/autotuner/benchmarking.py
++++ b/helion/autotuner/benchmarking.py
+@@ -81,6 +81,12 @@ def _make_l2_cache_clearer() -> Callable[[], None]:
+     from triton import runtime
+ 
+     active = runtime.driver.active  # type: ignore[attr-defined]
++    if not hasattr(active, "clear_cache") or not hasattr(
++        active, "get_empty_cache_for_benchmark"
++    ):
++        # Out-of-tree triton drivers may lack the cache-clear primitive; skip
++        # the flush there (same contract as safe_clear_cache()).
++        return lambda: None
+     cache = active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
+ 
+     def clear() -> None:
+diff --git a/helion/runtime/settings.py b/helion/runtime/settings.py
+index b6a11a15..3753af7a 100644
+--- a/helion/runtime/settings.py
++++ b/helion/runtime/settings.py
+@@ -667,6 +667,10 @@ class Settings(_Settings):
+     # Not a dataclass field: public serialization, equality and existing cache
+     # fingerprints continue to contain only the effective setting values.
+     _cute_structural_origins: CuteStructuralOrigins
++    # Not a dataclass field: True when the backend was passed as an explicit
++    # Settings/kernel kwarg (as opposed to resolved from the default or
++    # HELION_BACKEND). Device routing must not override an explicit choice.
++    _backend_explicit: bool
+ 
+     __slots__ = {
+         "backend": (
+@@ -682,7 +686,7 @@ class Settings(_Settings):
+             "The dtype to use for index variables. Default auto-selects torch.int32 or torch.int64 based on input sizes. "
+             "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
+         ),
+-        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'). For JAX/Pallas backend, accepted values emit Pallas default precision on TPU. Unified mappings exist so that any value can be used on any backend.",
++        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'hf32', 'ieee'). For JAX/Pallas backend, accepted values emit Pallas default precision on TPU. Unified mappings exist so that any value can be used on any backend.",
+         "cute_rng_stream": (
+             "CuTe RNG policy: auto (CuTe default) uses philox4 for explicit hl.rand "
+             "and preserves other RNG operations. philox4 maps logical offset i "
+@@ -949,6 +953,7 @@ class Settings(_Settings):
+         """
+         Initialize the Settings object with the provided dictionary of settings.
+         """
++        backend_explicit = "backend" in settings
+         if "backend" not in settings:
+             settings["backend"] = _get_backend()
+         if "cute_rng_stream" not in settings:
+@@ -973,6 +978,7 @@ class Settings(_Settings):
+         # pyrefly: ignore [bad-argument-type]
+         super().__init__(**settings)
+         self._cute_structural_origins = CuteStructuralOrigins(**origins)
++        self._backend_explicit = backend_explicit
+ 
+         if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
+             raise exc.MissingEnableTile
+@@ -1014,6 +1020,11 @@ class Settings(_Settings):
+             self._cute_structural_origins = CuteStructuralOrigins().with_explicit(
+                 *CUTE_STRUCTURAL_SETTINGS
+             )
++        if "_backend_explicit" not in self.__dict__:
++            # Same rationale: an older serialized Settings round-tripped only
++            # the effective backend value, so treat it as an explicit choice
++            # and leave device routing alone for it.
++            self._backend_explicit = True
+ 
+     def copy(self, **overrides: object) -> Settings:
+         """Copy values and origins, marking supplied structural overrides explicit.
+diff --git a/test/test_runtime.py b/test/test_runtime.py
+index 7c494ece..1808981f 100644
+--- a/test/test_runtime.py
++++ b/test/test_runtime.py
+@@ -95,6 +95,30 @@ class TestTritonLauncher(unittest.TestCase):
+             required_programs=7,
+         )
+ 
++    def test_none_num_warps_and_stages_are_omitted_from_run(self) -> None:
++        # Backends that defer num_warps/num_stages to the triton driver pass
++        # None; the launcher must omit the keys (not forward None) so triton
++        # applies its own defaults.
++        calls: list[dict[str, object]] = []
++
++        class FakeJITFunction:
++            def run(self, *args: object, **kwargs: object) -> object:
++                calls.append(kwargs)
++                return "launched"
++
++        result = triton_default_launcher(  
++            FakeJITFunction(),
++            (8,),
++            object(),
++            num_warps=None,
++            num_stages=None,
++        )
++
++        self.assertEqual(result, "launched")
++        self.assertEqual(len(calls), 1)
++        self.assertNotIn("num_warps", calls[0])
++        self.assertNotIn("num_stages", calls[0])
++
+     def test_cross_loop_occupancy_failure_is_an_invalid_config(self) -> None:
+         with (
+             patch(

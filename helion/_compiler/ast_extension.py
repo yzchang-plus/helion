@@ -188,9 +188,13 @@ def _parse_statement(template: str) -> ast.stmt:
     return statement
 
 
-def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
+def statements_from_string(template: str, **placeholders: ast.AST) -> list[ast.stmt]:
     """
-    Create an AST statement from a template string with placeholders.
+    Create a list of AST statements from a template string with placeholders.
+
+    Like :func:`statement_from_string` but parses a *block* of statements
+    (e.g. a ``for`` loop with its indented body, or several statements) and
+    returns the list of statements.
 
     Uses {placeholder} syntax to mark placeholders that should be replaced with AST nodes.
     This supports two common patterns:
@@ -233,7 +237,7 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
     modified_template = re.sub(pattern, make_unique, template)
 
     # Parse the modified template into an AST
-    statement = _parse_statement(modified_template)
+    statements = ast.parse(modified_template).body
 
     # Second pass: Recursively walk the AST and replace __placeholder_N__ identifiers
     # with the actual AST nodes provided by the user
@@ -263,7 +267,29 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
         )
 
     # Apply the second pass transformation to replace all placeholders
-    return _replace(statement)
+    return [_replace(statement) for statement in statements]
+
+
+def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
+    """
+    Create an AST statement from a template string with placeholders.
+
+    Uses {placeholder} syntax to mark placeholders that should be replaced with AST nodes.
+    This supports two common patterns:
+
+    1. Regular strings - placeholders use single braces:
+        expr_from_string("tl.load({ptr} + {offset}, {mask})",
+                        ptr=ptr_ast, offset=offset_ast, mask=mask_ast)
+
+    2. f-strings - placeholders use double braces (which become single braces):
+        name = "my_tensor"
+        expr_from_string(f"tl.load({name} + {{offset}}, {{mask}})",
+                        offset=offset_ast, mask=mask_ast)
+        # In the f-string, {name} is interpolated to "my_tensor",
+        # while {{offset}} becomes {offset} for placeholder replacement
+    """
+    (statement,) = statements_from_string(template, **placeholders)
+    return statement
 
 
 def expr_from_string(template: str, **placeholders: ast.AST) -> ast.AST:

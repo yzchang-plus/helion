@@ -1,0 +1,412 @@
+root@node73-144:/home/cyz/helion# cat backend-generic-mechanisms-fixes-round6.patch
+diff --git a/docs/api/settings.md b/docs/api/settings.md
+index 111420f4..ffb7bbc3 100644
+--- a/docs/api/settings.md
++++ b/docs/api/settings.md
+@@ -93,7 +93,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
+    - For Pallas backend, this is initialized from the ``JAX_DEFAULT_MATMUL_PRECISION`` environment variable (defaulting to ``"default"``).
+ 
+    Supported values depend on the backend:
+-   - Triton (GPU): ``"tf32"``, ``"tf32x3"``, ``"ieee"``
++   - Triton (GPU): ``"tf32"``, ``"tf32x3"``, ``"ieee"``, ``"hf32"``
+    - Pallas (TPU): ``"default"``, ``"high"``, ``"highest"`` and portable Triton aliases are accepted.
+ 
+    However, unified mappings exist so you can use any value on any backend:
+@@ -377,7 +377,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
+ 
+ | Environment Variable | Maps To | Description |
+ |----------------------|---------|-------------|
+-| ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). This variable does not apply to the Pallas backend. |
++| ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``, ``"hf32"``). This variable does not apply to the Pallas backend. |
+ | ``JAX_DEFAULT_MATMUL_PRECISION`` | ``dot_precision`` | Accepts JAX matmul precision values for Pallas dot products (``"default"``, ``"high"``, ``"highest"``, etc., mapped to Helion ``DotPrecision``). On TPU these values emit Pallas default precision. This variable does not apply to the Triton backend. |
+ | ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``), or set to ``auto``/unset to allow Helion to pick ``int32`` vs ``int64`` based on input sizes. |
+ | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
+diff --git a/helion/_compat.py b/helion/_compat.py
+index e598c33a..523bf8d1 100644
+--- a/helion/_compat.py
++++ b/helion/_compat.py
+@@ -735,10 +735,21 @@ def active_cache_clearer() -> Callable[[], None] | None:
+         from triton import runtime
+ 
+         driver = runtime.driver.active
++        # driver.active is triton's LazyProxy: the resolution that raises
++        # RuntimeError (no active driver, or several competing ones) happens
++        # on the first attribute access, so the capability probes below — not
++        # the attribute read above — are where an unresolvable driver fails.
++        resolvable = hasattr(driver, "clear_cache") and hasattr(
++            driver, "get_empty_cache_for_benchmark"
++        )
+     except (ImportError, AttributeError, RuntimeError):
+         # Triton missing, or its driver cannot be resolved: benchmarking
+         # proceeds without the L2 flush.
+         return None
++    if not resolvable:
++        return None
++    # The eager buffer allocation stays outside the gate: an OOM raised while
++    # binding the flush buffer is a real failure and must propagate.
+     return make_cache_clearer(driver)
+ 
+ 
+diff --git a/helion/_compiler/backend.py b/helion/_compiler/backend.py
+index b4b029ab..3b7f839a 100644
+--- a/helion/_compiler/backend.py
++++ b/helion/_compiler/backend.py
+@@ -492,8 +492,8 @@ class Backend(abc.ABC):
+         Some hardware DMA paths require non-negative pointer offsets even for
+         masked-out elements; when True, codegen wraps the offset in
+         ``tl.where(mask, offset, 0)`` so masked-out elements access
+-        ``ptr + 0`` (the loaded/stored value is discarded anyway). Only the
+-        pointer indexing strategy honors this; block-ptr and tensor
++        ``ptr + 0`` (the loaded/stored value is discarded anyway). The pointer
++        and stack indexing strategies honor this; block-ptr and tensor
+         descriptor strategies are unaffected, so a backend that enables it
+         should also exclude those indexing modes from its search space.
+         """
+diff --git a/helion/_compiler/compile_environment.py b/helion/_compiler/compile_environment.py
+index 7a897e6a..27a2239f 100644
+--- a/helion/_compiler/compile_environment.py
++++ b/helion/_compiler/compile_environment.py
+@@ -7,7 +7,6 @@ import contextvars
+ import dataclasses
+ import logging
+ import math
+-import os
+ import sys
+ import threading
+ import types
+@@ -420,12 +419,9 @@ class CompileEnvironment:
+         # declare the active device type while another registered backend
+         # does, use that backend instead.  An explicit choice — a
+         # Settings/kernel backend kwarg (including backend='triton') or
+-        # HELION_BACKEND=<name> — is always honored unchanged.
+-        if (
+-            backend_name == "triton"
+-            and not settings._backend_explicit
+-            and not os.environ.get("HELION_BACKEND")
+-        ):
++        # HELION_BACKEND=<name> — is always honored unchanged; both are
++        # recorded in Settings._backend_explicit at construction time.
++        if backend_name == "triton" and not settings._backend_explicit:
+             routed = find_backend_for_device(device.type)
+             if routed not in (None, backend_name):
+                 log.info(
+diff --git a/helion/_compiler/device_function.py b/helion/_compiler/device_function.py
+index e8e8fde3..bf4f6bb4 100644
+--- a/helion/_compiler/device_function.py
++++ b/helion/_compiler/device_function.py
+@@ -278,6 +278,20 @@ def _is_literal_constexpr(arg: ConstExprArg) -> bool:
+         return False
+ 
+ 
++def _is_inlined_constexpr(arg: object) -> bool:
++    """Whether ``arg`` is a literal constexpr this backend inlines at module level.
++
++    The function-def, call-site, and outlined-helper code paths must agree on
++    this predicate or kernels fail at launch with missing-argument errors
++    (the failure mode test_inline_constexpr_hook.py guards against).
++    """
++    return (
++        CompileEnvironment.current().backend.inline_constexpr_at_module_level()
++        and isinstance(arg, ConstExprArg)
++        and _is_literal_constexpr(arg)
++    )
++
++
+ class PallasMemorySpace(enum.Enum):
+     """TPU memory space for Pallas tensors."""
+ 
+@@ -1203,13 +1217,7 @@ class DeviceFunction:
+         # module level, keep dynamic ones as function parameters (unless the
+         # backend requires all constexpr args to stay function parameters)
+         constexpr_to_inline = [
+-            arg
+-            for arg in sorted_arguments
+-            if (
+-                backend.inline_constexpr_at_module_level()
+-                and isinstance(arg, ConstExprArg)
+-                and _is_literal_constexpr(arg)
+-            )
++            arg for arg in sorted_arguments if _is_inlined_constexpr(arg)
+         ]
+         inlined_names = {arg.name for arg in constexpr_to_inline}
+         param_args = [
+@@ -2189,11 +2197,7 @@ class DeviceFunction:
+             # Skip constexpr args that are inlined at module level — but only
+             # when the backend actually inlines them; otherwise they stay
+             # kernel parameters (codegen_function_def) and must be passed.
+-            if (
+-                backend.inline_constexpr_at_module_level()
+-                and isinstance(arg, ConstExprArg)
+-                and _is_literal_constexpr(arg)
+-            ):
++            if _is_inlined_constexpr(arg):
+                 continue
+             if isinstance(arg, ConstExprArg) and arg.name in self._constexpr_host_defs:
+                 host_arg = arg.name
+@@ -2362,12 +2366,7 @@ class DeviceFunction:
+         argument_names = [
+             argument.name
+             for argument in self.arguments
+-            if argument.name in reads
+-            and not (
+-                environment.backend.inline_constexpr_at_module_level()
+-                and isinstance(argument, ConstExprArg)
+-                and _is_literal_constexpr(argument)
+-            )
++            if argument.name in reads and not _is_inlined_constexpr(argument)
+         ]
+         argument_names.extend(
+             name
+diff --git a/helion/_compiler/indexing_strategy.py b/helion/_compiler/indexing_strategy.py
+index 8014181e..71c08280 100644
+--- a/helion/_compiler/indexing_strategy.py
++++ b/helion/_compiler/indexing_strategy.py
+@@ -912,9 +912,9 @@ def _clamped_offset_expr(indexing: SubscriptIndexing, offset: ast.AST) -> ast.AS
+     """Clamp masked-out pointer offsets to 0 when the backend requires it.
+ 
+     Some hardware DMA paths require non-negative pointer offsets even for
+-    masked-out elements (see ``Backend.clamp_masked_pointer_offsets``). Only
+-    the pointer indexing strategy goes through here; block-ptr and tensor
+-    descriptor strategies are unaffected.
++    masked-out elements (see ``Backend.clamp_masked_pointer_offsets``). The
++    pointer and stack indexing strategies go through here; block-ptr and
++    tensor descriptor strategies are unaffected.
+     """
+     if not _clamps_masked_offsets(indexing):
+         return offset
+@@ -1639,7 +1639,7 @@ class StackIndexingStrategy:
+         extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
+         load_placeholders: dict[str, ast.AST] = {
+             "base": dev_ptrs_ast,
+-            "offset": indexing.index_expr,
++            "offset": _clamped_offset_expr(indexing, indexing.index_expr),
+             "mask": mask_expr,
+         }
+         if eviction_policy is not None:
+@@ -1683,7 +1683,7 @@ class StackIndexingStrategy:
+         placeholders: dict[str, ast.AST] = {
+             "base": dev_ptrs_ast,
+             "value": value,
+-            "offset": indexing.index_expr,
++            "offset": _clamped_offset_expr(indexing, indexing.index_expr),
+             "mask": mask_expr,
+         }
+         if cache_modifier is not None:
+diff --git a/helion/autotuner/config_spec.py b/helion/autotuner/config_spec.py
+index 3e25f796..daa491e1 100644
+--- a/helion/autotuner/config_spec.py
++++ b/helion/autotuner/config_spec.py
+@@ -4596,6 +4596,25 @@ class ConfigSpec:
+             config.setdefault("indexing", self.indexing.default())
+         if self.supports_config_key("atomic_indexing"):
+             config.setdefault("atomic_indexing", self.atomic_indexing.default())
++        if self.backend.clamp_masked_pointer_offsets():
++            # The search space is already restricted to "pointer"
++            # (valid_indexing_types); this closes the gap for configs spelled
++            # out by hand, so the flag's contract holds for them too.
++            for name in ("indexing", "atomic_indexing"):
++                values = config.get(name)
++                if not values:
++                    continue
++                items = values if isinstance(values, list) else [values]
++                if all(item == "pointer" for item in items):
++                    continue
++                if _fix_invalid:
++                    config[name] = ["pointer"] * len(items)
++                else:
++                    raise InvalidConfig(
++                        f"{name}={values!r}: the {self.backend_name!r} backend "
++                        "requires the pointer indexing strategy "
++                        "(clamp_masked_pointer_offsets)"
++                    )
+         if config.get("host_tensor_descriptors"):
+             indexing_values = (config.get("indexing"), config.get("atomic_indexing"))
+             uses_tensor_descriptor = any(
+diff --git a/helion/runtime/settings.py b/helion/runtime/settings.py
+index cf934c51..e5e4eb8b 100644
+--- a/helion/runtime/settings.py
++++ b/helion/runtime/settings.py
+@@ -667,9 +667,9 @@ class Settings(_Settings):
+     # Not a dataclass field: public serialization, equality and existing cache
+     # fingerprints continue to contain only the effective setting values.
+     _cute_structural_origins: CuteStructuralOrigins
+-    # Not a dataclass field: True when the backend was passed as an explicit
+-    # Settings/kernel kwarg (as opposed to resolved from the default or
+-    # HELION_BACKEND). Device routing must not override an explicit choice.
++    # Not a dataclass field: True when the backend was chosen explicitly — a
++    # Settings/kernel kwarg or HELION_BACKEND — as opposed to resolved from
++    # the default. Device routing must not override an explicit choice.
+     _backend_explicit: bool
+ 
+     __slots__ = {
+@@ -956,6 +956,12 @@ class Settings(_Settings):
+         backend_explicit = "backend" in settings
+         if "backend" not in settings:
+             settings["backend"] = _get_backend()
++            # _get_backend above already resolved HELION_BACKEND; record that
++            # fact here instead of re-reading the env var at each consumer
++            # (the device-routing gate), so one construction-time snapshot
++            # decides whether routing may swap the implicit default. A blank
++            # value falls back like _get_backend does and stays implicit.
++            backend_explicit = bool(os.environ.get("HELION_BACKEND", "").strip())
+         if "cute_rng_stream" not in settings:
+             settings["cute_rng_stream"] = _env_get_literal(
+                 "HELION_CUTE_RNG_STREAM",
+diff --git a/test/test_config_api.py b/test/test_config_api.py
+index a364b189..62ac3c5c 100644
+--- a/test/test_config_api.py
++++ b/test/test_config_api.py
+@@ -1005,10 +1005,21 @@ class TestConfigAPI(TestCase):
+ @onlyBackends(["triton", "cute"])
+ class TestSettingsEnv(TestCase):
+     def test_backend_explicit_semantics_across_construction_paths(self) -> None:
++        # Pin the environment so the implicit cases below are genuine even
++        # when the suite runs with HELION_BACKEND set globally.
++        saved_backend_env = os.environ.pop("HELION_BACKEND", None)
++        try:
++            self._check_backend_explicit_semantics()
++        finally:
++            if saved_backend_env is not None:
++                os.environ["HELION_BACKEND"] = saved_backend_env
++
++    def _check_backend_explicit_semantics(self) -> None:
+         # Only a genuine user choice marks the backend explicit: a keyword,
+-        # or a direct assignment after construction. A plain default-constructed
+-        # Settings (and copies of it) stays implicit so device routing may
+-        # pick a backend that declares the active device type.
++        # a direct assignment after construction, or HELION_BACKEND at
++        # construction time. A plain default-constructed Settings (and copies
++        # of it) stays implicit so device routing may pick a backend that
++        # declares the active device type.
+         self.assertFalse(helion.Settings()._backend_explicit)
+         self.assertTrue(helion.Settings(backend="triton")._backend_explicit)
+ 
+@@ -1016,6 +1027,13 @@ class TestSettingsEnv(TestCase):
+         assigned.backend = "triton"
+         self.assertTrue(assigned._backend_explicit)
+ 
++        with patch.dict(os.environ, {"HELION_BACKEND": "triton"}, clear=False):
++            self.assertTrue(helion.Settings()._backend_explicit)
++        # A blank value falls back to the default like _get_backend does and
++        # stays implicit.
++        with patch.dict(os.environ, {"HELION_BACKEND": ""}, clear=False):
++            self.assertFalse(helion.Settings()._backend_explicit)
++
+         # copy() goes through dataclasses.replace, which feeds every field
+         # back through __init__; only an overridden "backend" is explicit.
+         self.assertFalse(helion.Settings().copy()._backend_explicit)
+@@ -1396,6 +1414,10 @@ class TestDeviceRouting(TestCase):
+             device_types = frozenset({"meta"})
+ 
+         register_compiler_backend(_MetaTritonBackend)
++        # Pin the environment so the implicit cases below are genuine: a
++        # HELION_BACKEND set in the outer environment (e.g. someone running
++        # the suite as `HELION_BACKEND=triton pytest`) would suppress routing.
++        saved_backend_env = os.environ.pop("HELION_BACKEND", None)
+         try:
+             # Implicit default 'triton' + a registered backend declaring the
+             # device type: the code generator is routed while settings.backend
+@@ -1415,9 +1437,63 @@ class TestDeviceRouting(TestCase):
+                 env = CompileEnvironment(torch.device("meta"), helion.Settings())
+             self.assertEqual(env.backend.name, "triton")
+         finally:
++            if saved_backend_env is not None:
++                os.environ["HELION_BACKEND"] = saved_backend_env
+             _REGISTRY.pop("_test_meta_routing", None)
+ 
+ 
++@onlyBackends(["triton"])
++class TestClampBackendIndexingContract(TestCase):
++    def test_clamp_backend_rejects_non_pointer_explicit_indexing(self) -> None:
++        # The autotune search space is restricted to "pointer" by
++        # valid_indexing_types(); explicit configs spelling out another
++        # strategy must be rejected too, or the clamp contract silently
++        # fails for hand-written Configs.
++
++        @helion.kernel(static_shapes=True)
++        def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
++            out = torch.empty((a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
++            for m, n in hl.tile((a.size(0), b.size(1))):
++                out[m, n] = a[m, :] @ b[:, n]
++            return out
++
++        a = torch.randn((128, 16), dtype=torch.float16)
++        b = torch.randn((32, 16), dtype=torch.float16).T
++        bound = matmul.bind((a, b))
++
++        with patch.object(
++            TritonBackend, "clamp_masked_pointer_offsets", return_value=True
++        ):
++            # Defaults and pointer configs are accepted as-is.
++            config = helion.Config(block_sizes=[128, 32])
++            bound.config_spec.normalize(config)
++            self.assertEqual(set(config.config["indexing"]), {"pointer"})
++
++            # A non-pointer strategy on a clamp backend is rejected...
++            with self.assertRaisesRegex(
++                exc.InvalidConfig, "requires the pointer indexing strategy"
++            ):
++                bound.config_spec.normalize(
++                    helion.Config(
++                        block_sizes=[128, 32],
++                        indexing=["tensor_descriptor"],
++                    )
++                )
++
++            # ...or coerced during autotune config generation.
++            fixed = helion.Config(
++                block_sizes=[128, 32],
++                indexing=["tensor_descriptor", "pointer"],
++            )
++            bound.config_spec.normalize(fixed, _fix_invalid=True)
++            self.assertEqual(fixed.config["indexing"], ["pointer", "pointer"])
++
++        # Without the clamp flag, descriptor indexing stays accepted.
++        config = helion.Config(block_sizes=[128, 32], indexing=["tensor_descriptor"])
++        bound.config_spec.normalize(config)
++        self.assertIn("tensor_descriptor", config.config["indexing"])
++
++
+ @onlyBackends(["triton", "cute"])
+ class TestFormatKernelDecorator(TestCase):
+     def test_format_kernel_decorator_includes_index_dtype(self) -> None:
+diff --git a/test/test_l2_cache_flush.py b/test/test_l2_cache_flush.py
+index a8c0f769..475498a2 100644
+--- a/test/test_l2_cache_flush.py
++++ b/test/test_l2_cache_flush.py
+@@ -7,6 +7,7 @@ import unittest
+ from unittest.mock import patch
+ 
+ from helion._compat import _flush_cache_state
++from helion._compat import active_cache_clearer
+ from helion._compat import make_cache_clearer
+ from helion._compat import safe_clear_cache
+ 
+@@ -74,6 +75,27 @@ class TestSafeClearCache(unittest.TestCase):
+         _flush_cache_state.clear()
+         self.addCleanup(_flush_cache_state.clear)
+ 
++    def test_noop_when_driver_resolution_raises(self) -> None:
++        # triton's driver.active is a LazyProxy: resolution happens on the
++        # first attribute access, so the capability probes can raise
++        # RuntimeError (zero or several active drivers). hasattr only
++        # suppresses AttributeError, so that must be caught at the gate.
++        class _UnresolvableDriver:
++            def __getattr__(self, name: str) -> object:
++                raise RuntimeError("no active driver")
++
++        runtime = ModuleType("triton.runtime")
++        runtime.driver = SimpleNamespace(  # type: ignore[attr-defined]
++            active=_UnresolvableDriver()
++        )
++        triton_module = ModuleType("triton")
++        triton_module.runtime = runtime  # type: ignore[attr-defined]
++        with patch.dict(
++            sys.modules, {"triton": triton_module, "triton.runtime": runtime}
++        ):
++            self.assertIsNone(active_cache_clearer())
++            safe_clear_cache()  # must not raise
++
+     def test_noop_when_driver_lacks_primitives(self) -> None:
+         # A resolvable driver without the flush primitives (common for
+         # out-of-tree Triton drivers on non-CUDA accelerators) must be a

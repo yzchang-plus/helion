@@ -1,0 +1,273 @@
+root@node73-144:/home/cyz/helion# cat backend-generic-mechanisms-fixes-round2.patch 
+diff --git a/helion/_compat.py b/helion/_compat.py
+index 9d5b60e2..a202f910 100644
+--- a/helion/_compat.py
++++ b/helion/_compat.py
+@@ -656,26 +656,37 @@ class _BenchmarkCacheDriver(Protocol):
+     def get_empty_cache_for_benchmark(self) -> object: ...
+ 
+ 
+-# (driver, buffer) pair so the flush buffer is allocated once per driver
+-# instead of on every timed iteration. Identity-compared rather than dict-keyed
+-# because driver objects (and test doubles) may be unhashable.
+-_flush_cache_state: list[tuple[object, object]] = []
++# (driver, device, buffer) triple so the flush buffer is allocated once per
++# (driver, device) instead of on every timed iteration. The driver is
++# identity-compared rather than dict-keyed (driver objects and test doubles
++# may be unhashable), and the buffer is reallocated on device change because
++# ``get_empty_cache_for_benchmark()`` allocates on the current device.
++_flush_cache_state: list[tuple[object, object, object]] = []
+ 
+ 
+ def _driver_flush_cache(driver: object) -> object:
+-    """Allocate the flush buffer once per driver, not per timed iteration.
+-
+-    ``get_empty_cache_for_benchmark()`` allocates a large buffer; allocating it
+-    on every call would pay the first allocation inside a timed estimate loop.
+-    The buffer stays alive for the process lifetime (it is only used for
+-    benchmarking anyway), and a driver switch re-allocates.
++    """Allocate the flush buffer once per (driver, device), not per iteration.
++
++    ``get_empty_cache_for_benchmark()`` allocates a large buffer on the current
++    device; allocating it on every call would pay the first allocation inside
++    a timed estimate loop, and a single buffer shared across devices would
++    flush the wrong one. The buffer stays alive for the process lifetime (it
++    is only used for benchmarking anyway); switching drivers or devices
++    reallocates.
+     """
+-    if not _flush_cache_state or _flush_cache_state[0][0] is not driver:
++    device = torch.cuda.current_device() if torch.cuda.is_available() else None
++    if (
++        not _flush_cache_state
++        or _flush_cache_state[0][0] is not driver
++        or _flush_cache_state[0][1] != device
++    ):
+         # The runtime driver object (triton's LazyProxy or a test double)
+         # forwards attribute access; the Protocol is the structural contract.
+         cache_driver = cast("_BenchmarkCacheDriver", driver)
+-        _flush_cache_state[:] = [(driver, cache_driver.get_empty_cache_for_benchmark())]
+-    return _flush_cache_state[0][1]
++        _flush_cache_state[:] = [
++            (driver, device, cache_driver.get_empty_cache_for_benchmark())
++        ]
++    return _flush_cache_state[0][2]
+ 
+ 
+ def safe_clear_cache() -> None:
+diff --git a/helion/_compiler/backend.py b/helion/_compiler/backend.py
+index fb3e8d34..b4b029ab 100644
+--- a/helion/_compiler/backend.py
++++ b/helion/_compiler/backend.py
+@@ -1432,8 +1432,8 @@ class Backend(abc.ABC):
+             "tf32x3": "tf32x3",
+             "ieee": "ieee",
+             # Forwarded verbatim: stock CUDA triton rejects it loudly at
+-            # compile time, while out-of-tree drivers (e.g. Ascend) that
+-            # declare "hf32" in allowed_dot_input_precisions honor it.
++            # compile time; out-of-tree drivers that accept the value
++            # honor it.
+             "hf32": "hf32",
+         }
+         return triton_precision_by_dot_precision.get(precision, "")
+diff --git a/helion/_compiler/compile_environment.py b/helion/_compiler/compile_environment.py
+index f1ed3ee4..7a897e6a 100644
+--- a/helion/_compiler/compile_environment.py
++++ b/helion/_compiler/compile_environment.py
+@@ -436,6 +436,10 @@ class CompileEnvironment:
+                     backend_name,
+                 )
+                 backend_name = routed
++        # Note: only self._backend is routed; settings.backend keeps the
++        # user-facing value ('triton'). Host-side readers of settings.backend
++        # (cache keys, backend-specific feature checks) see the unrouted
++        # value by design — routing only picks the code generator.
+         self._backend = get_backend_class(backend_name)()
+         self._backend.validate_environment()
+         if self._backend.experimental:
+diff --git a/helion/_compiler/cute/cute_mma.py b/helion/_compiler/cute/cute_mma.py
+index 52a21ef2..6388edb3 100644
+--- a/helion/_compiler/cute/cute_mma.py
++++ b/helion/_compiler/cute/cute_mma.py
+@@ -8638,7 +8638,11 @@ def _emit_mma_pipeline(
+     # producer flag is the master predicate for all three role-local loops.
+     tcgen05_use_role_local_persistent_body = tcgen05_use_role_local_tma_producer
+     tcgen05_ab_stage_count_value = _tcgen05_config_int(
+-        df.config, "tcgen05_ab_stages", _tcgen05_ab_stage_count(df.config.num_stages)
++        df.config,
++        "tcgen05_ab_stages",
++        # CuTe configs always pin num_stages; deferral (None) is not a CuTe
++        # concept.
++        _tcgen05_ab_stage_count(cast("int", df.config.num_stages)),
+     )
+     tcgen05_c_stage_count_value = _tcgen05_config_int(
+         df.config, "tcgen05_c_stages", _tcgen05_c_stage_count(bn)
+diff --git a/helion/_compiler/metal/backend.py b/helion/_compiler/metal/backend.py
+index e3c44786..9cda4f3e 100644
+--- a/helion/_compiler/metal/backend.py
++++ b/helion/_compiler/metal/backend.py
+@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
+ from typing import Any
+ from typing import ClassVar
+ from typing import Sequence
++from typing import cast
+ 
+ import torch
+ 
+@@ -888,7 +889,9 @@ class MetalBackend(Backend):
+         # simdgroup has 32 threads.  tid[0] must be large enough for both
+         # MPP's cooperative operation and any scalar indexing on the first
+         # root axis.
+-        mpp_threads = config.num_warps * 32
++        # Metal configs always pin num_warps; deferral (None) is not a Metal
++        # concept, and a pinned None raises TypeError loudly here.
++        mpp_threads = cast("int", config.num_warps) * 32
+         used_threads = max(mpp_threads, first_axis_threads)
+         changed = False
+ 
+diff --git a/helion/_compiler/tile_strategy.py b/helion/_compiler/tile_strategy.py
+index c084d2d7..3681985d 100644
+--- a/helion/_compiler/tile_strategy.py
++++ b/helion/_compiler/tile_strategy.py
+@@ -7360,7 +7360,9 @@ class TileStrategy:
+         range_num_stages = env.config_spec.range_num_stages.config_get(
+             config.range_num_stages, block_idx, 0
+         )
+-        num_stages = config.num_stages
++        # Triton configs always pin num_stages (the search space includes it);
++        # deferral (None) never reaches codegen.
++        num_stages = cast("int", config.num_stages)
+ 
+         if indexing_uses_tensor_descriptor(
+             config.indexing
+diff --git a/helion/_compiler/triton/distributed_ops.py b/helion/_compiler/triton/distributed_ops.py
+index 6f00553c..c4fab43c 100644
+--- a/helion/_compiler/triton/distributed_ops.py
++++ b/helion/_compiler/triton/distributed_ops.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import ast
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING
++from typing import cast
+ 
+ import torch
+ from torch.fx.experimental.symbolic_shapes import guard_int
+@@ -749,7 +750,9 @@ def _poll_pack(state: CodegenState, output_size: list[int | torch.SymInt]) -> in
+         if not isinstance(size, int):
+             return 1
+         numel *= size
+-    threads = 32 * state.config.num_warps
++    # Triton configs always pin num_warps (the search space includes it);
++    # deferral (None) never reaches codegen.
++    threads = 32 * cast("int", state.config.num_warps)
+     return 4 if numel >= 4 * threads else 2 if numel >= 2 * threads else 1
+ 
+ 
+diff --git a/helion/autotuner/benchmarking.py b/helion/autotuner/benchmarking.py
+index 757121d2..acf2d111 100644
+--- a/helion/autotuner/benchmarking.py
++++ b/helion/autotuner/benchmarking.py
+@@ -18,6 +18,7 @@ from typing import cast
+ 
+ import torch
+ 
++from .._compat import _driver_flush_cache
+ from .._compat import safe_clear_cache
+ from ..runtime.settings import _env_get_bool
+ from ..runtime.settings import is_pallas_interpret
+@@ -87,10 +88,13 @@ def _make_l2_cache_clearer() -> Callable[[], None]:
+         # Out-of-tree triton drivers may lack the cache-clear primitive; skip
+         # the flush there (same contract as safe_clear_cache()).
+         return lambda: None
+-    cache = active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
++    # Allocate eagerly (before any timed loop) through the shared per-(driver,
++    # device) cache so this path and safe_clear_cache() use one buffer instead
++    # of keeping two ~256MB allocations alive.
++    _driver_flush_cache(active)
+ 
+     def clear() -> None:
+-        active.clear_cache(cache)  # type: ignore[attr-defined]
++        active.clear_cache(_driver_flush_cache(active))  # type: ignore[attr-defined]
+ 
+     return clear
+ 
+@@ -286,6 +290,10 @@ def compute_repeat(
+     di.synchronize()
+     benchmark_function = _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
+ 
++    # Pre-warm the L2-flush buffer outside the timed estimate window; the
++    # first safe_clear_cache() would otherwise pay its allocation inside it.
++    safe_clear_cache()
++
+     start_event = di.Event(enable_timing=True)
+     end_event = di.Event(enable_timing=True)
+     start_event.record()
+@@ -909,11 +917,14 @@ def do_bench(
+ 
+     calls = 1
+     flush_replay: Callable[[], None] | None = None
++    # Pre-warm the L2-flush buffer outside the timed estimate loops; the
++    # first safe_clear_cache() would otherwise pay its allocation inside
++    # them. The flush-only CUDA-graph capture below also relies on the buffer
++    # existing by then.
++    safe_clear_cache()
+     if benchmark_function is not fn:
+-        # The first L2 flush and the first replay of a fresh graph pay their
+-        # one-time costs; keep those out of the estimate that sizes the
+-        # repetitions and the batch.
+-        safe_clear_cache()
++        # The first replay of a fresh graph pays its one-time cost; keep it
++        # out of the estimate that sizes the repetitions and the batch.
+         benchmark_function()
+         di.synchronize()
+ 
+diff --git a/helion/runtime/config.py b/helion/runtime/config.py
+index 5705055f..2831ea4b 100644
+--- a/helion/runtime/config.py
++++ b/helion/runtime/config.py
+@@ -382,16 +382,18 @@ class Config(Mapping[str, object]):
+         return cast("list[int | None]", self.config.get("reduction_loops", []))
+ 
+     @property
+-    def num_warps(self) -> int:
++    def num_warps(self) -> int | None:
++        """Warp count, or None to defer the choice to the backend's driver."""
+         from ..autotuner.config_spec import DEFAULT_NUM_WARPS
+ 
+-        return cast("int", self.config.get("num_warps", DEFAULT_NUM_WARPS))
++        return cast("int | None", self.config.get("num_warps", DEFAULT_NUM_WARPS))
+ 
+     @property
+-    def num_stages(self) -> int:
++    def num_stages(self) -> int | None:
++        """Pipeline depth, or None to defer the choice to the backend's driver."""
+         from ..autotuner.config_spec import DEFAULT_NUM_STAGES
+ 
+-        return cast("int", self.config.get("num_stages", DEFAULT_NUM_STAGES))
++        return cast("int | None", self.config.get("num_stages", DEFAULT_NUM_STAGES))
+ 
+     @property
+     def l2_groupings(self) -> list[int]:
+diff --git a/helion/runtime/settings.py b/helion/runtime/settings.py
+index 3753af7a..38161297 100644
+--- a/helion/runtime/settings.py
++++ b/helion/runtime/settings.py
+@@ -686,7 +686,7 @@ class Settings(_Settings):
+             "The dtype to use for index variables. Default auto-selects torch.int32 or torch.int64 based on input sizes. "
+             "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
+         ),
+-        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'hf32', 'ieee'). For JAX/Pallas backend, accepted values emit Pallas default precision on TPU. Unified mappings exist so that any value can be used on any backend.",
++        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'; 'hf32' is only honored by triton drivers that accept it). For JAX/Pallas backend, accepted values emit Pallas default precision on TPU. Unified mappings exist so that any value can be used on any backend.",
+         "cute_rng_stream": (
+             "CuTe RNG policy: auto (CuTe default) uses philox4 for explicit hl.rand "
+             "and preserves other RNG operations. philox4 maps logical offset i "
+@@ -1038,6 +1038,10 @@ class Settings(_Settings):
+         result._cute_structural_origins = self._cute_structural_origins.with_explicit(
+             *(name for name in CUTE_STRUCTURAL_SETTINGS if name in overrides)
+         )
++        # dataclasses.replace re-runs __init__ with every field and would mark
++        # the backend explicit even when it was resolved from the default;
++        # only a copy() override of "backend" is a user choice.
++        result._backend_explicit = self._backend_explicit or "backend" in overrides
+         return result
+ 
+     @property

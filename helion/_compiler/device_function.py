@@ -1229,11 +1229,16 @@ class DeviceFunction:
         sorted_arguments = self.sorted_args()
 
         # Separate constexpr args: inline those with known literal values at
-        # module level, keep dynamic ones as function parameters
+        # module level, keep dynamic ones as function parameters (unless the
+        # backend requires all constexpr args to stay function parameters)
         constexpr_to_inline = [
             arg
             for arg in sorted_arguments
-            if isinstance(arg, ConstExprArg) and _is_literal_constexpr(arg)
+            if (
+                backend.inline_constexpr_at_module_level()
+                and isinstance(arg, ConstExprArg)
+                and _is_literal_constexpr(arg)
+            )
         ]
         inlined_names = {arg.name for arg in constexpr_to_inline}
         param_args = [

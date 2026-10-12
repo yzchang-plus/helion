@@ -1,0 +1,1027 @@
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+  --> benchmarks\cute\attnbwd_smoke.py:8:1
+   |
+ 6 |   """
+ 7 |
+ 8 | / from __future__ import annotations
+ 9 | |
+10 | | import os
+11 | | import sys
+12 | |
+13 | | from attnbwd_kernels import RCP_LN2  # pyrefly: ignore [missing-import]
+14 | | from attnbwd_kernels import attention_bwd  # pyrefly: ignore [missing-import]
+15 | | from attnbwd_kernels import attention_bwd_causal  # pyrefly: ignore [missing-import]
+16 | | from attnbwd_kernels import attention_bwd_dkdv  # pyrefly: ignore [missing-import]
+17 | | from attnbwd_kernels import (  # pyrefly: ignore [missing-import]
+18 | |     attention_bwd_dkdv_causal,
+19 | | )
+20 | | from attnbwd_kernels import attention_bwd_dq  # pyrefly: ignore [missing-import]
+21 | | from attnbwd_kernels import attention_bwd_dq_causal  # pyrefly: ignore [missing-import]
+22 | | from attnbwd_kernels import attention_bwd_preprocess  # pyrefly: ignore [missing-import]
+23 | | import torch
+24 | |
+25 | | from helion._testing import code_and_output
+   | |___________________________________________^
+26 |
+27 |   CASES = {
+   |
+help: Organize imports
+   |
+16 | from attnbwd_kernels import attention_bwd_dkdv  # pyrefly: ignore [missing-import]
+   - from attnbwd_kernels import (  # pyrefly: ignore [missing-import]
+   -     attention_bwd_dkdv_causal,
+   - )
+17 + from attnbwd_kernels import attention_bwd_dkdv_causal  # pyrefly: ignore [missing-import]
+18 | from attnbwd_kernels import attention_bwd_dq  # pyrefly: ignore [missing-import]
+   |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> benchmarks\cute\compare_cross_entropy_backends.py:297:5
+    |
+296 |       sys.path.insert(0, str(QUACK_PATH))
+297 | /     import cutlass
+298 | |     from cutlass import Float32  # pyrefly: ignore [missing-import]
+299 | |     from cutlass import Int32  # pyrefly: ignore [missing-import]
+300 | |     import cutlass.cute as cute  # pyrefly: ignore [missing-import]
+301 | |     from quack.compile_utils import make_fake_tensor  # pyrefly: ignore [missing-import]
+302 | |     from quack.cross_entropy import CrossEntropy  # pyrefly: ignore [missing-import]
+303 | |     from quack.cute_dsl_utils import (  # pyrefly: ignore [missing-import]
+304 | |         torch2cute_dtype_map,
+305 | |     )
+    | |_____^
+306 |
+307 |       cutlass.cuda.initialize_cuda_context()
+    |
+help: Organize imports
+    |
+302 |     from quack.cross_entropy import CrossEntropy  # pyrefly: ignore [missing-import]
+    -     from quack.cute_dsl_utils import (  # pyrefly: ignore [missing-import]
+    -         torch2cute_dtype_map,
+    -     )
+303 +     from quack.cute_dsl_utils import torch2cute_dtype_map  # pyrefly: ignore [missing-import]
+304 |
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+  --> benchmarks\cute\compare_kda_decode_backends.py:30:1
+   |
+28 |       sys.path.insert(0, str(REPO_ROOT))
+29 |
+30 | / from benchmarks.cute.kda_benchmark_utils import DEFAULT_COOLDOWN_C  # noqa: E402
+31 | | from benchmarks.cute.kda_benchmark_utils import PairedGraphArm  # noqa: E402
+32 | | from benchmarks.cute.kda_benchmark_utils import assert_stable  # noqa: E402
+33 | | from benchmarks.cute.kda_benchmark_utils import canonical_config_json  # noqa: E402
+34 | | from benchmarks.cute.kda_benchmark_utils import capture_paired_cuda_graphs  # noqa: E402
+35 | | from benchmarks.cute.kda_benchmark_utils import file_sha256  # noqa: E402
+36 | | from benchmarks.cute.kda_benchmark_utils import gpu_info  # noqa: E402
+37 | | from benchmarks.cute.kda_benchmark_utils import measure_paired_cuda_graphs  # noqa: E402
+38 | | from benchmarks.cute.kda_benchmark_utils import parse_json_object  # noqa: E402
+39 | | from benchmarks.cute.kda_benchmark_utils import source_provenance  # noqa: E402
+40 | | from benchmarks.cute.kda_benchmark_utils import text_sha256  # noqa: E402
+41 | | from benchmarks.cute.kda_benchmark_utils import validate_pinned_source  # noqa: E402
+42 | | from benchmarks.cute.kda_benchmark_utils import (  # noqa: E402
+43 | |     verify_helion_generated_wrapper,
+44 | | )
+45 | | import torch  # noqa: E402
+46 | |
+47 | | import helion  # noqa: E402
+   | |_____________^
+48 |
+49 |   DEFAULT_BATCH_SIZES = (1, 256)
+   |
+help: Organize imports
+   |
+41 | from benchmarks.cute.kda_benchmark_utils import validate_pinned_source  # noqa: E402
+   - from benchmarks.cute.kda_benchmark_utils import (  # noqa: E402
+   -     verify_helion_generated_wrapper,
+   - )
+42 + from benchmarks.cute.kda_benchmark_utils import verify_helion_generated_wrapper  # noqa: E402
+43 | import torch  # noqa: E402
+   |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+  --> benchmarks\cute\compare_kda_prefill_backends.py:33:1
+   |
+31 |       sys.path.insert(0, str(REPO_ROOT))
+32 |
+33 | / from benchmarks.cute import kda_benchmark_utils as benchmark_utils  # noqa: E402
+34 | | from benchmarks.cute.kda_benchmark_utils import (  # noqa: E402
+35 | |     assert_stable as _assert_stable,
+36 | | )
+37 | | from benchmarks.cute.kda_benchmark_utils import (  # noqa: E402, F401
+38 | |     file_sha256 as _sha256,
+39 | | )
+40 | | from benchmarks.cute.kda_benchmark_utils import gpu_info as _gpu_info  # noqa: E402
+41 | | from benchmarks.cute.kda_benchmark_utils import (  # noqa: E402
+42 | |     source_provenance as _source_provenance,
+43 | | )
+44 | | from benchmarks.cute.kda_prefill_kernels import KDA_PREPARE_CONFIG  # noqa: E402
+45 | | from benchmarks.cute.kda_prefill_kernels import KDA_RECURRENCE_CONFIG  # noqa: E402
+46 | | from benchmarks.cute.kda_prefill_kernels import kda_chunk_prepare  # noqa: E402
+47 | | from benchmarks.cute.kda_prefill_kernels import kda_chunk_recurrence  # noqa: E402
+48 | | from benchmarks.cute.kda_prefill_staged import create_staged_kda_resources  # noqa: E402
+49 | | from benchmarks.cute.kda_prefill_staged import launch_staged_kda_prefill  # noqa: E402
+50 | | import torch  # noqa: E402
+51 | |
+52 | | import helion  # noqa: E402
+53 | | from helion.runtime.config import Config  # noqa: E402
+   | |________________________________________^
+54 |
+55 |   if TYPE_CHECKING:
+   |
+help: Organize imports
+   |
+33 | from benchmarks.cute import kda_benchmark_utils as benchmark_utils  # noqa: E402
+   - from benchmarks.cute.kda_benchmark_utils import (  # noqa: E402
+   -     assert_stable as _assert_stable,
+   - )
+   - from benchmarks.cute.kda_benchmark_utils import (  # noqa: E402, F401
+   -     file_sha256 as _sha256,
+   - )
+34 + from benchmarks.cute.kda_benchmark_utils import assert_stable as _assert_stable  # noqa: E402
+35 + from benchmarks.cute.kda_benchmark_utils import file_sha256 as _sha256  # noqa: E402, F401
+36 | from benchmarks.cute.kda_benchmark_utils import gpu_info as _gpu_info  # noqa: E402
+   - from benchmarks.cute.kda_benchmark_utils import (  # noqa: E402
+   -     source_provenance as _source_provenance,
+   - )
+37 + from benchmarks.cute.kda_benchmark_utils import source_provenance as _source_provenance  # noqa: E402
+38 | from benchmarks.cute.kda_prefill_kernels import KDA_PREPARE_CONFIG  # noqa: E402
+   |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+  --> benchmarks\cute\compare_kda_recurrent_backends.py:31:1
+   |
+29 |       sys.path.insert(0, str(REPO_ROOT))
+30 |
+31 | / from benchmarks.cute.kda_benchmark_utils import DEFAULT_COOLDOWN_C  # noqa: E402
+32 | | from benchmarks.cute.kda_benchmark_utils import PairedGraphArm  # noqa: E402
+33 | | from benchmarks.cute.kda_benchmark_utils import assert_stable  # noqa: E402
+34 | | from benchmarks.cute.kda_benchmark_utils import canonical_config_json  # noqa: E402
+35 | | from benchmarks.cute.kda_benchmark_utils import capture_paired_cuda_graphs  # noqa: E402
+36 | | from benchmarks.cute.kda_benchmark_utils import file_sha256  # noqa: E402
+37 | | from benchmarks.cute.kda_benchmark_utils import gpu_info  # noqa: E402
+38 | | from benchmarks.cute.kda_benchmark_utils import measure_paired_cuda_graphs  # noqa: E402
+39 | | from benchmarks.cute.kda_benchmark_utils import parse_json_object  # noqa: E402
+40 | | from benchmarks.cute.kda_benchmark_utils import source_provenance  # noqa: E402
+41 | | from benchmarks.cute.kda_benchmark_utils import text_sha256  # noqa: E402
+42 | | from benchmarks.cute.kda_benchmark_utils import validate_pinned_source  # noqa: E402
+43 | | from benchmarks.cute.kda_benchmark_utils import (  # noqa: E402
+44 | |     verify_helion_generated_wrapper,
+45 | | )
+46 | | import torch  # noqa: E402
+47 | |
+48 | | import helion  # noqa: E402
+49 | | import helion.language as hl  # noqa: E402
+   | |____________________________^
+50 |
+51 |   HEAD_DIM = 128
+   |
+help: Organize imports
+   |
+42 | from benchmarks.cute.kda_benchmark_utils import validate_pinned_source  # noqa: E402
+   - from benchmarks.cute.kda_benchmark_utils import (  # noqa: E402
+   -     verify_helion_generated_wrapper,
+   - )
+43 + from benchmarks.cute.kda_benchmark_utils import verify_helion_generated_wrapper  # noqa: E402
+44 | import torch  # noqa: E402
+   |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> benchmarks\cute\compare_layernorm_backends.py:230:5
+    |
+229 |       sys.path.insert(0, str(QUACK_PATH))
+230 | /     from quack.cute_dsl_utils import (  # pyrefly: ignore [missing-import]
+231 | |         torch2cute_dtype_map,
+232 | |     )
+233 | |     from quack.rmsnorm import _compile_rmsnorm_fwd  # pyrefly: ignore [missing-import]
+    | |__________________________________________________^
+234 |
+235 |       dt = torch2cute_dtype_map[x.dtype]
+    |
+help: Organize imports
+    |
+229 |     sys.path.insert(0, str(QUACK_PATH))
+    -     from quack.cute_dsl_utils import (  # pyrefly: ignore [missing-import]
+    -         torch2cute_dtype_map,
+    -     )
+230 +     from quack.cute_dsl_utils import torch2cute_dtype_map  # pyrefly: ignore [missing-import]
+231 |     from quack.rmsnorm import _compile_rmsnorm_fwd  # pyrefly: ignore [missing-import]
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> benchmarks\cute\compare_layernorm_backends.py:283:9
+    |
+281 |       elif args.impl == "quack-tuned":
+282 |           sys.path.insert(0, str(QUACK_PATH))
+283 | /         from quack.rmsnorm_config import (  # pyrefly: ignore [missing-import]
+284 | |             get_all_fwd_configs,
+285 | |         )
+286 | |         from triton.testing import do_bench
+    | |___________________________________________^
+287 |
+288 |           t0 = time.time()
+    |
+help: Organize imports
+    |
+282 |         sys.path.insert(0, str(QUACK_PATH))
+    -         from quack.rmsnorm_config import (  # pyrefly: ignore [missing-import]
+    -             get_all_fwd_configs,
+    -         )
+283 +         from quack.rmsnorm_config import get_all_fwd_configs  # pyrefly: ignore [missing-import]
+284 |         from triton.testing import do_bench
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> benchmarks\cute\compare_pointwise_backends.py:591:9
+    |
+589 |           out = fn()
+590 |       elif args.impl == "cute-manual":
+591 | /         from cute_pointwise_manual import (  # pyrefly: ignore [missing-import]
+592 | |             make_manual_fn,
+593 | |         )
+    | |_________^
+594 |
+595 |           fn, out, config_used, tune_s = make_manual_fn(
+    |
+help: Organize imports
+    |
+590 |     elif args.impl == "cute-manual":
+    -         from cute_pointwise_manual import (  # pyrefly: ignore [missing-import]
+    -             make_manual_fn,
+    -         )
+591 +         from cute_pointwise_manual import make_manual_fn  # pyrefly: ignore [missing-import]
+592 |
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> benchmarks\cute\compare_rmsnorm_backends.py:224:5
+    |
+223 |       sys.path.insert(0, str(QUACK_PATH))
+224 | /     from quack.cute_dsl_utils import (  # pyrefly: ignore [missing-import]
+225 | |         torch2cute_dtype_map,
+226 | |     )
+227 | |     from quack.rmsnorm import _compile_rmsnorm_fwd  # pyrefly: ignore [missing-import]
+    | |__________________________________________________^
+228 |
+229 |       dt = torch2cute_dtype_map[x.dtype]
+    |
+help: Organize imports
+    |
+223 |     sys.path.insert(0, str(QUACK_PATH))
+    -     from quack.cute_dsl_utils import (  # pyrefly: ignore [missing-import]
+    -         torch2cute_dtype_map,
+    -     )
+224 +     from quack.cute_dsl_utils import torch2cute_dtype_map  # pyrefly: ignore [missing-import]
+225 |     from quack.rmsnorm import _compile_rmsnorm_fwd  # pyrefly: ignore [missing-import]
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> benchmarks\cute\compare_rmsnorm_backends.py:279:9
+    |
+277 |       elif args.impl == "quack-tuned":
+278 |           sys.path.insert(0, str(QUACK_PATH))
+279 | /         from quack.rmsnorm_config import (  # pyrefly: ignore [missing-import]
+280 | |             get_all_fwd_configs,
+281 | |         )
+282 | |         from triton.testing import do_bench
+    | |___________________________________________^
+283 |
+284 |           t0 = time.time()
+    |
+help: Organize imports
+    |
+278 |         sys.path.insert(0, str(QUACK_PATH))
+    -         from quack.rmsnorm_config import (  # pyrefly: ignore [missing-import]
+    -             get_all_fwd_configs,
+    -         )
+279 +         from quack.rmsnorm_config import get_all_fwd_configs  # pyrefly: ignore [missing-import]
+280 |         from triton.testing import do_bench
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> benchmarks\cute\compare_softmax_backends.py:209:9
+    |
+207 |       elif args.impl == "quack":
+208 |           sys.path.insert(0, str(QUACK_PATH))
+209 | /         from quack.cute_dsl_utils import (  # pyrefly: ignore [missing-import]
+210 | |             torch2cute_dtype_map,
+211 | |         )
+212 | |         from quack.softmax import (  # pyrefly: ignore [missing-import]
+213 | |             _compile_softmax_fwd,
+214 | |         )
+    | |_________^
+215 |
+216 |           cute_dtype = torch2cute_dtype_map[x.dtype]
+    |
+help: Organize imports
+    |
+208 |         sys.path.insert(0, str(QUACK_PATH))
+    -         from quack.cute_dsl_utils import (  # pyrefly: ignore [missing-import]
+    -             torch2cute_dtype_map,
+    -         )
+    -         from quack.softmax import (  # pyrefly: ignore [missing-import]
+    -             _compile_softmax_fwd,
+    -         )
+209 +         from quack.cute_dsl_utils import torch2cute_dtype_map  # pyrefly: ignore [missing-import]
+210 +         from quack.softmax import _compile_softmax_fwd  # pyrefly: ignore [missing-import]
+211 |
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+  --> benchmarks\rocm_utils.py:28:5
+   |
+26 |       """
+27 |       # TritonBench is an optional benchmark dependency, installed by the caller.
+28 | /     from tritonbench.components.do_bench.common import (  # pyrefly: ignore [missing-import]
+29 | |         summarize_statistics,
+30 | |     )
+31 | |     from tritonbench.components.do_bench.utils import (  # pyrefly: ignore [missing-import]
+32 | |         resolve_warmup_and_rep,
+33 | |     )
+   | |_____^
+34 |
+35 |       cache = (
+   |
+help: Organize imports
+   |
+27 |     # TritonBench is an optional benchmark dependency, installed by the caller.
+   -     from tritonbench.components.do_bench.common import (  # pyrefly: ignore [missing-import]
+   -         summarize_statistics,
+   -     )
+   -     from tritonbench.components.do_bench.utils import (  # pyrefly: ignore [missing-import]
+   -         resolve_warmup_and_rep,
+   -     )
+28 +     from tritonbench.components.do_bench.common import summarize_statistics  # pyrefly: ignore [missing-import]
+29 +     from tritonbench.components.do_bench.utils import resolve_warmup_and_rep  # pyrefly: ignore [missing-import]
+30 |
+   |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+    --> benchmarks\run.py:2213:9
+     |
+2211 |       check_and_setup_tritonbench()
+2212 |       if torch.version.hip is not None:
+2213 | /         from benchmarks.rocm_utils import do_bench_cudagraph_with_cache_clear
+2214 | |         from tritonbench.components.do_bench import (  # pyrefly: ignore [missing-import]
+2215 | |             run as bench_timers,
+2216 | |         )
+     | |_________^
+2217 |
+2218 |           bench_timers._do_bench_cudagraph_with_cache_clear = (
+     |
+help: Organize imports
+     |
+2213 |         from benchmarks.rocm_utils import do_bench_cudagraph_with_cache_clear
+     -         from tritonbench.components.do_bench import (  # pyrefly: ignore [missing-import]
+     -             run as bench_timers,
+     -         )
+2214 +         from tritonbench.components.do_bench import run as bench_timers  # pyrefly: ignore [missing-import]
+2215 |
+     |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+  --> examples\linear\example_mamba2_ssd.py:50:9
+   |
+48 |               sys.modules[m] = types.ModuleType(m)
+49 |       try:
+50 | /         from mamba_ssm.ops.triton.ssd_combined import (  # pyrefly: ignore[missing-import]
+51 | |             mamba_chunk_scan_combined,
+52 | |         )
+   | |_________^
+53 |       except ImportError:
+54 |           warnings.warn(
+   |
+help: Organize imports
+   |
+49 |     try:
+   -         from mamba_ssm.ops.triton.ssd_combined import (  # pyrefly: ignore[missing-import]
+   -             mamba_chunk_scan_combined,
+   -         )
+50 +         from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined  # pyrefly: ignore[missing-import]
+51 |     except ImportError:
+   |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+  --> examples\linear\linear_attention_fla.py:36:5
+   |
+35 |   try:
+36 | /     from fla.ops.delta_rule import chunk_delta_rule  # pyrefly: ignore[missing-import]
+37 | |     from fla.ops.gated_delta_rule import (  # pyrefly: ignore[missing-import]
+38 | |         chunk_gated_delta_rule,
+39 | |     )
+40 | |     from fla.ops.gla import chunk_gla  # pyrefly: ignore[missing-import]
+41 | |     from fla.ops.kda import chunk_kda  # pyrefly: ignore[missing-import]
+42 | |     from fla.ops.linear_attn import chunk_linear_attn  # pyrefly: ignore[missing-import]
+43 | |     from fla.ops.retention import chunk_retention  # pyrefly: ignore[missing-import]
+44 | |     from fla.ops.simple_gla import chunk_simple_gla  # pyrefly: ignore[missing-import]
+   | |___________________________________________________^
+45 |   except ImportError:
+46 |       pass
+   |
+help: Organize imports
+   |
+36 |     from fla.ops.delta_rule import chunk_delta_rule  # pyrefly: ignore[missing-import]
+   -     from fla.ops.gated_delta_rule import (  # pyrefly: ignore[missing-import]
+   -         chunk_gated_delta_rule,
+   -     )
+37 +     from fla.ops.gated_delta_rule import chunk_gated_delta_rule  # pyrefly: ignore[missing-import]
+38 |     from fla.ops.gla import chunk_gla  # pyrefly: ignore[missing-import]
+   |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> helion\_compat.py:573:9
+    |
+571 |   def _supports_mtia_tunables() -> bool:
+572 |       try:
+573 | /         from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
+574 | |             supports_mtia_tunables as _fb_supports_mtia,
+575 | |         )
+    | |_________^
+576 |
+577 |           return _fb_supports_mtia()
+    |
+help: Organize imports
+    |
+572 |     try:
+    -         from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
+    -             supports_mtia_tunables as _fb_supports_mtia,
+    -         )
+573 +         from .fb.mtia_tunables import supports_mtia_tunables as _fb_supports_mtia  # pyrefly: ignore [missing-import]
+574 |
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+  --> helion\_compiler\_inductor\template_buffer.py:1:1
+   |
+ 1 | / from __future__ import annotations
+ 2 | |
+ 3 | | import ast
+ 4 | | from contextlib import nullcontext
+ 5 | | import dataclasses
+ 6 | | import hashlib
+ 7 | | import logging
+ 8 | | from typing import TYPE_CHECKING
+ 9 | | from typing import cast
+10 | |
+11 | | import sympy
+12 | | import torch
+13 | | from torch._dynamo.testing import rand_strided
+14 | | from torch._dynamo.utils import ExactWeakKeyDictionary
+15 | | from torch._inductor.codecache import PyCodeCache
+16 | | from torch._inductor.ir import Buffer
+17 | | from torch._inductor.ir import FinalizeCodegenResult
+18 | | from torch._inductor.ir import IRNode
+19 | | from torch._inductor.ir import Layout
+20 | | from torch._inductor.ir import MultiOutputLayout
+21 | | from torch._inductor.ir import MutationOutput
+22 | | from torch._inductor.ir import ReinterpretView
+23 | | from torch._inductor.ir import TemplateBuffer
+24 | | from torch._inductor.ir import TensorBox
+25 | | from torch._inductor.lowering import clone
+26 | | from torch._inductor.lowering import register_lowering
+27 | | from torch._inductor.select_algorithm import AlgorithmSelectorCache
+28 | | from torch._inductor.select_algorithm import (
+29 | |     ExternalTritonTemplateKernel,  # pyrefly: ignore[missing-module-attribute]
+30 | | )
+31 | | from torch._inductor.select_algorithm import PartialRender
+32 | | from torch._inductor.utils import Placeholder
+33 | | from torch._inductor.utils import convert_shape_to_symint
+34 | | from torch._inductor.virtualized import V
+35 | | from torch.utils._ordered_set import OrderedSet
+36 | | import torch.utils._pytree as pytree
+37 | |
+38 | | from .._dynamo.higher_order_ops import _rebuild_container_args
+39 | | from .._dynamo.higher_order_ops import get_helion_kernel
+40 | | from .._dynamo.higher_order_ops import helion_kernel_wrapper_functional
+41 | | from .._dynamo.higher_order_ops import helion_kernel_wrapper_mutation
+42 | | from .._dynamo.variables import _HOST_SEMANTIC_FINGERPRINT
+43 | | from .._dynamo.variables import _HOST_SEMANTIC_INPUT_NORMALIZATION
+44 | | from .._dynamo.variables import _REQUIRES_ISOLATED_LOWERING
+45 | | from .._dynamo.variables import _get_flat_output
+46 | | from ..ast_extension import unparse
+47 | | from ..generate_ast import generate_ast
+48 | | from ..indexing_strategy import SubscriptIndexing
+49 | | from ..output_header import _active_library_imports
+50 | | from ..output_header import get_needed_import_lines
+51 | | from helion._compat import torch_uses_template_producer_fusion
+52 | | from helion.runtime.config import Config
+   | |________________________________________^
+53 |
+54 |   if TYPE_CHECKING:
+   |
+help: Organize imports
+   |
+27 | from torch._inductor.select_algorithm import AlgorithmSelectorCache
+   - from torch._inductor.select_algorithm import (
+   -     ExternalTritonTemplateKernel,  # pyrefly: ignore[missing-module-attribute]
+   - )
+28 + from torch._inductor.select_algorithm import ExternalTritonTemplateKernel  # pyrefly: ignore[missing-module-attribute]
+29 | from torch._inductor.select_algorithm import PartialRender
+   |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> helion\_compiler\autotuner_heuristics\cute.py:1:1
+    |
+  1 | / from __future__ import annotations
+  2 | |
+  3 | | import contextlib
+  4 | | from copy import deepcopy
+  5 | | from itertools import zip_longest
+  6 | | from typing import TYPE_CHECKING
+  7 | | from typing import Any
+  8 | | from typing import cast
+  9 | |
+ 10 | | import sympy
+ 11 | | import torch
+ 12 | | from torch._inductor.runtime.runtime_utils import next_power_of_2
+ 13 | | from torch._inductor.runtime.triton_heuristics import (
+ 14 | |     get_max_y_grid,  # type: ignore[import-untyped]
+ 15 | | )
+ 16 | |
+ 17 | | from ...autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
+ 18 | | from ...autotuner.config_spec import CUTE_AFFINE_SCAN_SCHEDULE_KEY
+ 19 | | from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
+ 20 | | from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
+ 21 | | from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
+ 22 | | from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
+ 23 | | from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_MMA_M_KEY
+ 24 | | from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_STAGES_KEY
+ 25 | | from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
+ 26 | | from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
+ 27 | | from ...autotuner.config_spec import get_valid_eviction_policies
+ 28 | | from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
+ 29 | | from ...language.memory_ops import load as language_load
+ 30 | | from ...language.scan_ops import _associative_scan
+ 31 | | from ...runtime.config import Config
+ 32 | | from ..compile_environment import ConfigValueExpression
+ 33 | | from ..compile_environment import FixedBlockSizeSource
+ 34 | | from ..compile_environment import _symint_sympy_expr
+ 35 | | from ..cute.cutedsl_compat import cp_async_supported
+ 36 | | from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
+ 37 | | from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
+ 38 | | from ..cute.grouped_full_coverage import FULL_COVERAGE_PIPELINES
+ 39 | | from ..cute.grouped_full_coverage import full_coverage_index_domain
+ 40 | | from ..cute.grouped_full_coverage import full_coverage_pipeline_supported
+ 41 | | from ..cute.grouped_full_coverage import full_coverage_smem_upper_bound
+ 42 | | from ..cute.grouped_row_union import PAIRED_CLC
+ 43 | | from ..cute.grouped_row_union import PAIRED_CLC_SCHEDULE
+ 44 | | from ..cute.grouped_row_union import SCHEDULE_KEY as GROUPED_ROW_UNION_SCHEDULE_KEY
+ 45 | | from ..cute.grouped_row_union import TRANSPOSED
+ 46 | | from ..cute.grouped_row_union import TRANSPOSED_SCHEDULE
+ 47 | | from ..cute.grouped_row_union import index_domain as row_union_index_domain
+ 48 | | from ..cute.grouped_row_union import resident_ctas_supported
+ 49 | | from ..cute.grouped_worklist_policy import GroupedBMajor
+ 50 | | from ..cute.grouped_worklist_policy import GroupedWorklistHardwareIdentity
+ 51 | | from ..cute.grouped_worklist_policy import get_grouped_worklist_target_policy
+ 52 | | from ..cute.grouped_worklist_policy import grouped_worklist_target_identities
+ 53 | | from ..cute.loop_nesting import sibling_row_loop_blocks
+ 54 | | from ..cute.loop_nesting import tile_loop_paths
+ 55 | | from ..cute.matmul_utils import cute_matmul_root_placements
+ 56 | | from ..cute.mma_support import cute_fp32_dot_uses_tf32
+ 57 | | from ..cute.packed_matmul import packed_axis_for_fact
+ 58 | | from ..cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
+ 59 | | from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+ 60 | | from ..cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
+ 61 | | from ..cute.strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
+ 62 | | from ..cute.strategies import Tcgen05PersistenceModel
+ 63 | | from ..cute.strategies import Tcgen05Strategy
+ 64 | | from ..cute.tcgen05_config import TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
+ 65 | | from ..cute.tcgen05_config import CuteTcgen05Config
+ 66 | | from ..cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
+ 67 | | from ..cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
+ 68 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY
+ 69 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE
+ 70 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL
+ 71 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
+ 72 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
+ 73 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
+ 74 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
+ 75 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS
+ 76 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY
+ 77 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS
+ 78 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
+ 79 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
+ 80 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+ 81 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
+ 82 | | from ..cute.tcgen05_constants import (
+ 83 | |     TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES,
+ 84 | | )
+ 85 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
+ 86 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+ 87 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+ 88 | | from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
+ 89 | | from ..cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
+ 90 | | from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+ 91 | | from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+ 92 | | from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+ 93 | | from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+ 94 | | from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+ 95 | | from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
+ 96 | | from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+ 97 | | from ..cute.tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
+ 98 | | from ..cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+ 99 | | from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
+100 | | from ..cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
+101 | | from .common import dedupe_configs
+102 | | from .common import is_canonical_row_reduction
+103 | | from .registry import AutotunerHeuristic
+    | |________________________________________^
+104 |
+105 |   if TYPE_CHECKING:
+    |
+help: Organize imports
+   |
+12 | from torch._inductor.runtime.runtime_utils import next_power_of_2
+   - from torch._inductor.runtime.triton_heuristics import (
+   -     get_max_y_grid,  # type: ignore[import-untyped]
+   - )
+13 + from torch._inductor.runtime.triton_heuristics import get_max_y_grid  # type: ignore[import-untyped]
+14 |
+   |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+  --> helion\_compiler\cute\block_scaled_runtime.py:9:1
+   |
+ 7 |   """
+ 8 |
+ 9 | / from __future__ import annotations
+10 | |
+11 | | from typing import cast
+12 | |
+13 | | from cuda.bindings.driver import (  # pyrefly: ignore [missing-import]
+14 | |     CUstream,  # noqa: TC002
+15 | | )
+16 | | import cutlass
+17 | | import cutlass.cute as cute
+18 | | from cutlass.cute.nvgpu import OperandMajorMode
+19 | | from cutlass.cute.nvgpu import cpasync
+20 | | from cutlass.cute.nvgpu import tcgen05
+21 | | from cutlass.cutlass_dsl import dsl_user_op
+22 | | import cutlass.pipeline as pipeline
+23 | | import cutlass.utils as utils
+24 | | from cutlass.utils import blackwell_helpers
+25 | | from cutlass.utils import blockscaled_layout
+26 | | from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
+27 | | from cutlass.utils.layout import LayoutEnum
+28 | |
+29 | | from .block_scaled_config import block_scaled_workspace_shape
+   | |_____________________________________________________________^
+help: Organize imports
+   |
+12 |
+   - from cuda.bindings.driver import (  # pyrefly: ignore [missing-import]
+   -     CUstream,  # noqa: TC002
+   - )
+13 + from cuda.bindings.driver import CUstream  # pyrefly: ignore [missing-import]  # noqa: TC002
+14 | import cutlass
+   |
+
+redefined-while-unused: [*] Redefinition of unused `torch` from line 11
+  --> helion\_compiler\cute\device_state.py:18:12
+   |
+16 |     from collections.abc import Sequence
+17 |
+18 |     import torch
+   |            ^^^^^ `torch` redefined here
+19 |     from torch.fx.node import Node
+   |
+  ::: helion\_compiler\cute\device_state.py:11:8
+   |
+ 9 | from typing import cast
+10 |
+11 | import torch
+   |        ----- previous definition of `torch` here
+12 |
+13 | from ... import exc
+   |
+help: Remove definition: `torch`
+   |
+17 |
+   -     import torch
+18 |     from torch.fx.node import Node
+   |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> helion\_compiler\cute\fx_matcher.py:140:5
+    |
+138 |       """Prove one physical CUDA XYZ launch fits each architectural dimension."""
+139 |
+140 | /     from torch._inductor.runtime.triton_heuristics import (  # type: ignore[import-untyped]
+141 | |         get_max_y_grid,
+142 | |     )
+    | |_____^
+143 |
+144 |       if len(extents) != 3:
+    |
+help: Organize imports
+    |
+139 |
+    -     from torch._inductor.runtime.triton_heuristics import (  # type: ignore[import-untyped]
+    -         get_max_y_grid,
+    -     )
+140 +     from torch._inductor.runtime.triton_heuristics import get_max_y_grid  # type: ignore[import-untyped]
+141 |
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+  --> helion\language\loops.py:1:1
+   |
+ 1 | / from __future__ import annotations
+ 2 | |
+ 3 | | import ast
+ 4 | | import builtins
+ 5 | | import inspect
+ 6 | | import itertools
+ 7 | | from itertools import starmap
+ 8 | | from typing import TYPE_CHECKING
+ 9 | | from typing import Iterator
+10 | | from typing import Sequence
+11 | | from typing import TypeGuard
+12 | | from typing import cast
+13 | | from typing import overload
+14 | |
+15 | | import torch
+16 | | from torch._inductor.runtime.triton_heuristics import (
+17 | |     get_max_y_grid,  # type: ignore[import-untyped]
+18 | | )
+19 | |
+20 | | from .. import exc
+21 | | from .._compat import use_tileir_tunables
+22 | | from .._compiler.ast_extension import ExtendedAST
+23 | | from .._compiler.ast_extension import LoopType
+24 | | from .._compiler.ast_extension import expr_from_string
+25 | | from .._compiler.compile_environment import CompileEnvironment
+26 | | from .._compiler.type_info import GridIndexType
+27 | | from .._compiler.type_info import IterType
+28 | | from .._compiler.type_info import JaggedTileIndexType
+29 | | from .._compiler.type_info import LiteralType
+30 | | from .._compiler.type_info import Origin
+31 | | from .._compiler.type_info import SequenceType
+32 | | from .._compiler.type_info import TensorType
+33 | | from .._compiler.type_info import TileIndexType
+34 | | from .._compiler.type_info import TypeInfo
+35 | | from .._compiler.variable_origin import GetItemOrigin
+36 | | from ..autotuner.config_spec import ConfigSpec
+37 | | from ..autotuner.config_spec import FlattenLoopSpec
+38 | | from ..autotuner.config_spec import L2GroupingSpec
+39 | | from ..autotuner.config_spec import LoopOrderSpec
+40 | | from ..autotuner.config_spec import RangeFlattenSpec
+41 | | from ..autotuner.config_spec import RangeMultiBufferSpec
+42 | | from ..autotuner.config_spec import RangeNumStagesSpec
+43 | | from ..autotuner.config_spec import RangeUnrollFactorSpec
+44 | | from ..autotuner.config_spec import RangeWarpSpecializeSpec
+45 | | from ..autotuner.config_spec import StaticRangeSpec
+46 | | from . import _decorators
+47 | | from .ref_tile import RefTile
+48 | | from .tile_proxy import Tile
+   | |____________________________^
+49 |
+50 |   if TYPE_CHECKING:
+   |
+help: Organize imports
+   |
+15 | import torch
+   - from torch._inductor.runtime.triton_heuristics import (
+   -     get_max_y_grid,  # type: ignore[import-untyped]
+   - )
+16 + from torch._inductor.runtime.triton_heuristics import get_max_y_grid  # type: ignore[import-untyped]
+17 |
+   |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> helion\runtime\pallas\launcher.py:670:13
+    |
+668 |       if not interpret:
+669 |           try:
+670 | /             from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+671 | |                 jax_placeholder,
+672 | |             )
+    | |_____________^
+673 |
+674 |               return jax_placeholder(t)
+    |
+help: Organize imports
+    |
+669 |         try:
+    -             from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+    -                 jax_placeholder,
+    -             )
+670 +             from torch_tpu._internal.pallas.pallas import jax_placeholder  # pyrefly: ignore[missing-import]
+671 |
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> helion\runtime\pallas\launcher.py:784:5
+    |
+782 |           return _HELION_STATIC_JAX_CALLABLE_CLASS
+783 |
+784 | /     from torch_tpu._internal.pallas import (  # pyrefly: ignore[missing-import]
+785 | |         tpu_torch_pallas,
+786 | |     )
+787 | |     from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+788 | |         JaxCallable,
+789 | |     )
+    | |_____^
+790 |
+791 |       class _HelionStaticJaxCallable(JaxCallable):  # type: ignore[misc, valid-type]
+    |
+help: Organize imports
+    |
+783 |
+    -     from torch_tpu._internal.pallas import (  # pyrefly: ignore[missing-import]
+    -         tpu_torch_pallas,
+    -     )
+    -     from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+    -         JaxCallable,
+    -     )
+784 +     from torch_tpu._internal.pallas import tpu_torch_pallas  # pyrefly: ignore[missing-import]
+785 +     from torch_tpu._internal.pallas.pallas import JaxCallable  # pyrefly: ignore[missing-import]
+786 |
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> helion\runtime\pallas\launcher.py:816:13
+    |
+814 |                   return result
+815 |
+816 | /             from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+817 | |                 _get_kernel_invocation_key,
+818 | |             )
+    | |_____________^
+819 |
+820 |               kernel_key = _get_kernel_invocation_key(
+    |
+help: Organize imports
+    |
+815 |
+    -             from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+    -                 _get_kernel_invocation_key,
+    -             )
+816 +             from torch_tpu._internal.pallas.pallas import _get_kernel_invocation_key  # pyrefly: ignore[missing-import]
+817 |
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+    --> helion\runtime\pallas\launcher.py:1337:13
+     |
+1335 |           # direct TorchTPU launch has no enclosing shard_map, so supply one.
+1336 |           if torch.distributed.is_initialized():
+1337 | /             from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+1338 | |                 get_default_pallas_mesh,
+1339 | |             )
+     | |_____________^
+1340 |
+1341 |               mesh = get_default_pallas_mesh()
+     |
+help: Organize imports
+     |
+1336 |         if torch.distributed.is_initialized():
+     -             from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+     -                 get_default_pallas_mesh,
+     -             )
+1337 +             from torch_tpu._internal.pallas.pallas import get_default_pallas_mesh  # pyrefly: ignore[missing-import]
+1338 |
+     |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+    --> helion\runtime\pallas\launcher.py:1448:5
+     |
+1446 |   def _ensure_torch_tpu_cpu_export_info() -> None:
+1447 |       """Expose the physical TPU target to a CPU-only JAX export trace."""
+1448 | /     from torch_tpu._internal.utils.hardware import (  # pyrefly: ignore[missing-import]
+1449 | |         get_tpu_device_name,
+1450 | |     )
+     | |_____^
+1451 |
+1452 |       _ensure_cpu_tpu_info(get_tpu_device_name())
+     |
+help: Organize imports
+     |
+1447 |     """Expose the physical TPU target to a CPU-only JAX export trace."""
+     -     from torch_tpu._internal.utils.hardware import (  # pyrefly: ignore[missing-import]
+     -         get_tpu_device_name,
+     -     )
+1448 +     from torch_tpu._internal.utils.hardware import get_tpu_device_name  # pyrefly: ignore[missing-import]
+1449 |
+     |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+  --> pretuned_kernels\_bench.py:61:5
+   |
+59 |       a cudagraph kernel's ``main()`` (the nightly benchmark workflow does).
+60 |       """
+61 | /     from tritonbench.components.do_bench.run import (  # pyrefly: ignore[missing-import]
+62 | |         _do_bench_cudagraph_with_cache_clear,
+63 | |     )
+   | |_____^
+64 |
+65 |       return _do_bench_cudagraph_with_cache_clear(call, rep=rep, return_mode="median")
+   |
+help: Organize imports
+   |
+60 |     """
+   -     from tritonbench.components.do_bench.run import (  # pyrefly: ignore[missing-import]
+   -         _do_bench_cudagraph_with_cache_clear,
+   -     )
+61 +     from tritonbench.components.do_bench.run import _do_bench_cudagraph_with_cache_clear  # pyrefly: ignore[missing-import]
+62 |
+   |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> pretuned_kernels\megakernels\flash_mla\flash_mla.py:576:9
+    |
+574 |       """Whether vLLM's production FlashInfer MLA dependency is importable."""
+575 |       try:
+576 | /         from flashinfer.decode import (  # noqa: F401
+577 | |             trtllm_batch_decode_with_kv_cache_mla,
+578 | |         )
+579 | |         from vllm.v1.attention.backends.mla.flashinfer_mla import (  # noqa: F401
+580 | |             _get_workspace_buffer,
+581 | |         )
+    | |_________^
+582 |       except ImportError:
+583 |           return False
+    |
+help: Organize imports
+    |
+575 |     try:
+    -         from flashinfer.decode import (  # noqa: F401
+    -             trtllm_batch_decode_with_kv_cache_mla,
+    -         )
+    -         from vllm.v1.attention.backends.mla.flashinfer_mla import (  # noqa: F401
+    -             _get_workspace_buffer,
+    -         )
+576 +         from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla  # noqa: F401
+577 +         from vllm.v1.attention.backends.mla.flashinfer_mla import _get_workspace_buffer  # noqa: F401
+578 |     except ImportError:
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+   --> pretuned_kernels\megakernels\gpt_oss_moe\gpt_oss_moe.py:448:9
+    |
+446 |       """Whether vLLM's production Blackwell GPT-OSS backend is importable."""
+447 |       try:
+448 | /         from flashinfer import trtllm_fp4_block_scale_moe  # noqa: F401
+449 | |         from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (  # noqa: F401
+450 | |             Mxfp4MoeBackend,
+451 | |         )
+    | |_________^
+452 |       except ImportError:
+453 |           return False
+    |
+help: Organize imports
+    |
+448 |         from flashinfer import trtllm_fp4_block_scale_moe  # noqa: F401
+    -         from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (  # noqa: F401
+    -             Mxfp4MoeBackend,
+    -         )
+449 +         from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend  # noqa: F401
+450 |     except ImportError:
+    |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+    --> test\test_pallas.py:3901:9
+     |
+3899 |               return best
+3900 |
+3901 | /         from torch_tpu._internal.sync import (  # pyrefly: ignore[missing-import]
+3902 | |             synchronize as tpu_sync,
+3903 | |         )
+     | |_________^
+3904 |
+3905 |           device_sync_ms = best_ms(lambda out: synchronize_device())
+     |
+help: Organize imports
+     |
+3900 |
+     -         from torch_tpu._internal.sync import (  # pyrefly: ignore[missing-import]
+     -             synchronize as tpu_sync,
+     -         )
+3901 +         from torch_tpu._internal.sync import synchronize as tpu_sync  # pyrefly: ignore[missing-import]
+3902 |
+     |
+
+unsorted-imports: [*] Import block is un-sorted or un-formatted
+    --> test\test_remote_copy.py:1799:5
+     |
+1797 |       import torch.multiprocessing as mp
+1798 |       import torch_tpu  # pyrefly: ignore[missing-import]  # noqa: F401  # isort: skip
+1799 | /     from torch.tpu import (
+1800 | |         distributed as tt_distributed,  # pyrefly: ignore[missing-import]
+1801 | |     )
+     | |_____^
+1802 |
+1803 |       world_size = 2
+     |
+help: Organize imports
+     |
+1798 |     import torch_tpu  # pyrefly: ignore[missing-import]  # noqa: F401  # isort: skip
+     -     from torch.tpu import (
+     -         distributed as tt_distributed,  # pyrefly: ignore[missing-import]
+     -     )
+1799 +     from torch.tpu import distributed as tt_distributed  # pyrefly: ignore[missing-import]
+1800 |
+     |
+
+Found 32 errors.
+[*] 32 fixable with the `--fix` option.

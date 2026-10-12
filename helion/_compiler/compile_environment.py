@@ -7,6 +7,7 @@ import contextvars
 import dataclasses
 import logging
 import math
+import os
 import sys
 import threading
 import types
@@ -41,6 +42,7 @@ from .._compat import target_device_capability
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import BackendState
+from .backend_registry import find_backend_for_device
 from .backend_registry import get_backend_class
 from .source_location import SourceLocation
 from .source_location import current_location
@@ -440,7 +442,24 @@ class CompileEnvironment:
         )
         self._is_distributed = is_distributed
         self.process_group_name = None
-        self._backend = get_backend_class(settings.backend)()
+        backend_name = settings.backend
+        # Device routing: when the backend is the default ('triton', i.e. the
+        # user did not set HELION_BACKEND) and it does not declare the active
+        # device type while another registered backend does, use that backend
+        # instead.  An explicit HELION_BACKEND=<name> (including
+        # HELION_BACKEND=triton) is always honored unchanged.
+        if backend_name == "triton" and not os.environ.get("HELION_BACKEND"):
+            routed = find_backend_for_device(device.type)
+            if routed not in (None, backend_name):
+                log.info(
+                    "Device %s: using the '%s' backend (the default '%s' "
+                    "backend does not target this device)",
+                    device.type,
+                    routed,
+                    backend_name,
+                )
+                backend_name = routed
+        self._backend = get_backend_class(backend_name)()
         self._backend.validate_environment()
         if (
             settings.debug_dtype_asserts

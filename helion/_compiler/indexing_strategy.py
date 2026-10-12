@@ -1033,6 +1033,14 @@ class PointerIndexingStrategy(IndexingStrategy):
             offset_ast = expr_from_string(
                 f"tl.max_contiguous({{off}}, {contiguity!r})", off=inner_ast
             )
+        if indexing.has_mask():
+            backend = CompileEnvironment.current().backend
+            if backend.clamp_masked_pointer_offsets():
+                offset_ast = expr_from_string(
+                    "tl.where({mask}, {off}, 0)",
+                    mask=indexing.mask_expr,
+                    off=offset_ast,
+                )
         extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
         extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
         load_placeholders: dict[str, ast.AST] = {
@@ -1105,10 +1113,23 @@ class PointerIndexingStrategy(IndexingStrategy):
         ):
             value = expr_from_string(backend.reshape_expr("{value}", "[]"), value=value)
 
+        offset_expr = indexing.index_expr
+        # If dimensions need broadcasting for store, broadcast the pointer
+        if indexing.needs_broadcast():
+            shape_str = state.tile_strategy.shape_str(output_size)
+            broadcast = backend.broadcast_to_expr("{offset}", shape_str)
+            offset_expr = expr_from_string(broadcast, offset=offset_expr)
+        if indexing.has_mask() and backend.clamp_masked_pointer_offsets():
+            offset_expr = expr_from_string(
+                "tl.where({mask}, {off}, 0)",
+                mask=indexing.mask_expr,
+                off=offset_expr,
+            )
+
         extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
         store_placeholders: dict[str, ast.AST] = {
             "value": value,
-            "offset": indexing.broadcast_offset(state, output_size),
+            "offset": offset_expr,
             "mask": indexing.mask_expr,
         }
         if cache_modifier is not None:
@@ -1131,10 +1152,17 @@ class PointerIndexingStrategy(IndexingStrategy):
             state, fake_tensor, subscript, for_store=True
         )
         name = state.device_function.tensor_arg(fake_tensor).name
-        output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+        offset_expr = indexing.index_expr
+        backend = CompileEnvironment.current().backend
+        if indexing.has_mask() and backend.clamp_masked_pointer_offsets():
+            offset_expr = expr_from_string(
+                "tl.where({mask}, {off}, 0)",
+                mask=indexing.mask_expr,
+                off=offset_expr,
+            )
         return expr_from_string(
             f"tl.{op}({name} + {{offset}}, {{value}}, mask={{mask}}, sem={{sem}})",
-            offset=indexing.broadcast_offset(state, output_size),
+            offset=offset_expr,
             value=value,
             mask=indexing.mask_expr,
             sem=sem,

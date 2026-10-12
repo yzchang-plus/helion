@@ -1,0 +1,133 @@
+root@node73-144:/home/cyz/helion# cat backend-generic-mechanisms-fixes-round4.patch 
+diff --git a/helion/_compiler/cute/cute_mma.py b/helion/_compiler/cute/cute_mma.py
+index 6388edb3..63767c8e 100644
+--- a/helion/_compiler/cute/cute_mma.py
++++ b/helion/_compiler/cute/cute_mma.py
+@@ -8640,8 +8640,9 @@ def _emit_mma_pipeline(
+     tcgen05_ab_stage_count_value = _tcgen05_config_int(
+         df.config,
+         "tcgen05_ab_stages",
+-        # CuTe configs always pin num_stages; deferral (None) is not a CuTe
+-        # concept.
++        # CuTe configs always pin num_stages; a config that defers (None)
++        # fails loudly at the arithmetic below rather than silently
++        # miscompiling.
+         _tcgen05_ab_stage_count(cast("int", df.config.num_stages)),
+     )
+     tcgen05_c_stage_count_value = _tcgen05_config_int(
+diff --git a/helion/_compiler/tile_strategy.py b/helion/_compiler/tile_strategy.py
+index 3681985d..4b4b7347 100644
+--- a/helion/_compiler/tile_strategy.py
++++ b/helion/_compiler/tile_strategy.py
+@@ -7360,9 +7360,10 @@ class TileStrategy:
+         range_num_stages = env.config_spec.range_num_stages.config_get(
+             config.range_num_stages, block_idx, 0
+         )
+-        # Triton configs always pin num_stages (the search space includes it);
+-        # deferral (None) never reaches codegen.
+-        num_stages = cast("int", config.num_stages)
++        # A deferred num_stages (None) is unknown at codegen time — the
++        # triton driver picks it — and its default is multi-stage, so the
++        # descriptor/unroll refinement below treats it conservatively as > 1.
++        num_stages = config.num_stages
+ 
+         if indexing_uses_tensor_descriptor(
+             config.indexing
+@@ -7375,7 +7376,7 @@ class TileStrategy:
+                 range_num_stages = 0
+             # Host construction has not established that descriptor indexing
+             # is safe with both unrolling and a separate kernel-level pipeline.
+-            if range_unroll_factor > 0 and num_stages > 1:
++            if range_unroll_factor > 0 and (num_stages is None or num_stages > 1):
+                 range_unroll_factor = 0
+         elif (
+             range_num_stages > 1
+diff --git a/helion/_compiler/triton/distributed_ops.py b/helion/_compiler/triton/distributed_ops.py
+index c4fab43c..3e738ca4 100644
+--- a/helion/_compiler/triton/distributed_ops.py
++++ b/helion/_compiler/triton/distributed_ops.py
+@@ -5,7 +5,6 @@ from __future__ import annotations
+ import ast
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING
+-from typing import cast
+ 
+ import torch
+ from torch.fx.experimental.symbolic_shapes import guard_int
+@@ -750,9 +749,13 @@ def _poll_pack(state: CodegenState, output_size: list[int | torch.SymInt]) -> in
+         if not isinstance(size, int):
+             return 1
+         numel *= size
+-    # Triton configs always pin num_warps (the search space includes it);
+-    # deferral (None) never reaches codegen.
+-    threads = 32 * cast("int", state.config.num_warps)
++    # A deferred num_warps (None) follows the triton driver's own default for
++    # this launch-width heuristic; the property already falls back to the
++    # default for absent keys.
++    from ...autotuner.config_spec import DEFAULT_NUM_WARPS
++
++    num_warps = state.config.num_warps
++    threads = 32 * (DEFAULT_NUM_WARPS if num_warps is None else num_warps)
+     return 4 if numel >= 4 * threads else 2 if numel >= 2 * threads else 1
+ 
+ 
+diff --git a/helion/runtime/config.py b/helion/runtime/config.py
+index 8b7e3950..a15ce56e 100644
+--- a/helion/runtime/config.py
++++ b/helion/runtime/config.py
+@@ -34,8 +34,9 @@ MaxnregLiteral = int | None
+ # Constructor sentinel distinguishing "not passed" from an explicit None for
+ # num_warps/num_stages: None there defers the choice to the backend's driver,
+ # while every other core property treats an omitted/None argument as "unset".
+-# Mirrors _TARGET_DEVICE_CAPABILITY_UNSET in autotuner/config_spec.py.
+-_NUM_THREADS_UNSET = object()
++# Typed as int so the parameters stay `int | None` (an `| object` union would
++# collapse to object and disable checking); identity comparison still works.
++_NUM_THREADS_UNSET = cast("int", object())
+ 
+ 
+ class Config(Mapping[str, object]):
+@@ -82,8 +83,8 @@ class Config(Mapping[str, object]):
+         cute_packet_prefetch: int | None = None,
+         cute_reduction_pipeline_depth: int | None = None,
+         cute_host_paired_sum: CuteHostPairedSumLiteral | None = None,
+-        num_warps: int | object | None = _NUM_THREADS_UNSET,
+-        num_stages: int | object | None = _NUM_THREADS_UNSET,
++        num_warps: int | None = _NUM_THREADS_UNSET,
++        num_stages: int | None = _NUM_THREADS_UNSET,
+         pid_type: PidTypeLiteral | None = None,
+         cross_loop_pipeline: CrossLoopPipelineLiteral | None = None,
+         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
+diff --git a/test/test_backend_registry.py b/test/test_backend_registry.py
+index 18d1381c..bb843497 100644
+--- a/test/test_backend_registry.py
++++ b/test/test_backend_registry.py
+@@ -102,7 +102,7 @@ class TestBackendRegistry(unittest.TestCase):
+             def name(self) -> str:
+                 return "_test_routed"
+ 
+-            device_types = ("helion_test_device",)
++            device_types = frozenset({"helion_test_device"})
+ 
+             def dtype_str(self, dtype: object) -> str:
+                 return ""
+diff --git a/test/test_inline_constexpr_hook.py b/test/test_inline_constexpr_hook.py
+index e8b142f9..42523aec 100644
+--- a/test/test_inline_constexpr_hook.py
++++ b/test/test_inline_constexpr_hook.py
+@@ -7,6 +7,7 @@ from unittest.mock import patch
+ import torch
+ 
+ import helion
++from helion._testing import onlyBackends
+ import helion.language as hl
+ from helion.runtime.config import Config
+ 
+@@ -39,6 +40,7 @@ def _passed_names(call: ast.Call) -> list[str]:
+     return [arg.id for arg in call.args if isinstance(arg, ast.Name)]
+ 
+ 
++@onlyBackends(["triton"])
+ class TestInlineConstexprHookGating(unittest.TestCase):
+     """inline_constexpr_at_module_level() must gate def and call sides together.
+ 
