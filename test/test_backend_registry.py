@@ -103,7 +103,7 @@ class TestBackendRegistry(unittest.TestCase):
             def name(self) -> str:
                 return "_test_routed"
 
-            device_types = ("helion_test_device",)
+            device_types = frozenset({"helion_test_device"})
 
             def dtype_str(self, dtype: object) -> str:
                 return ""

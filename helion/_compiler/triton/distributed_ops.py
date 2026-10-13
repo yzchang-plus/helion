@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-from typing import cast
 
 import torch
 from torch.fx.experimental.symbolic_shapes import guard_int
@@ -1063,9 +1062,13 @@ def _poll_pack(
             return 1
         numel *= size
     numel //= lanes
-    # Triton configs always pin num_warps (the search space includes it);
-    # deferral (None) never reaches codegen.
-    threads = 32 * cast("int", state.config.num_warps)
+    # A deferred num_warps (None) follows the triton driver's own default for
+    # this launch-width heuristic; the property already falls back to the
+    # default for absent keys.
+    from ...autotuner.config_spec import DEFAULT_NUM_WARPS
+
+    num_warps = state.config.num_warps
+    threads = 32 * (DEFAULT_NUM_WARPS if num_warps is None else num_warps)
     return 4 if numel >= 4 * threads else 2 if numel >= 2 * threads else 1
 
 

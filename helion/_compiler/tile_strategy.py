@@ -8165,9 +8165,10 @@ class TileStrategy:
         range_num_stages = env.config_spec.range_num_stages.config_get(
             config.range_num_stages, block_idx, 0
         )
-        # Triton configs always pin num_stages (the search space includes it);
-        # deferral (None) never reaches codegen.
-        num_stages = cast("int", config.num_stages)
+        # A deferred num_stages (None) is unknown at codegen time — the
+        # triton driver picks it — and its default is multi-stage, so the
+        # descriptor/unroll refinement below treats it conservatively as > 1.
+        num_stages = config.num_stages
 
         if indexing_uses_tensor_descriptor(
             config.indexing
@@ -8180,7 +8181,7 @@ class TileStrategy:
                 range_num_stages = 0
             # Host construction has not established that descriptor indexing
             # is safe with both unrolling and a separate kernel-level pipeline.
-            if range_unroll_factor > 0 and num_stages > 1:
+            if range_unroll_factor > 0 and (num_stages is None or num_stages > 1):
                 range_unroll_factor = 0
         elif (
             range_num_stages > 1

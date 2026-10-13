@@ -8795,8 +8795,9 @@ def _emit_mma_pipeline(
     tcgen05_ab_stage_count_value = _tcgen05_config_int(
         df.config,
         "tcgen05_ab_stages",
-        # CuTe configs always pin num_stages; deferral (None) is not a CuTe
-        # concept.
+        # CuTe configs always pin num_stages; a config that defers (None)
+        # fails loudly at the arithmetic below rather than silently
+        # miscompiling.
         _tcgen05_ab_stage_count(cast("int", df.config.num_stages)),
     )
     tcgen05_c_stage_count_value = _tcgen05_config_int(

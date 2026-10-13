@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 import helion
+from helion._testing import onlyBackends
 import helion.language as hl
 from helion.runtime.config import Config
 
@@ -39,6 +40,7 @@ def _passed_names(call: ast.Call) -> list[str]:
     return [arg.id for arg in call.args if isinstance(arg, ast.Name)]
 
 
+@onlyBackends(["triton"])
 class TestInlineConstexprHookGating(unittest.TestCase):
     """inline_constexpr_at_module_level() must gate def and call sides together.
 

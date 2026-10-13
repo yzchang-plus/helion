@@ -34,8 +34,9 @@ MaxnregLiteral = int | None
 # Constructor sentinel distinguishing "not passed" from an explicit None for
 # num_warps/num_stages: None there defers the choice to the backend's driver,
 # while every other core property treats an omitted/None argument as "unset".
-# Mirrors _TARGET_DEVICE_CAPABILITY_UNSET in autotuner/config_spec.py.
-_NUM_THREADS_UNSET = object()
+# Typed as int so the parameters stay `int | None` (an `| object` union would
+# collapse to object and disable checking); identity comparison still works.
+_NUM_THREADS_UNSET = cast("int", object())
 
 
 class Config(Mapping[str, object]):
@@ -83,8 +84,8 @@ class Config(Mapping[str, object]):
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
         cute_host_paired_sum: CuteHostPairedSumLiteral | None = None,
-        num_warps: int | object | None = _NUM_THREADS_UNSET,
-        num_stages: int | object | None = _NUM_THREADS_UNSET,
+        num_warps: int | None = _NUM_THREADS_UNSET,
+        num_stages: int | None = _NUM_THREADS_UNSET,
         pid_type: PidTypeLiteral | None = None,
         cross_loop_pipeline: CrossLoopPipelineLiteral | None = None,
         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
