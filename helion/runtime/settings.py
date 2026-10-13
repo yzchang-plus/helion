@@ -1021,6 +1021,11 @@ class Settings(_Settings):
 
     def __setattr__(self, name: str, value: object) -> None:
         super().__setattr__(name, value)
+        if name == "backend" and "_backend_explicit" in self.__dict__:
+            # Direct assignment is an explicit user choice (the initial
+            # dataclass write precede creation of the flag; copy() fixes up
+            # the replace()-based path separately).
+            self._backend_explicit = True
         if (
             name in CUTE_STRUCTURAL_SETTINGS
             and "_cute_structural_origins" in self.__dict__

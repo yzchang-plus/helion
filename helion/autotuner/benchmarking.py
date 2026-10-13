@@ -18,7 +18,7 @@ from typing import cast
 
 import torch
 
-from .._compat import _driver_flush_cache
+from .._compat import make_cache_clearer
 from .._compat import safe_clear_cache
 from ..runtime.settings import _env_get_bool
 from ..runtime.settings import is_pallas_interpret
@@ -82,21 +82,13 @@ def _make_l2_cache_clearer() -> Callable[[], None]:
     from triton import runtime
 
     active = runtime.driver.active  # type: ignore[attr-defined]
-    if not hasattr(active, "clear_cache") or not hasattr(
-        active, "get_empty_cache_for_benchmark"
-    ):
-        # Out-of-tree triton drivers may lack the cache-clear primitive; skip
-        # the flush there (same contract as safe_clear_cache()).
+    # Shared probe/buffer with safe_clear_cache() (see make_cache_clearer):
+    # one capability contract, one eagerly-allocated buffer. Out-of-tree
+    # triton drivers without the primitive get the same no-op.
+    clearer = make_cache_clearer(active)
+    if clearer is None:
         return lambda: None
-    # Allocate eagerly (before any timed loop) through the shared per-(driver,
-    # device) cache so this path and safe_clear_cache() use one buffer instead
-    # of keeping two ~256MB allocations alive.
-    _driver_flush_cache(active)
-
-    def clear() -> None:
-        active.clear_cache(_driver_flush_cache(active))  # type: ignore[attr-defined]
-
-    return clear
+    return clearer
 
 
 def _cudagraph_unavailable_reason() -> str | None:

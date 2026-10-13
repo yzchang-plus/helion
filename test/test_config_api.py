@@ -867,6 +867,26 @@ class TestConfigAPI(TestCase):
 
         self.assertEqual(backend.effective_num_warps(config), 4)
 
+    def test_explicit_none_defers_num_warps_and_num_stages(self) -> None:
+        # An explicit None defers the choice to the backend's driver; it must
+        # survive the constructor and the to_json/from_json round-trip the
+        # autotune caches use (a dropped null would silently become the
+        # default and change behavior on cache reload).
+        config = helion.Config(num_warps=None, num_stages=None)
+        self.assertIsNone(config.num_warps)
+        self.assertIsNone(config.num_stages)
+        reloaded = helion.Config.from_json(config.to_json())
+        self.assertIsNone(reloaded.num_warps)
+        self.assertIsNone(reloaded.num_stages)
+
+        # Absence (argument not given) still falls back to the defaults.
+        from helion.autotuner.config_spec import DEFAULT_NUM_STAGES
+        from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
+
+        default_config = helion.Config()
+        self.assertEqual(default_config.num_warps, DEFAULT_NUM_WARPS)
+        self.assertEqual(default_config.num_stages, DEFAULT_NUM_STAGES)
+
     def test_mapping_behavior_len_iter_dict_roundtrip(self) -> None:
         data = {
             "block_sizes": [64, 32],
@@ -975,6 +995,24 @@ class TestConfigAPI(TestCase):
 
 @onlyBackends(["triton", "cute"])
 class TestSettingsEnv(TestCase):
+    def test_backend_explicit_semantics_across_construction_paths(self) -> None:
+        # Only a genuine user choice marks the backend explicit: a keyword,
+        # or a direct assignment after construction. A plain default-constructed
+        # Settings (and copies of it) stays implicit so device routing may
+        # pick a backend that declares the active device type.
+        self.assertFalse(helion.Settings()._backend_explicit)
+        self.assertTrue(helion.Settings(backend="triton")._backend_explicit)
+
+        assigned = helion.Settings()
+        assigned.backend = "triton"
+        self.assertTrue(assigned._backend_explicit)
+
+        # copy() goes through dataclasses.replace, which feeds every field
+        # back through __init__; only an overridden "backend" is explicit.
+        self.assertFalse(helion.Settings().copy()._backend_explicit)
+        self.assertTrue(helion.Settings(backend="triton").copy()._backend_explicit)
+        self.assertTrue(helion.Settings().copy(backend="triton")._backend_explicit)
+
     def test_persistent_reserved_sms_env_var(self) -> None:
         with patch.dict(
             os.environ,

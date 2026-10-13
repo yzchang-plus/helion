@@ -659,6 +659,17 @@ class _BenchmarkCacheDriver(Protocol):
 _flush_cache_state: list[tuple[object, object, object]] = []
 
 
+def _current_flush_device(driver: object) -> object:
+    # Prefer the driver's own notion of the current device: it tracks
+    # non-CUDA accelerators too, while torch's CUDA query is unavailable on
+    # CUDA-less machines and would collapse the per-(driver, device) keying
+    # to a single slot.
+    get_current_device = getattr(driver, "get_current_device", None)
+    if get_current_device is not None:
+        return get_current_device()
+    return torch.cuda.current_device() if torch.cuda.is_available() else None
+
+
 def _driver_flush_cache(driver: object) -> object:
     """Allocate the flush buffer once per (driver, device), not per iteration.
 
@@ -669,7 +680,7 @@ def _driver_flush_cache(driver: object) -> object:
     is only used for benchmarking anyway); switching drivers or devices
     reallocates.
     """
-    device = torch.cuda.current_device() if torch.cuda.is_available() else None
+    device = _current_flush_device(driver)
     if (
         not _flush_cache_state
         or _flush_cache_state[0][0] is not driver
@@ -682,6 +693,28 @@ def _driver_flush_cache(driver: object) -> object:
             (driver, device, cache_driver.get_empty_cache_for_benchmark())
         ]
     return _flush_cache_state[0][2]
+
+
+def make_cache_clearer(driver: object) -> Callable[[], None] | None:
+    """Bind an L2-flush callable to ``driver``, or return None without the primitives.
+
+    This is the single driver-capability probe for the L2 flush: both
+    ``safe_clear_cache()`` and the autotuner's benchmark paths go through it,
+    so a driver is judged by one contract. The flush buffer is allocated
+    eagerly (at binding time, before any timed loop) through the shared
+    per-(driver, device) slot, so the first flush never pays the allocation
+    inside a timed window and all callers share one buffer.
+    """
+    if not hasattr(driver, "clear_cache") or not hasattr(
+        driver, "get_empty_cache_for_benchmark"
+    ):
+        return None
+    _driver_flush_cache(driver)
+
+    def clear() -> None:
+        cast("_BenchmarkCacheDriver", driver).clear_cache(_driver_flush_cache(driver))
+
+    return clear
 
 
 def safe_clear_cache() -> None:
@@ -699,15 +732,13 @@ def safe_clear_cache() -> None:
         from triton import runtime
 
         driver = runtime.driver.active
-        if not hasattr(driver, "clear_cache") or not hasattr(
-            driver, "get_empty_cache_for_benchmark"
-        ):
-            return
     except (ImportError, AttributeError, RuntimeError):
         # Triton missing, or its driver cannot be resolved: benchmarking
         # proceeds without the L2 flush.
         return
-    driver.clear_cache(_driver_flush_cache(driver))
+    clearer = make_cache_clearer(driver)
+    if clearer is not None:
+        clearer()
 
 
 def fp8_block_ptr_padding_broken() -> bool:

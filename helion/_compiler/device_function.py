@@ -2320,8 +2320,14 @@ class DeviceFunction:
         tensor_host_args: list[str] = []
         arg_objects: list[Argument] = []
         for arg in self.sorted_args():
-            # Skip constexpr args that are inlined at module level
-            if isinstance(arg, ConstExprArg) and _is_literal_constexpr(arg):
+            # Skip constexpr args that are inlined at module level — but only
+            # when the backend actually inlines them; otherwise they stay
+            # kernel parameters (codegen_function_def) and must be passed.
+            if (
+                backend.inline_constexpr_at_module_level()
+                and isinstance(arg, ConstExprArg)
+                and _is_literal_constexpr(arg)
+            ):
                 continue
             if isinstance(arg, ConstExprArg) and arg.name in self._constexpr_host_defs:
                 host_arg = arg.name
@@ -2489,12 +2495,18 @@ class DeviceFunction:
             self.triton_outlined_helper_constexprs[name] = int(
                 environment.block_sizes[block_id].from_config_assert(self.config)
             )
+        # Literal constexpr args are satisfied by the module-level constants
+        # that codegen_function_def inlines — but only when the backend inlines
+        # them; otherwise they must stay helper parameters so the call site
+        # passes them from the kernel's scope.
         argument_names = [
             argument.name
             for argument in self.arguments
             if argument.name in reads
             and not (
-                isinstance(argument, ConstExprArg) and _is_literal_constexpr(argument)
+                environment.backend.inline_constexpr_at_module_level()
+                and isinstance(argument, ConstExprArg)
+                and _is_literal_constexpr(argument)
             )
         ]
         argument_names.extend(

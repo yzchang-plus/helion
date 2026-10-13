@@ -14,6 +14,7 @@ from helion._compiler.backend import Backend
 from helion._compiler.backend import BackendState
 from helion._compiler.backend_registry import _REGISTRY
 from helion._compiler.backend_registry import all_reserved_launch_param_names
+from helion._compiler.backend_registry import find_backend_for_device
 from helion._compiler.backend_registry import get_backend_class
 from helion._compiler.backend_registry import list_backends
 from helion._compiler.backend_registry import register_compiler_backend
@@ -95,6 +96,47 @@ class TestBackendRegistry(unittest.TestCase):
             self.assertIs(_TestBackend().state, BackendState.EXPERIMENTAL)
         finally:
             _REGISTRY.pop("_test_custom", None)
+
+    def test_find_backend_for_device_routes_declared_types(self) -> None:
+        class _RoutedBackend(Backend):
+            @property
+            def name(self) -> str:
+                return "_test_routed"
+
+            device_types = ("helion_test_device",)
+
+            def dtype_str(self, dtype: object) -> str:
+                return ""
+
+            def acc_type(self, dtype: object) -> str:
+                return ""
+
+            @property
+            def default_launcher_name(self) -> str:
+                return ""
+
+            @property
+            def constexpr_type(self) -> str:
+                return ""
+
+            @property
+            def function_decorator(self) -> str:
+                return ""
+
+            @property
+            def library_imports(self) -> dict[str, str]:
+                return {}
+
+        register_compiler_backend(_RoutedBackend)
+        try:
+            # A backend only participates in routing when it declares the
+            # device type; backends without a declaration never match.
+            self.assertEqual(
+                find_backend_for_device("helion_test_device"), "_test_routed"
+            )
+            self.assertIsNone(find_backend_for_device("cpu"))
+        finally:
+            _REGISTRY.pop("_test_routed", None)
 
     def test_all_reserved_launch_param_names_is_union(self) -> None:
         result = all_reserved_launch_param_names()
