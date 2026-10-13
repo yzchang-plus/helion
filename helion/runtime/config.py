@@ -394,16 +394,18 @@ class Config(Mapping[str, object]):
         return cast("list[int | None]", self.config.get("reduction_loops", []))
 
     @property
-    def num_warps(self) -> int:
+    def num_warps(self) -> int | None:
+        """Warp count, or None to defer the choice to the backend's driver."""
         from ..autotuner.config_spec import DEFAULT_NUM_WARPS
 
-        return cast("int", self.config.get("num_warps", DEFAULT_NUM_WARPS))
+        return cast("int | None", self.config.get("num_warps", DEFAULT_NUM_WARPS))
 
     @property
-    def num_stages(self) -> int:
+    def num_stages(self) -> int | None:
+        """Pipeline depth, or None to defer the choice to the backend's driver."""
         from ..autotuner.config_spec import DEFAULT_NUM_STAGES
 
-        return cast("int", self.config.get("num_stages", DEFAULT_NUM_STAGES))
+        return cast("int | None", self.config.get("num_stages", DEFAULT_NUM_STAGES))
 
     @property
     def l2_groupings(self) -> list[int]:

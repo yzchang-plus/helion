@@ -464,6 +464,10 @@ class CompileEnvironment:
                     backend_name,
                 )
                 backend_name = routed
+        # Note: only self._backend is routed; settings.backend keeps the
+        # user-facing value ('triton'). Host-side readers of settings.backend
+        # (cache keys, backend-specific feature checks) see the unrouted
+        # value by design — routing only picks the code generator.
         self._backend = get_backend_class(backend_name)()
         self._backend.validate_environment()
         if (

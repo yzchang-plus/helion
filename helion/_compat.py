@@ -651,26 +651,37 @@ class _BenchmarkCacheDriver(Protocol):
     def get_empty_cache_for_benchmark(self) -> object: ...
 
 
-# (driver, buffer) pair so the flush buffer is allocated once per driver
-# instead of on every timed iteration. Identity-compared rather than dict-keyed
-# because driver objects (and test doubles) may be unhashable.
-_flush_cache_state: list[tuple[object, object]] = []
+# (driver, device, buffer) triple so the flush buffer is allocated once per
+# (driver, device) instead of on every timed iteration. The driver is
+# identity-compared rather than dict-keyed (driver objects and test doubles
+# may be unhashable), and the buffer is reallocated on device change because
+# ``get_empty_cache_for_benchmark()`` allocates on the current device.
+_flush_cache_state: list[tuple[object, object, object]] = []
 
 
 def _driver_flush_cache(driver: object) -> object:
-    """Allocate the flush buffer once per driver, not per timed iteration.
+    """Allocate the flush buffer once per (driver, device), not per iteration.
 
-    ``get_empty_cache_for_benchmark()`` allocates a large buffer; allocating it
-    on every call would pay the first allocation inside a timed estimate loop.
-    The buffer stays alive for the process lifetime (it is only used for
-    benchmarking anyway), and a driver switch re-allocates.
+    ``get_empty_cache_for_benchmark()`` allocates a large buffer on the current
+    device; allocating it on every call would pay the first allocation inside
+    a timed estimate loop, and a single buffer shared across devices would
+    flush the wrong one. The buffer stays alive for the process lifetime (it
+    is only used for benchmarking anyway); switching drivers or devices
+    reallocates.
     """
-    if not _flush_cache_state or _flush_cache_state[0][0] is not driver:
+    device = torch.cuda.current_device() if torch.cuda.is_available() else None
+    if (
+        not _flush_cache_state
+        or _flush_cache_state[0][0] is not driver
+        or _flush_cache_state[0][1] != device
+    ):
         # The runtime driver object (triton's LazyProxy or a test double)
         # forwards attribute access; the Protocol is the structural contract.
         cache_driver = cast("_BenchmarkCacheDriver", driver)
-        _flush_cache_state[:] = [(driver, cache_driver.get_empty_cache_for_benchmark())]
-    return _flush_cache_state[0][1]
+        _flush_cache_state[:] = [
+            (driver, device, cache_driver.get_empty_cache_for_benchmark())
+        ]
+    return _flush_cache_state[0][2]
 
 
 def safe_clear_cache() -> None:

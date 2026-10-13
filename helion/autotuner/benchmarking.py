@@ -18,6 +18,7 @@ from typing import cast
 
 import torch
 
+from .._compat import _driver_flush_cache
 from .._compat import safe_clear_cache
 from ..runtime.settings import _env_get_bool
 from ..runtime.settings import is_pallas_interpret
@@ -87,10 +88,13 @@ def _make_l2_cache_clearer() -> Callable[[], None]:
         # Out-of-tree triton drivers may lack the cache-clear primitive; skip
         # the flush there (same contract as safe_clear_cache()).
         return lambda: None
-    cache = active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
+    # Allocate eagerly (before any timed loop) through the shared per-(driver,
+    # device) cache so this path and safe_clear_cache() use one buffer instead
+    # of keeping two ~256MB allocations alive.
+    _driver_flush_cache(active)
 
     def clear() -> None:
-        active.clear_cache(cache)  # type: ignore[attr-defined]
+        active.clear_cache(_driver_flush_cache(active))  # type: ignore[attr-defined]
 
     return clear
 
@@ -285,6 +289,10 @@ def compute_repeat(
     fn()
     di.synchronize()
     benchmark_function = _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
+
+    # Pre-warm the L2-flush buffer outside the timed estimate window; the
+    # first safe_clear_cache() would otherwise pay its allocation inside it.
+    safe_clear_cache()
 
     start_event = di.Event(enable_timing=True)
     end_event = di.Event(enable_timing=True)
@@ -909,11 +917,14 @@ def do_bench(
 
     calls = 1
     flush_replay: Callable[[], None] | None = None
+    # Pre-warm the L2-flush buffer outside the timed estimate loops; the
+    # first safe_clear_cache() would otherwise pay its allocation inside
+    # them. The flush-only CUDA-graph capture below also relies on the buffer
+    # existing by then.
+    safe_clear_cache()
     if benchmark_function is not fn:
-        # The first L2 flush and the first replay of a fresh graph pay their
-        # one-time costs; keep those out of the estimate that sizes the
-        # repetitions and the batch.
-        safe_clear_cache()
+        # The first replay of a fresh graph pays its one-time cost; keep it
+        # out of the estimate that sizes the repetitions and the batch.
         benchmark_function()
         di.synchronize()
 

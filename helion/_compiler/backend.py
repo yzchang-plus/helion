@@ -1583,8 +1583,8 @@ class Backend(abc.ABC):
             "tf32x3": "tf32x3",
             "ieee": "ieee",
             # Forwarded verbatim: stock CUDA triton rejects it loudly at
-            # compile time, while out-of-tree drivers (e.g. Ascend) that
-            # declare "hf32" in allowed_dot_input_precisions honor it.
+            # compile time; out-of-tree drivers that accept the value
+            # honor it.
             "hf32": "hf32",
         }
         return triton_precision_by_dot_precision.get(precision, "")

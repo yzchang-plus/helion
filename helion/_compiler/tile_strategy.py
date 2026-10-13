@@ -8165,7 +8165,9 @@ class TileStrategy:
         range_num_stages = env.config_spec.range_num_stages.config_get(
             config.range_num_stages, block_idx, 0
         )
-        num_stages = config.num_stages
+        # Triton configs always pin num_stages (the search space includes it);
+        # deferral (None) never reaches codegen.
+        num_stages = cast("int", config.num_stages)
 
         if indexing_uses_tensor_descriptor(
             config.indexing

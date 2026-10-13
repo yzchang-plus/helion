@@ -8793,7 +8793,11 @@ def _emit_mma_pipeline(
     # producer flag is the master predicate for all three role-local loops.
     tcgen05_use_role_local_persistent_body = tcgen05_use_role_local_tma_producer
     tcgen05_ab_stage_count_value = _tcgen05_config_int(
-        df.config, "tcgen05_ab_stages", _tcgen05_ab_stage_count(df.config.num_stages)
+        df.config,
+        "tcgen05_ab_stages",
+        # CuTe configs always pin num_stages; deferral (None) is not a CuTe
+        # concept.
+        _tcgen05_ab_stage_count(cast("int", df.config.num_stages)),
     )
     tcgen05_c_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_c_stages", _tcgen05_c_stage_count(bn)

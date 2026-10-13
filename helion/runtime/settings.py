@@ -696,7 +696,7 @@ class Settings(_Settings):
             "The dtype to use for index variables. Default auto-selects torch.int32 or torch.int64 based on input sizes. "
             "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
         ),
-        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'hf32', 'ieee'). For JAX/Pallas backend, accepted values emit Pallas default precision on TPU. Unified mappings exist so that any value can be used on any backend.",
+        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'; 'hf32' is only honored by triton drivers that accept it). For JAX/Pallas backend, accepted values emit Pallas default precision on TPU. Unified mappings exist so that any value can be used on any backend.",
         "cute_rng_stream": (
             "CuTe RNG policy: auto (CuTe default) uses philox4 for explicit hl.rand "
             "and preserves other RNG operations. philox4 maps logical offset i "
@@ -1065,6 +1065,10 @@ class Settings(_Settings):
         result._cute_structural_origins = self._cute_structural_origins.with_explicit(
             *(name for name in CUTE_STRUCTURAL_SETTINGS if name in overrides)
         )
+        # dataclasses.replace re-runs __init__ with every field and would mark
+        # the backend explicit even when it was resolved from the default;
+        # only a copy() override of "backend" is a user choice.
+        result._backend_explicit = self._backend_explicit or "backend" in overrides
         return result
 
     @property
