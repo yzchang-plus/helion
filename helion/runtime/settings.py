@@ -677,9 +677,9 @@ class Settings(_Settings):
     # Not a dataclass field: public serialization, equality and existing cache
     # fingerprints continue to contain only the effective setting values.
     _cute_structural_origins: CuteStructuralOrigins
-    # Not a dataclass field: True when the backend was passed as an explicit
-    # Settings/kernel kwarg (as opposed to resolved from the default or
-    # HELION_BACKEND). Device routing must not override an explicit choice.
+    # Not a dataclass field: True when the backend was chosen explicitly — a
+    # Settings/kernel kwarg or HELION_BACKEND — as opposed to resolved from
+    # the default. Device routing must not override an explicit choice.
     _backend_explicit: bool
 
     __slots__ = {
@@ -980,6 +980,12 @@ class Settings(_Settings):
         backend_explicit = "backend" in settings
         if "backend" not in settings:
             settings["backend"] = _get_backend()
+            # _get_backend above already resolved HELION_BACKEND; record that
+            # fact here instead of re-reading the env var at each consumer
+            # (the device-routing gate), so one construction-time snapshot
+            # decides whether routing may swap the implicit default. A blank
+            # value falls back like _get_backend does and stays implicit.
+            backend_explicit = bool(os.environ.get("HELION_BACKEND", "").strip())
         if "cute_rng_stream" not in settings:
             settings["cute_rng_stream"] = _env_get_literal(
                 "HELION_CUTE_RNG_STREAM",

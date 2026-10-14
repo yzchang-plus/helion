@@ -7,7 +7,6 @@ import contextvars
 import dataclasses
 import logging
 import math
-import os
 import sys
 import threading
 import types
@@ -448,12 +447,9 @@ class CompileEnvironment:
         # declare the active device type while another registered backend
         # does, use that backend instead.  An explicit choice — a
         # Settings/kernel backend kwarg (including backend='triton') or
-        # HELION_BACKEND=<name> — is always honored unchanged.
-        if (
-            backend_name == "triton"
-            and not settings._backend_explicit
-            and not os.environ.get("HELION_BACKEND")
-        ):
+        # HELION_BACKEND=<name> — is always honored unchanged; both are
+        # recorded in Settings._backend_explicit at construction time.
+        if backend_name == "triton" and not settings._backend_explicit:
             routed = find_backend_for_device(device.type)
             if routed not in (None, backend_name):
                 log.info(

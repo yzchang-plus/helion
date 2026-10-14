@@ -5730,6 +5730,25 @@ class ConfigSpec:
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
+        if self.backend.clamp_masked_pointer_offsets():
+            # The search space is already restricted to "pointer"
+            # (valid_indexing_types); this closes the gap for configs spelled
+            # out by hand, so the flag's contract holds for them too.
+            for name in ("indexing", "atomic_indexing"):
+                values = config.get(name)
+                if not values:
+                    continue
+                items = values if isinstance(values, list) else [values]
+                if all(item == "pointer" for item in items):
+                    continue
+                if _fix_invalid:
+                    config[name] = ["pointer"] * len(items)
+                else:
+                    raise InvalidConfig(
+                        f"{name}={values!r}: the {self.backend_name!r} backend "
+                        "requires the pointer indexing strategy "
+                        "(clamp_masked_pointer_offsets)"
+                    )
         if config.get("host_tensor_descriptors"):
             indexing_values = (config.get("indexing"), config.get("atomic_indexing"))
             uses_tensor_descriptor = any(

@@ -278,6 +278,20 @@ def _is_literal_constexpr(arg: ConstExprArg) -> bool:
         return False
 
 
+def _is_inlined_constexpr(arg: object) -> bool:
+    """Whether ``arg`` is a literal constexpr this backend inlines at module level.
+
+    The function-def, call-site, and outlined-helper code paths must agree on
+    this predicate or kernels fail at launch with missing-argument errors
+    (the failure mode test_inline_constexpr_hook.py guards against).
+    """
+    return (
+        CompileEnvironment.current().backend.inline_constexpr_at_module_level()
+        and isinstance(arg, ConstExprArg)
+        and _is_literal_constexpr(arg)
+    )
+
+
 class PallasMemorySpace(enum.Enum):
     """TPU memory space for Pallas tensors."""
 
@@ -1232,13 +1246,7 @@ class DeviceFunction:
         # module level, keep dynamic ones as function parameters (unless the
         # backend requires all constexpr args to stay function parameters)
         constexpr_to_inline = [
-            arg
-            for arg in sorted_arguments
-            if (
-                backend.inline_constexpr_at_module_level()
-                and isinstance(arg, ConstExprArg)
-                and _is_literal_constexpr(arg)
-            )
+            arg for arg in sorted_arguments if _is_inlined_constexpr(arg)
         ]
         inlined_names = {arg.name for arg in constexpr_to_inline}
         param_args = [
@@ -2323,11 +2331,7 @@ class DeviceFunction:
             # Skip constexpr args that are inlined at module level — but only
             # when the backend actually inlines them; otherwise they stay
             # kernel parameters (codegen_function_def) and must be passed.
-            if (
-                backend.inline_constexpr_at_module_level()
-                and isinstance(arg, ConstExprArg)
-                and _is_literal_constexpr(arg)
-            ):
+            if _is_inlined_constexpr(arg):
                 continue
             if isinstance(arg, ConstExprArg) and arg.name in self._constexpr_host_defs:
                 host_arg = arg.name
@@ -2502,12 +2506,7 @@ class DeviceFunction:
         argument_names = [
             argument.name
             for argument in self.arguments
-            if argument.name in reads
-            and not (
-                environment.backend.inline_constexpr_at_module_level()
-                and isinstance(argument, ConstExprArg)
-                and _is_literal_constexpr(argument)
-            )
+            if argument.name in reads and not _is_inlined_constexpr(argument)
         ]
         argument_names.extend(
             name

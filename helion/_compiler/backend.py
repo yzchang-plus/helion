@@ -586,8 +586,8 @@ class Backend(abc.ABC):
         Some hardware DMA paths require non-negative pointer offsets even for
         masked-out elements; when True, codegen wraps the offset in
         ``tl.where(mask, offset, 0)`` so masked-out elements access
-        ``ptr + 0`` (the loaded/stored value is discarded anyway). Only the
-        pointer indexing strategy honors this; block-ptr and tensor
+        ``ptr + 0`` (the loaded/stored value is discarded anyway). The pointer
+        and stack indexing strategies honor this; block-ptr and tensor
         descriptor strategies are unaffected, so a backend that enables it
         should also exclude those indexing modes from its search space.
         """

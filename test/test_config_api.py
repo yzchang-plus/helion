@@ -1005,16 +1005,34 @@ class TestConfigAPI(TestCase):
 @onlyBackends(["triton", "cute"])
 class TestSettingsEnv(TestCase):
     def test_backend_explicit_semantics_across_construction_paths(self) -> None:
+        # Pin the environment so the implicit cases below are genuine even
+        # when the suite runs with HELION_BACKEND set globally.
+        saved_backend_env = os.environ.pop("HELION_BACKEND", None)
+        try:
+            self._check_backend_explicit_semantics()
+        finally:
+            if saved_backend_env is not None:
+                os.environ["HELION_BACKEND"] = saved_backend_env
+
+    def _check_backend_explicit_semantics(self) -> None:
         # Only a genuine user choice marks the backend explicit: a keyword,
-        # or a direct assignment after construction. A plain default-constructed
-        # Settings (and copies of it) stays implicit so device routing may
-        # pick a backend that declares the active device type.
+        # a direct assignment after construction, or HELION_BACKEND at
+        # construction time. A plain default-constructed Settings (and copies
+        # of it) stays implicit so device routing may pick a backend that
+        # declares the active device type.
         self.assertFalse(helion.Settings()._backend_explicit)
         self.assertTrue(helion.Settings(backend="triton")._backend_explicit)
 
         assigned = helion.Settings()
         assigned.backend = "triton"
         self.assertTrue(assigned._backend_explicit)
+
+        with patch.dict(os.environ, {"HELION_BACKEND": "triton"}, clear=False):
+            self.assertTrue(helion.Settings()._backend_explicit)
+        # A blank value falls back to the default like _get_backend does and
+        # stays implicit.
+        with patch.dict(os.environ, {"HELION_BACKEND": ""}, clear=False):
+            self.assertFalse(helion.Settings()._backend_explicit)
 
         # copy() goes through dataclasses.replace, which feeds every field
         # back through __init__; only an overridden "backend" is explicit.
@@ -1417,6 +1435,10 @@ class TestDeviceRouting(TestCase):
             device_types = frozenset({"meta"})
 
         register_compiler_backend(_MetaTritonBackend)
+        # Pin the environment so the implicit cases below are genuine: a
+        # HELION_BACKEND set in the outer environment (e.g. someone running
+        # the suite as `HELION_BACKEND=triton pytest`) would suppress routing.
+        saved_backend_env = os.environ.pop("HELION_BACKEND", None)
         try:
             # Implicit default 'triton' + a registered backend declaring the
             # device type: the code generator is routed while settings.backend
@@ -1436,7 +1458,61 @@ class TestDeviceRouting(TestCase):
                 env = CompileEnvironment(torch.device("meta"), helion.Settings())
             self.assertEqual(env.backend.name, "triton")
         finally:
+            if saved_backend_env is not None:
+                os.environ["HELION_BACKEND"] = saved_backend_env
             _REGISTRY.pop("_test_meta_routing", None)
+
+
+@onlyBackends(["triton"])
+class TestClampBackendIndexingContract(TestCase):
+    def test_clamp_backend_rejects_non_pointer_explicit_indexing(self) -> None:
+        # The autotune search space is restricted to "pointer" by
+        # valid_indexing_types(); explicit configs spelling out another
+        # strategy must be rejected too, or the clamp contract silently
+        # fails for hand-written Configs.
+
+        @helion.kernel(static_shapes=True)
+        def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty((a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
+            for m, n in hl.tile((a.size(0), b.size(1))):
+                out[m, n] = a[m, :] @ b[:, n]
+            return out
+
+        a = torch.randn((128, 16), dtype=torch.float16)
+        b = torch.randn((32, 16), dtype=torch.float16).T
+        bound = matmul.bind((a, b))
+
+        with patch.object(
+            TritonBackend, "clamp_masked_pointer_offsets", return_value=True
+        ):
+            # Defaults and pointer configs are accepted as-is.
+            config = helion.Config(block_sizes=[128, 32])
+            bound.config_spec.normalize(config)
+            self.assertEqual(set(config.config["indexing"]), {"pointer"})
+
+            # A non-pointer strategy on a clamp backend is rejected...
+            with self.assertRaisesRegex(
+                exc.InvalidConfig, "requires the pointer indexing strategy"
+            ):
+                bound.config_spec.normalize(
+                    helion.Config(
+                        block_sizes=[128, 32],
+                        indexing=["tensor_descriptor"],
+                    )
+                )
+
+            # ...or coerced during autotune config generation.
+            fixed = helion.Config(
+                block_sizes=[128, 32],
+                indexing=["tensor_descriptor", "pointer"],
+            )
+            bound.config_spec.normalize(fixed, _fix_invalid=True)
+            self.assertEqual(fixed.config["indexing"], ["pointer", "pointer"])
+
+        # Without the clamp flag, descriptor indexing stays accepted.
+        config = helion.Config(block_sizes=[128, 32], indexing=["tensor_descriptor"])
+        bound.config_spec.normalize(config)
+        self.assertIn("tensor_descriptor", config.config["indexing"])
 
 
 @onlyBackends(["triton", "cute"])

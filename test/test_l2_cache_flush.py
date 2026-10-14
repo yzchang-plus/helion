@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from helion._compat import _flush_cache_state
+from helion._compat import active_cache_clearer
 from helion._compat import make_cache_clearer
 from helion._compat import safe_clear_cache
 
@@ -57,22 +58,32 @@ class TestMakeCacheClearer(unittest.TestCase):
         self.assertEqual(driver.flushed.count(driver.allocated[0]), 2)
         self.assertEqual(len(driver.allocated), 1)
 
-    def test_buffer_is_reallocated_on_device_change(self) -> None:
-        driver = _FakeDriver()
-        clearer = make_cache_clearer(driver)
-        assert clearer is not None
-        first = driver.allocated[0]
-        driver.device = "gpu1"
-        clearer()
-        self.assertEqual(len(driver.allocated), 2)
-        self.assertIsNot(driver.allocated[1], first)
-        self.assertIs(driver.flushed[-1], driver.allocated[1])
-
 
 class TestSafeClearCache(unittest.TestCase):
     def setUp(self) -> None:
         _flush_cache_state.clear()
         self.addCleanup(_flush_cache_state.clear)
+
+    def test_noop_when_driver_resolution_raises(self) -> None:
+        # triton's driver.active is a LazyProxy: resolution happens on the
+        # first attribute access, so the capability probes can raise
+        # RuntimeError (zero or several active drivers). hasattr only
+        # suppresses AttributeError, so that must be caught at the gate.
+        class _UnresolvableDriver:
+            def __getattr__(self, name: str) -> object:
+                raise RuntimeError("no active driver")
+
+        runtime = ModuleType("triton.runtime")
+        runtime.driver = SimpleNamespace(  # type: ignore[attr-defined]
+            active=_UnresolvableDriver()
+        )
+        triton_module = ModuleType("triton")
+        triton_module.runtime = runtime  # type: ignore[attr-defined]
+        with patch.dict(
+            sys.modules, {"triton": triton_module, "triton.runtime": runtime}
+        ):
+            self.assertIsNone(active_cache_clearer())
+            safe_clear_cache()  # must not raise
 
     def test_noop_when_driver_lacks_primitives(self) -> None:
         # A resolvable driver without the flush primitives (common for

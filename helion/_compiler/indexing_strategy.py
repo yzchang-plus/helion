@@ -991,9 +991,9 @@ def _clamped_offset_expr(indexing: SubscriptIndexing, offset: ast.AST) -> ast.AS
     """Clamp masked-out pointer offsets to 0 when the backend requires it.
 
     Some hardware DMA paths require non-negative pointer offsets even for
-    masked-out elements (see ``Backend.clamp_masked_pointer_offsets``). Only
-    the pointer indexing strategy goes through here; block-ptr and tensor
-    descriptor strategies are unaffected.
+    masked-out elements (see ``Backend.clamp_masked_pointer_offsets``). The
+    pointer and stack indexing strategies go through here; block-ptr and
+    tensor descriptor strategies are unaffected.
     """
     if not _clamps_masked_offsets(indexing):
         return offset
@@ -1770,7 +1770,7 @@ class StackIndexingStrategy:
         extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
         load_placeholders: dict[str, ast.AST] = {
             "base": dev_ptrs_ast,
-            "offset": indexing.broadcast_offset(state, subscripts_shape),
+            "offset": _clamped_offset_expr(indexing, indexing.index_expr),
             "mask": mask_expr,
         }
         if eviction_policy is not None:
@@ -1816,7 +1816,7 @@ class StackIndexingStrategy:
         placeholders: dict[str, ast.AST] = {
             "base": dev_ptrs_ast,
             "value": value,
-            "offset": indexing.broadcast_offset(state, subscripts_shape),
+            "offset": _clamped_offset_expr(indexing, indexing.index_expr),
             "mask": mask_expr,
         }
         if cache_modifier is not None:

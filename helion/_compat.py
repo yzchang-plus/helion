@@ -730,10 +730,21 @@ def active_cache_clearer() -> Callable[[], None] | None:
         from triton import runtime
 
         driver = runtime.driver.active
+        # driver.active is triton's LazyProxy: the resolution that raises
+        # RuntimeError (no active driver, or several competing ones) happens
+        # on the first attribute access, so the capability probes below — not
+        # the attribute read above — are where an unresolvable driver fails.
+        resolvable = hasattr(driver, "clear_cache") and hasattr(
+            driver, "get_empty_cache_for_benchmark"
+        )
     except (ImportError, AttributeError, RuntimeError):
         # Triton missing, or its driver cannot be resolved: benchmarking
         # proceeds without the L2 flush.
         return None
+    if not resolvable:
+        return None
+    # The eager buffer allocation stays outside the gate: an OOM raised while
+    # binding the flush buffer is a real failure and must propagate.
     return make_cache_clearer(driver)
 
 
