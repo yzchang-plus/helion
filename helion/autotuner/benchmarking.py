@@ -18,7 +18,7 @@ from typing import cast
 
 import torch
 
-from .._compat import make_cache_clearer
+from .._compat import active_cache_clearer
 from .._compat import safe_clear_cache
 from ..runtime.settings import _env_get_bool
 from ..runtime.settings import is_pallas_interpret
@@ -74,18 +74,15 @@ def _make_l2_cache_clearer() -> Callable[[], None]:
     clears L2 by default) actually measure. Flushing L2 between timed calls
     makes the autotune regime match the deployment regime.
 
-    Uses Triton's CUDA-only cache-clear primitive. Returns a no-op when not on
-    CUDA (e.g. TPU/Pallas backends that also use the generic bench).
+    Flushes purely on driver capability (see active_cache_clearer): the
+    primitive ships with triton's CUDA driver, and out-of-tree drivers that
+    implement it get the same flush as the event benches. ROCm keeps its
+    historical exclusion; environments without a resolvable flush-capable
+    driver (e.g. TPU/Pallas boxes) get a no-op.
     """
-    if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
+    if getattr(torch.version, "hip", None) is not None:
         return lambda: None
-    from triton import runtime
-
-    active = runtime.driver.active  # type: ignore[attr-defined]
-    # Shared probe/buffer with safe_clear_cache() (see make_cache_clearer):
-    # one capability contract, one eagerly-allocated buffer. Out-of-tree
-    # triton drivers without the primitive get the same no-op.
-    clearer = make_cache_clearer(active)
+    clearer = active_cache_clearer()
     if clearer is None:
         return lambda: None
     return clearer

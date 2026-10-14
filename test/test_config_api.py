@@ -25,6 +25,8 @@ from helion._compiler.autotuner_heuristics.cute import (
 )
 from helion._compiler.backend import PallasBackend
 from helion._compiler.backend import TritonBackend
+from helion._compiler.backend_registry import _REGISTRY
+from helion._compiler.backend_registry import register_compiler_backend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
@@ -867,6 +869,13 @@ class TestConfigAPI(TestCase):
 
         self.assertEqual(backend.effective_num_warps(config), 4)
 
+    def test_hf32_dot_precision_is_forwarded_verbatim(self) -> None:
+        # 'hf32' is honored only by out-of-tree triton drivers that accept the
+        # value; the base mapping forwards it verbatim so stock CUDA triton
+        # fails loudly instead of silently dropping the setting.
+        helion.Settings(dot_precision="hf32")
+        self.assertEqual(TritonBackend().map_dot_precision("hf32"), "hf32")
+
     def test_explicit_none_defers_num_warps_and_num_stages(self) -> None:
         # An explicit None defers the choice to the backend's driver; it must
         # survive the constructor and the to_json/from_json round-trip the
@@ -1395,6 +1404,39 @@ class TestSettingsEnv(TestCase):
             settings.autotune_search_acf,
             ["/a/first.bin", "/b/second.bin", "/c/third.bin"],
         )
+
+
+@onlyBackends(["triton"])
+class TestDeviceRouting(TestCase):
+    def test_routing_swaps_only_the_implicit_default_backend(self) -> None:
+        class _MetaTritonBackend(TritonBackend):
+            @property
+            def name(self) -> str:
+                return "_test_meta_routing"
+
+            device_types = frozenset({"meta"})
+
+        register_compiler_backend(_MetaTritonBackend)
+        try:
+            # Implicit default 'triton' + a registered backend declaring the
+            # device type: the code generator is routed while settings.backend
+            # keeps the user-facing 'triton'.
+            env = CompileEnvironment(torch.device("meta"), helion.Settings())
+            self.assertEqual(env.backend.name, "_test_meta_routing")
+            self.assertEqual(env.settings.backend, "triton")
+
+            # An explicit backend choice suppresses routing...
+            env = CompileEnvironment(
+                torch.device("meta"), helion.Settings(backend="triton")
+            )
+            self.assertEqual(env.backend.name, "triton")
+
+            # ...and so does HELION_BACKEND.
+            with patch.dict(os.environ, {"HELION_BACKEND": "triton"}, clear=False):
+                env = CompileEnvironment(torch.device("meta"), helion.Settings())
+            self.assertEqual(env.backend.name, "triton")
+        finally:
+            _REGISTRY.pop("_test_meta_routing", None)
 
 
 @onlyBackends(["triton", "cute"])

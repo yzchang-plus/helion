@@ -34,8 +34,10 @@ class _FakeDriver:
 class TestMakeCacheClearer(unittest.TestCase):
     def setUp(self) -> None:
         # Module-level (driver, device, buffer) slot shared with
-        # safe_clear_cache(); isolate each test from prior allocations.
+        # safe_clear_cache(); isolate each test from prior allocations and
+        # clear the fake driver/buffer again when the tests finish.
         _flush_cache_state.clear()
+        self.addCleanup(_flush_cache_state.clear)
 
     def test_driver_without_primitives_yields_none(self) -> None:
         self.assertIsNone(make_cache_clearer(SimpleNamespace()))
@@ -70,6 +72,7 @@ class TestMakeCacheClearer(unittest.TestCase):
 class TestSafeClearCache(unittest.TestCase):
     def setUp(self) -> None:
         _flush_cache_state.clear()
+        self.addCleanup(_flush_cache_state.clear)
 
     def test_noop_when_driver_lacks_primitives(self) -> None:
         # A resolvable driver without the flush primitives (common for

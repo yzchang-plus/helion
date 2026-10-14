@@ -717,6 +717,26 @@ def make_cache_clearer(driver: object) -> Callable[[], None] | None:
     return clear
 
 
+def active_cache_clearer() -> Callable[[], None] | None:
+    """Resolve the active Triton driver and bind a cache clearer to it.
+
+    The single driver-resolution gate for the L2 flush: an environment whose
+    active driver cannot be resolved at all (no Triton, CPU-only, or several
+    competing accelerators) yields None, as does a driver without the flush
+    primitives — so both the event benches (via safe_clear_cache) and the
+    generic wall-clock benches flush on one capability contract.
+    """
+    try:
+        from triton import runtime
+
+        driver = runtime.driver.active
+    except (ImportError, AttributeError, RuntimeError):
+        # Triton missing, or its driver cannot be resolved: benchmarking
+        # proceeds without the L2 flush.
+        return None
+    return make_cache_clearer(driver)
+
+
 def safe_clear_cache() -> None:
     """Clear the benchmark cache when the active Triton driver supports it.
 
@@ -728,15 +748,7 @@ def safe_clear_cache() -> None:
     warmer L2. Failures of the flush itself (e.g. an OOM allocating the flush
     buffer) are not hidden; they propagate to the caller.
     """
-    try:
-        from triton import runtime
-
-        driver = runtime.driver.active
-    except (ImportError, AttributeError, RuntimeError):
-        # Triton missing, or its driver cannot be resolved: benchmarking
-        # proceeds without the L2 flush.
-        return
-    clearer = make_cache_clearer(driver)
+    clearer = active_cache_clearer()
     if clearer is not None:
         clearer()
 

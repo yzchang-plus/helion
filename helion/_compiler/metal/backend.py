@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
 from typing import Sequence
-from typing import cast
 
 import torch
 
@@ -895,9 +894,13 @@ class MetalBackend(Backend):
         # simdgroup has 32 threads.  tid[0] must be large enough for both
         # MPP's cooperative operation and any scalar indexing on the first
         # root axis.
-        # Metal configs always pin num_warps; deferral (None) is not a Metal
-        # concept, and a pinned None raises TypeError loudly here.
-        mpp_threads = cast("int", config.num_warps) * 32
+        if config.num_warps is None:
+            raise exc.InvalidConfig(
+                "the metal backend requires an explicit num_warps "
+                "(num_warps=None deferral is only supported by backends "
+                "that defer to the triton driver)"
+            )
+        mpp_threads = config.num_warps * 32
         used_threads = max(mpp_threads, first_axis_threads)
         changed = False
 

@@ -1909,6 +1909,11 @@ class ConfigSpec:
     def _should_keep_epilogue_subtile_for_autotune(self) -> bool:
         if self.epilogue_subtile_autotune_choices is None:
             return False
+        # Subtiled stores are forced onto tensor descriptors below; a
+        # clamp-masked-offset backend cannot guarantee masked accesses there,
+        # so it does not get the epilogue-subtile search space at all.
+        if self.backend.clamp_masked_pointer_offsets():
+            return False
         return supports_tensor_descriptor()
 
     def fix_epilogue_subtile_store_indexing(self, config: dict[str, object]) -> None:
@@ -1916,6 +1921,8 @@ class ConfigSpec:
         if (
             not self.epilogue_subtile_candidate_enabled
             or "epilogue_subtile" not in config
+            # Clamp-masked-offset backends keep pointer stores (see above).
+            or self.backend.clamp_masked_pointer_offsets()
         ):
             return
         indexing = config.get("indexing")
@@ -1974,6 +1981,12 @@ class ConfigSpec:
             self.epilogue_subtile_autotune_choices = EPILOGUE_SUBTILE_DEFAULT_CHOICES
 
     def valid_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+        # Clamp-masked-offset backends only guarantee masked accesses on the
+        # pointer strategy; restrict the search space here so the flag's
+        # contract holds by construction instead of relying on backend
+        # authors to also override the other capability hooks.
+        if self.backend.clamp_masked_pointer_offsets():
+            return ("pointer",)
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         if not self.backend.supports_block_ptr_indexing():
@@ -1982,6 +1995,8 @@ class ConfigSpec:
 
     def valid_atomic_indexing_types(self) -> tuple[IndexingLiteral, ...]:
         """Atomic ops only support pointer and tensor_descriptor (no block_ptr)."""
+        if self.backend.clamp_masked_pointer_offsets():
+            return ("pointer",)
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         return ("pointer",)
