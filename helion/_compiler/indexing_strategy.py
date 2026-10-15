@@ -994,6 +994,11 @@ def _clamped_offset_expr(indexing: SubscriptIndexing, offset: ast.AST) -> ast.AS
     masked-out elements (see ``Backend.clamp_masked_pointer_offsets``). The
     pointer and stack indexing strategies go through here; block-ptr and
     tensor descriptor strategies are unaffected.
+
+    The stack strategy clamps with the subscript mask alone while its
+    load/store mask additionally conjoins the dev-ptr extent mask; lanes
+    excluded only by the latter still carry in-extent, hence non-negative,
+    offsets, so the DMA contract holds without clamping them.
     """
     if not _clamps_masked_offsets(indexing):
         return offset

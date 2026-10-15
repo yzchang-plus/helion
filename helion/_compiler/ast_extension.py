@@ -195,6 +195,9 @@ def statements_from_string(template: str, **placeholders: ast.AST) -> list[ast.s
     Parses a *block* of statements (e.g. a ``for`` loop with its indented
     body, or several statements) and returns the list of statements.
 
+    Deliberate API surface for out-of-tree backend code generators emitting
+    multi-statement blocks; in-tree codegen uses ``statement_from_string``.
+
     Uses {placeholder} syntax to mark placeholders that should be replaced with AST nodes.
     This supports two common patterns:
 

@@ -602,6 +602,15 @@ class Backend(abc.ABC):
         """
         return True
 
+    def supports_num_threads_deferral(self) -> bool:
+        """Whether num_warps/num_stages may be None (deferred to the driver).
+
+        Backends that do not resolve these through the triton driver override
+        this to False; normalization then rejects a deferred None uniformly
+        instead of letting some consumer silently ignore it.
+        """
+        return True
+
     def launches_surplus_tile_threads(self) -> bool:
         """Whether an axis may be launched wider than the tile it indexes."""
         return False

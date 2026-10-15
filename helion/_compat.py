@@ -651,11 +651,12 @@ class _BenchmarkCacheDriver(Protocol):
     def get_empty_cache_for_benchmark(self) -> object: ...
 
 
-# (driver, device, buffer) triple so the flush buffer is allocated once per
-# (driver, device) instead of on every timed iteration. The driver is
-# identity-compared rather than dict-keyed (driver objects and test doubles
-# may be unhashable), and the buffer is reallocated on device change because
-# ``get_empty_cache_for_benchmark()`` allocates on the current device.
+# Most-recent (driver, device, buffer) slot, not a cache. The driver is
+# identity-compared (test doubles may be unhashable); the buffer is
+# reallocated on device change (get_empty_cache_for_benchmark() allocates on
+# the current device). Unsynchronized by design — assumes one benchmarking
+# writer per process; a second writer could free the buffer while a captured
+# flush-only CUDA graph still references it.
 _flush_cache_state: list[tuple[object, object, object]] = []
 
 
@@ -676,9 +677,8 @@ def _driver_flush_cache(driver: object) -> object:
     ``get_empty_cache_for_benchmark()`` allocates a large buffer on the current
     device; allocating it on every call would pay the first allocation inside
     a timed estimate loop, and a single buffer shared across devices would
-    flush the wrong one. The buffer stays alive for the process lifetime (it
-    is only used for benchmarking anyway); switching drivers or devices
-    reallocates.
+    flush the wrong one. The buffer stays alive until the slot is reassigned;
+    switching drivers or devices reallocates (see ``_flush_cache_state``).
     """
     device = _current_flush_device(driver)
     if (

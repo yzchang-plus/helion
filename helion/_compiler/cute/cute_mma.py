@@ -8793,6 +8793,8 @@ def _emit_mma_pipeline(
     # producer flag is the master predicate for all three role-local loops.
     tcgen05_use_role_local_persistent_body = tcgen05_use_role_local_tma_producer
     if df.config.num_stages is None:
+        # Backstop: normalize() rejects this first via
+        # supports_num_threads_deferral().
         raise exc.InvalidConfig(
             "the cute backend requires an explicit num_stages "
             "(num_stages=None deferral is only supported by backends "

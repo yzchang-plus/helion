@@ -5690,6 +5690,23 @@ class ConfigSpec:
             config.setdefault("num_warps", DEFAULT_NUM_WARPS)
         if self.supports_config_key("num_stages"):
             config.setdefault("num_stages", self._default_num_stages())
+        if not self.backend.supports_num_threads_deferral():
+            # Reject a deferred None uniformly at the config boundary; autotune
+            # generation passes _fix_invalid and gets the default instead.
+            for name, default in (
+                ("num_warps", DEFAULT_NUM_WARPS),
+                ("num_stages", self._default_num_stages()),
+            ):
+                if self.supports_config_key(name) and config.get(name) is None:
+                    if _fix_invalid:
+                        config[name] = default
+                    else:
+                        raise InvalidConfig(
+                            f"the {self.backend_name!r} backend requires an "
+                            f"explicit {name} ({name}=None deferral is only "
+                            "supported by backends that defer to the triton "
+                            "driver)"
+                        )
         if self.supports_config_key("host_tensor_descriptors"):
             value = config.setdefault("host_tensor_descriptors", False)
             if type(value) is not bool:

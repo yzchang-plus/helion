@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 
+import pytest
+
 from helion._compiler.ast_extension import create
 from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.ast_extension import statement_from_string
@@ -24,13 +26,8 @@ def test_statements_from_string_parses_statement_blocks() -> None:
 
     # The single-statement variant enforces its exactly-one contract:
     # a two-statement block does not unpack.
-    try:
+    with pytest.raises(ValueError):
         statement_from_string("x = 1\ny = 2")
-    except ValueError:
-        pass
-    else:
-        msg = "expected the exactly-one contract to reject a block"
-        raise AssertionError(msg)
 
 
 def test_unparse_inserts_source_location_comments(tmp_path) -> None:

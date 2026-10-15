@@ -541,7 +541,12 @@ def _validate_resident_program_capacity(
         raise RuntimeError("cross-loop residency checks require a CUDA tensor")
 
     if num_warps is None:
-        raise RuntimeError("cross-loop residency checks require an explicit num_warps")
+        # The prefix lets the runtime wrapper convert this to InvalidConfig,
+        # like the capacity error below.
+        raise RuntimeError(
+            "Cross-loop scheduling requires an explicit num_warps "
+            "(num_warps=None defers to the driver and has no residency answer)"
+        )
 
     if compiled_kernel is None:
         raise RuntimeError("unable to compile cross-loop scheduled kernel")

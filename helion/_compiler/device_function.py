@@ -283,7 +283,7 @@ def _is_inlined_constexpr(arg: object) -> bool:
 
     The function-def, call-site, and outlined-helper code paths must agree on
     this predicate or kernels fail at launch with missing-argument errors
-    (the failure mode test_inline_constexpr_hook.py guards against).
+    (the failure mode the inline-constexpr hook tests guard against).
     """
     return (
         CompileEnvironment.current().backend.inline_constexpr_at_module_level()

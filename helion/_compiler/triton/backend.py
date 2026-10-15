@@ -688,6 +688,10 @@ class TritonBackend(Backend):
 class TileIRBackend(TritonBackend):
     """TileIR code generation backend (extends Triton)."""
 
+    # Experimental and ENABLE_TILE-gated: claim no device types so routing
+    # never dispatches to it; only an explicit backend="tileir" reaches it.
+    device_types = frozenset()
+
     @property
     def name(self) -> str:
         return "tileir"

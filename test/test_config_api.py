@@ -20,12 +20,14 @@ import torch
 
 import helion
 from helion import exc
+from helion._compiler import backend_registry
 from helion._compiler.autotuner_heuristics.cute import (
     _tcgen05_grouped_worklist_seed_family,
 )
 from helion._compiler.backend import PallasBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.backend_registry import _REGISTRY
+from helion._compiler.backend_registry import find_backend_for_device
 from helion._compiler.backend_registry import register_compiler_backend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
@@ -91,6 +93,7 @@ from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
+from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import MatmulFact
@@ -873,7 +876,7 @@ class TestConfigAPI(TestCase):
         # 'hf32' is honored only by out-of-tree triton drivers that accept the
         # value; the base mapping forwards it verbatim so stock CUDA triton
         # fails loudly instead of silently dropping the setting.
-        helion.Settings(dot_precision="hf32")
+        helion.Settings(dot_precision="hf32")  # acceptance only: no validation here
         self.assertEqual(TritonBackend().map_dot_precision("hf32"), "hf32")
 
     def test_explicit_none_defers_num_warps_and_num_stages(self) -> None:
@@ -1434,12 +1437,19 @@ class TestDeviceRouting(TestCase):
 
             device_types = frozenset({"meta"})
 
+        # register_compiler_backend also discards triton/tileir from
+        # _REPAIRED_CODEGEN_NAMES (the subclass shares triton's codegen_name);
+        # restore both alongside the registry entry.
+        saved_repaired_names = backend_registry._REPAIRED_CODEGEN_NAMES
         register_compiler_backend(_MetaTritonBackend)
         # Pin the environment so the implicit cases below are genuine: a
         # HELION_BACKEND set in the outer environment (e.g. someone running
         # the suite as `HELION_BACKEND=triton pytest`) would suppress routing.
         saved_backend_env = os.environ.pop("HELION_BACKEND", None)
         try:
+            # A device type no registered backend declares does not route...
+            self.assertIsNone(find_backend_for_device("cpu"))
+
             # Implicit default 'triton' + a registered backend declaring the
             # device type: the code generator is routed while settings.backend
             # keeps the user-facing 'triton'.
@@ -1461,6 +1471,7 @@ class TestDeviceRouting(TestCase):
             if saved_backend_env is not None:
                 os.environ["HELION_BACKEND"] = saved_backend_env
             _REGISTRY.pop("_test_meta_routing", None)
+            backend_registry._REPAIRED_CODEGEN_NAMES = saved_repaired_names
 
 
 @onlyBackends(["triton"])
@@ -1513,6 +1524,45 @@ class TestClampBackendIndexingContract(TestCase):
         config = helion.Config(block_sizes=[128, 32], indexing=["tensor_descriptor"])
         bound.config_spec.normalize(config)
         self.assertIn("tensor_descriptor", config.config["indexing"])
+
+
+@onlyBackends(["triton"])
+class TestDeferredNumThreadsContract(TestCase):
+    def test_non_deferring_backend_rejects_deferred_num_threads(self) -> None:
+        # A non-deferring backend must reject a deferred None at the config
+        # boundary, not just in whichever consumer does arithmetic on it.
+
+        @helion.kernel(static_shapes=True)
+        def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty((a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
+            for m, n in hl.tile((a.size(0), b.size(1))):
+                out[m, n] = a[m, :] @ b[:, n]
+            return out
+
+        a = torch.randn((128, 16), dtype=torch.float16)
+        b = torch.randn((32, 16), dtype=torch.float16).T
+        bound = matmul.bind((a, b))
+
+        with patch.object(
+            TritonBackend, "supports_num_threads_deferral", return_value=False
+        ):
+            # An explicit None is rejected at normalization...
+            with self.assertRaisesRegex(
+                exc.InvalidConfig, "requires an explicit num_warps"
+            ):
+                bound.config_spec.normalize(
+                    helion.Config(block_sizes=[128, 32], num_warps=None)
+                )
+
+            # ...and autotune config generation fills the default instead.
+            fixed = helion.Config(block_sizes=[128, 32], num_warps=None)
+            bound.config_spec.normalize(fixed, _fix_invalid=True)
+            self.assertEqual(fixed.config["num_warps"], DEFAULT_NUM_WARPS)
+
+        # Deferring backends (the default) still accept a deferred None.
+        config = helion.Config(block_sizes=[128, 32], num_warps=None)
+        bound.config_spec.normalize(config)
+        self.assertIsNone(config.config["num_warps"])
 
 
 @onlyBackends(["triton", "cute"])
